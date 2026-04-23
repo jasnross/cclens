@@ -1,0 +1,5 @@
+{"type":"permission-mode","mode":"default"}
+{"type":"file-history-snapshot","filesSnapshot":{}}
+{"type":"user","timestamp":"2026-04-01T10:00:00Z","cwd":"/Users/test/alpha","message":{"content":"<command-name>/test-cmd</command-name>\n<command-args>hello world</command-args>"}}
+{"type":"assistant","timestamp":"2026-04-01T10:00:05Z","cwd":"/Users/test/alpha","message":{"model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":9999}}}
+{"type":"assistant","timestamp":"2026-04-01T10:00:10Z","isSidechain":true,"cwd":"/Users/test/alpha","message":{"model":"claude-opus-4-7","usage":{"input_tokens":50,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}

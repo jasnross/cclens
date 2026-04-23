@@ -1,0 +1,4 @@
+{"type":"permission-mode","mode":"default"}
+this is not json
+{"type":"user","timestamp":"2026-04-20T09:00:00Z","cwd":"/Users/test/beta","message":{"content":"after malformed"}}
+{"type":"assistant","timestamp":"2026-04-20T09:00:05Z","cwd":"/Users/test/beta","message":{"model":"claude-opus-4-7","usage":{"input_tokens":5,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}

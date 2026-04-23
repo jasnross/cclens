@@ -1,0 +1,4 @@
+{"type":"permission-mode","mode":"default"}
+{"type":"file-history-snapshot","filesSnapshot":{}}
+{"type":"user","timestamp":"2026-04-15T14:33:00Z","cwd":"/Users/test/beta","message":{"content":"How do I configure neovim folds?"}}
+{"type":"assistant","timestamp":"2026-04-15T14:33:05Z","cwd":"/Users/test/beta","message":{"model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":90,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
