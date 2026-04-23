@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use comfy_table::presets::NOTHING;
+use comfy_table::{CellAlignment, Table};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -59,7 +61,7 @@ fn run_list(projects_dir: &Path) -> anyhow::Result<()> {
         }
     }
     sessions.sort_by_key(|s| s.started_at);
-    eprintln!("parsed {} sessions", sessions.len());
+    println!("{}", render_table(&sessions));
     Ok(())
 }
 
@@ -349,6 +351,49 @@ fn discover(projects_dir: &Path) -> anyhow::Result<Vec<(PathBuf, Vec<PathBuf>)>>
         result.push((path, jsonl_paths));
     }
     Ok(result)
+}
+
+// ---- rendering ----
+
+const TITLE_MAX_CHARS: usize = 80;
+
+// Index of the tokens column in the header vector below. Kept as a const so
+// reordering columns requires updating one place, not two.
+const TOKENS_COL_INDEX: usize = 3;
+
+fn truncate_title(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut result: String = s.chars().take(max.saturating_sub(1)).collect();
+    result.push('…');
+    result
+}
+
+fn format_local(ts: DateTime<Utc>) -> String {
+    ts.with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+fn render_table(sessions: &[Session]) -> String {
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+    table.set_header(vec!["datetime", "project", "title", "tokens"]);
+    for session in sessions {
+        table.add_row(vec![
+            format_local(session.started_at),
+            session.project_short_name.clone(),
+            truncate_title(&session.title, TITLE_MAX_CHARS),
+            session.total_billable.to_string(),
+        ]);
+    }
+    // column_mut returns Option; the column is guaranteed present because the
+    // header above defines TOKENS_COL_INDEX + 1 columns.
+    if let Some(col) = table.column_mut(TOKENS_COL_INDEX) {
+        col.set_cell_alignment(CellAlignment::Right);
+    }
+    format!("{table}")
 }
 
 // ---- tests ----
@@ -671,5 +716,138 @@ mod tests {
         let result = discover(tmp.path()).unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].1.is_empty());
+    }
+
+    // --- rendering ---
+
+    #[test]
+    fn truncate_title_under_limit_returns_unchanged() {
+        assert_eq!(truncate_title("hello", 80), "hello");
+        assert_eq!(truncate_title("", 80), "");
+        // Boundary: len == max is also considered "under limit" per the `<=`
+        // check, so an exact-80-char title passes through unchanged.
+        let exactly_80 = "a".repeat(80);
+        assert_eq!(truncate_title(&exactly_80, 80), exactly_80);
+    }
+
+    #[test]
+    fn truncate_title_over_limit_appends_ellipsis() {
+        let long: String = "a".repeat(81);
+        let truncated = truncate_title(&long, 80);
+        assert_eq!(truncated.chars().count(), 80);
+        assert!(truncated.ends_with('…'));
+        // First 79 chars should be 'a's.
+        assert_eq!(
+            truncated.chars().take(79).collect::<String>(),
+            "a".repeat(79)
+        );
+    }
+
+    #[test]
+    fn truncate_title_handles_multibyte_chars() {
+        // "日本語" is 3 scalars but 9 UTF-8 bytes; truncating by scalar is
+        // correct and must not panic on a byte boundary.
+        let s = "日本語の説明".to_string() + &"あ".repeat(80);
+        let truncated = truncate_title(&s, 10);
+        assert_eq!(truncated.chars().count(), 10);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn format_local_matches_explicit_chrono_composition() {
+        let ts: DateTime<Utc> = "2026-04-01T10:30:00Z".parse().unwrap();
+        let expected = ts
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        assert_eq!(format_local(ts), expected);
+    }
+
+    fn session_for_render(
+        project: &str,
+        title: &str,
+        total_billable: u64,
+        started_at: &str,
+    ) -> Session {
+        let ts: DateTime<Utc> = started_at.parse().unwrap();
+        Session {
+            id: "sid".to_string(),
+            project_short_name: project.to_string(),
+            started_at: ts,
+            last_activity: ts,
+            title: title.to_string(),
+            turns: Vec::new(),
+            total_billable,
+        }
+    }
+
+    #[test]
+    fn render_table_includes_header_and_rows() {
+        let sessions = vec![
+            session_for_render("alpha", "first title", 100, "2026-04-01T10:00:00Z"),
+            session_for_render("beta", "second title", 250, "2026-04-02T10:00:00Z"),
+        ];
+        let out = render_table(&sessions);
+        assert!(out.contains("datetime"));
+        assert!(out.contains("project"));
+        assert!(out.contains("title"));
+        assert!(out.contains("tokens"));
+        assert!(out.contains("alpha"));
+        assert!(out.contains("beta"));
+        assert!(out.contains("first title"));
+        assert!(out.contains("second title"));
+        assert!(out.contains("100"));
+        assert!(out.contains("250"));
+    }
+
+    #[test]
+    fn render_table_truncates_long_titles_with_ellipsis() {
+        // Title of 100 chars — longer than TITLE_MAX_CHARS (80) — should be
+        // truncated with a trailing `…` in the rendered output.
+        let long_title = "x".repeat(100);
+        let sessions = vec![session_for_render(
+            "p",
+            &long_title,
+            1,
+            "2026-04-01T10:00:00Z",
+        )];
+        let out = render_table(&sessions);
+        assert!(
+            out.contains('…'),
+            "expected ellipsis in output, got:\n{out}"
+        );
+        // Full 100-x run must NOT appear verbatim.
+        assert!(!out.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn render_table_right_aligns_tokens_column() {
+        let sessions = vec![
+            session_for_render("p1", "t1", 9, "2026-04-01T10:00:00Z"),
+            session_for_render("p2", "t2", 123_456, "2026-04-02T10:00:00Z"),
+        ];
+        let out = render_table(&sessions);
+        let data_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("p1") || l.contains("p2"))
+            .collect();
+        assert_eq!(data_lines.len(), 2);
+        // Right-aligned means both token columns end at the same byte offset
+        // from the end of the line.
+        let end_of_9 = data_lines
+            .iter()
+            .find(|l| l.contains("p1"))
+            .unwrap()
+            .trim_end();
+        let end_of_123456 = data_lines
+            .iter()
+            .find(|l| l.contains("p2"))
+            .unwrap()
+            .trim_end();
+        assert!(end_of_9.ends_with('9'));
+        assert!(end_of_123456.ends_with("123456"));
+        // Right-alignment: the shorter value has leading whitespace padding
+        // inside its column, so the line is the same length as the longer one.
+        assert_eq!(end_of_9.len(), end_of_123456.len());
     }
 }
