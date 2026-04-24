@@ -292,13 +292,22 @@ fn derive_project_short_name(project_dir: &Path, turns: &[Turn]) -> String {
         .unwrap_or_default()
 }
 
-// Harness-synthetic user-content wrappers that should never be treated as the
-// user's intent. Real data has at least these three; the plan spec'd only the
-// caveat, but the other two occur on every slash-command session.
+// Harness-synthetic user-content prefixes that should never be treated as the
+// user's intent. Applied to both string content and array `text` blocks — real
+// Claude Code stores skill-injection preambles as single-text-block arrays, so
+// the check has to cover both shapes.
+//
+// The first three are XML-like envelopes and won't false-positive in practice.
+// "Base directory for this skill: " is plain prose and in theory a real user
+// prompt could start with it; accepted as a low-probability tradeoff since
+// real sessions always produce it and no real prompt has been seen to match.
 const SYNTHETIC_USER_CONTENT_PREFIXES: &[&str] = &[
     "<local-command-caveat>",
     "<local-command-stdout>",
     "<local-command-stderr>",
+    // Skill harness injects the skill file's contents as a user turn whose
+    // content array contains one text block starting with this prefix.
+    "Base directory for this skill: ",
 ];
 
 fn extract_title(turns: &[Turn], session_id: &str) -> String {
@@ -310,18 +319,6 @@ fn extract_title(turns: &[Turn], session_id: &str) -> String {
         let Some(content) = &turn.content else {
             continue;
         };
-
-        // Title-only skip: synthetic-prefix string content is harness noise, not
-        // the user's intent. The show grouper applies the same rule via
-        // `is_substantive_user_turn` before ever calling `user_display_string`.
-        if let Some(s) = content.as_str()
-            && SYNTHETIC_USER_CONTENT_PREFIXES
-                .iter()
-                .any(|p| s.starts_with(p))
-        {
-            continue;
-        }
-
         if let Some(title) = user_display_string(content) {
             return title;
         }
@@ -329,18 +326,35 @@ fn extract_title(turns: &[Turn], session_id: &str) -> String {
     session_id.to_string()
 }
 
+fn is_synthetic_user_text(s: &str) -> bool {
+    SYNTHETIC_USER_CONTENT_PREFIXES
+        .iter()
+        .any(|p| s.starts_with(p))
+}
+
 /// Shared content-extraction primitive: returns the string we'd display for a
-/// user turn's content, or `None` if no displayable string can be derived.
+/// user turn's content, or `None` if the content is harness-synthetic or has
+/// no displayable text.
 ///
 /// - For string content: reconstructs a slash command if the content is a
 ///   `<command-name>…` XML wrapper; otherwise returns the string as-is.
-/// - For array content: returns the first non-empty `"text"` block's text.
+///   Returns `None` for synthetic-prefix content.
+/// - For array content: returns the first non-empty, non-synthetic `"text"`
+///   block's text verbatim. Slash-command XML wrappers have never been
+///   observed inside array text blocks in real data, so reconstruction runs
+///   only on string content — if that shape starts appearing, delegate the
+///   block's text to `extract_slash_command_title` here.
 /// - For all other `Value` shapes: returns `None`.
 ///
 /// Used by both `extract_title` (list view) and `user_content_preview`
 /// (show view) so the two views agree on what counts as "what the user said".
+/// `is_substantive_user_turn` delegates to this function — a turn is
+/// substantive iff this returns `Some(_)`.
 fn user_display_string(content: &Value) -> Option<String> {
     if let Some(s) = content.as_str() {
+        if is_synthetic_user_text(s) {
+            return None;
+        }
         if let Some(title) = extract_slash_command_title(s) {
             return Some(title);
         }
@@ -353,6 +367,7 @@ fn user_display_string(content: &Value) -> Option<String> {
             }
             if let Some(text) = block.get("text").and_then(Value::as_str)
                 && !text.is_empty()
+                && !is_synthetic_user_text(text)
             {
                 return Some(text.to_string());
             }
@@ -362,31 +377,18 @@ fn user_display_string(content: &Value) -> Option<String> {
 }
 
 /// `true` iff a user-role turn carries real user intent (as opposed to harness
-/// noise or tool-result-only array content). Used by the show grouper to decide
-/// which user turns start a new exchange.
+/// noise or tool-result-only array content). Defined as "there is a display
+/// string we can derive from the content" — this keeps the substantive-check
+/// and the display-string extraction consistent by construction.
 fn is_substantive_user_turn(turn: &Turn) -> bool {
     match &turn.role {
         Role::User => {}
         Role::Assistant | Role::Attachment | Role::System | Role::Other(_) => return false,
     }
-    let Some(content) = &turn.content else {
-        return false;
-    };
-    if let Some(s) = content.as_str() {
-        return !SYNTHETIC_USER_CONTENT_PREFIXES
-            .iter()
-            .any(|p| s.starts_with(p));
-    }
-    if let Some(arr) = content.as_array() {
-        return arr.iter().any(|block| {
-            block.get("type").and_then(Value::as_str) == Some("text")
-                && block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| !t.is_empty())
-        });
-    }
-    false
+    turn.content
+        .as_ref()
+        .and_then(user_display_string)
+        .is_some()
 }
 
 /// A user turn plus the cluster of consecutive assistant turns that follow it
@@ -524,10 +526,17 @@ const SHOW_TOKENS_COL_INDEX: usize = 2;
 const SHOW_CUMULATIVE_COL_INDEX: usize = 3;
 
 fn truncate_title(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+    // Collapse internal whitespace runs (including `\n`, `\t`) to a single
+    // space and trim ends. Comfy-table respects embedded newlines and would
+    // otherwise render a single cell across multiple visual rows — real
+    // JSONL content (e.g. skill preambles) contains newlines that would
+    // break the one-line-per-row invariant without this step.
+    let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if normalized.chars().count() <= max {
+        return normalized;
     }
-    let mut result: String = s.chars().take(max.saturating_sub(1)).collect();
+    let mut result: String = normalized.chars().take(max.saturating_sub(1)).collect();
     result.push('…');
     result
 }
@@ -1050,6 +1059,24 @@ mod tests {
     }
 
     #[test]
+    fn truncate_title_collapses_embedded_newlines() {
+        // Real JSONL content (e.g. skill preambles) has embedded newlines;
+        // unnormalized, comfy-table would render one cell across multiple
+        // visual rows.
+        assert_eq!(truncate_title("hello\nworld", 80), "hello world");
+        assert_eq!(truncate_title("line1\n\nline2", 80), "line1 line2");
+    }
+
+    #[test]
+    fn truncate_title_collapses_whitespace_runs() {
+        assert_eq!(truncate_title("hello  \t  world", 80), "hello world");
+        assert_eq!(
+            truncate_title("  leading and trailing  ", 80),
+            "leading and trailing"
+        );
+    }
+
+    #[test]
     fn format_local_matches_explicit_chrono_composition() {
         let ts: DateTime<Utc> = "2026-04-01T10:30:00Z".parse().unwrap();
         let expected = ts
@@ -1249,6 +1276,30 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn is_substantive_user_turn_rejects_skill_injection_array() {
+        // Real Claude Code stores skill content as a user turn whose content
+        // array has one text block starting with `Base directory for this
+        // skill: `. That prefix is in SYNTHETIC_USER_CONTENT_PREFIXES, so
+        // the turn must not start a new exchange.
+        let content = serde_json::json!([
+            {
+                "type": "text",
+                "text": "Base directory for this skill: /Users/x/.claude/skills/foo\n\n# Foo",
+            },
+        ]);
+        assert!(!is_substantive_user_turn(&user_array_turn(content)));
+    }
+
+    #[test]
+    fn is_substantive_user_turn_rejects_skill_injection_string() {
+        // Defensive: same prefix but in string content (shape not observed
+        // in real data yet, but the predicate should still classify it as
+        // synthetic).
+        let turn = user_string_turn("Base directory for this skill: /Users/x/.claude/skills/foo");
+        assert!(!is_substantive_user_turn(&turn));
+    }
+
     // --- group_into_exchanges ---
 
     #[test]
@@ -1318,6 +1369,33 @@ mod tests {
         assert!(exchanges.is_empty());
     }
 
+    #[test]
+    fn group_into_exchanges_absorbs_skill_injection() {
+        // Regression for real ~/.claude/projects/ data: slash-command string
+        // turn → skill-injection array-text turn → assistant. The skill
+        // injection must be absorbed so the slash command stays the user
+        // turn of one exchange (not orphaned by the skill injection starting
+        // its own).
+        let skill_inj = serde_json::json!([
+            {
+                "type": "text",
+                "text": "Base directory for this skill: /x/y\n\nbody",
+            },
+        ]);
+        let reply = serde_json::json!([{ "type": "text", "text": "ok" }]);
+        let turns = vec![
+            user_string_turn(
+                "<command-name>/tw-implement-plan</command-name>\n\
+                 <command-args>plan.md</command-args>",
+            ),
+            user_array_turn(skill_inj),
+            assistant_turn_with_content(reply, 100, 50, 0),
+        ];
+        let exchanges = group_into_exchanges(&turns);
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].assistants.len(), 1);
+    }
+
     // --- user_display_string ---
 
     #[test]
@@ -1357,6 +1435,35 @@ mod tests {
         assert_eq!(user_display_string(&Value::Bool(true)), None);
         assert_eq!(user_display_string(&serde_json::json!(42)), None);
         assert_eq!(user_display_string(&serde_json::json!({ "k": "v" })), None);
+    }
+
+    #[test]
+    fn user_display_string_returns_none_for_synthetic_string_content() {
+        let v = Value::String(
+            "<local-command-caveat>heads up: local</local-command-caveat>".to_string(),
+        );
+        assert_eq!(user_display_string(&v), None);
+    }
+
+    #[test]
+    fn user_display_string_returns_none_for_synthetic_array_text_block() {
+        let v = serde_json::json!([
+            { "type": "text", "text": "Base directory for this skill: /x/y\n\nbody" },
+        ]);
+        assert_eq!(user_display_string(&v), None);
+    }
+
+    #[test]
+    fn user_display_string_skips_synthetic_block_and_returns_next() {
+        // Hypothetical but defensible: if an array ever contains a synthetic
+        // text block followed by a real one, the extractor should skip the
+        // synthetic and return the real prose — matching how the show grouper
+        // and title extractor agree on "what the user said".
+        let v = serde_json::json!([
+            { "type": "text", "text": "Base directory for this skill: /x/y" },
+            { "type": "text", "text": "real prose" },
+        ]);
+        assert_eq!(user_display_string(&v), Some("real prose".to_string()));
     }
 
     #[test]
