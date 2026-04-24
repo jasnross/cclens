@@ -379,17 +379,18 @@ fn format_local(ts: DateTime<Utc>) -> String {
 fn render_table(sessions: &[Session]) -> String {
     let mut table = Table::new();
     table.load_preset(NOTHING);
-    table.set_header(vec!["datetime", "project", "title", "tokens"]);
+    table.set_header(vec!["datetime", "project", "title", "tokens", "id"]);
     for session in sessions {
         table.add_row(vec![
             format_local(session.started_at),
             session.project_short_name.clone(),
             truncate_title(&session.title, TITLE_MAX_CHARS),
             session.total_billable.to_string(),
+            session.id.clone(),
         ]);
     }
     // column_mut returns Option; the column is guaranteed present because the
-    // header above defines TOKENS_COL_INDEX + 1 columns.
+    // header above defines the tokens column at TOKENS_COL_INDEX.
     if let Some(col) = table.column_mut(TOKENS_COL_INDEX) {
         col.set_cell_alignment(CellAlignment::Right);
     }
@@ -400,10 +401,10 @@ fn render_table(sessions: &[Session]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::fs as stdfs;
     use std::io::Write;
+
+    use super::*;
 
     // --- test helpers ---
 
@@ -792,12 +793,14 @@ mod tests {
         assert!(out.contains("project"));
         assert!(out.contains("title"));
         assert!(out.contains("tokens"));
+        assert!(out.contains("id"));
         assert!(out.contains("alpha"));
         assert!(out.contains("beta"));
         assert!(out.contains("first title"));
         assert!(out.contains("second title"));
         assert!(out.contains("100"));
         assert!(out.contains("250"));
+        assert!(out.contains("sid"));
     }
 
     #[test]
@@ -832,18 +835,19 @@ mod tests {
             .filter(|l| l.contains("p1") || l.contains("p2"))
             .collect();
         assert_eq!(data_lines.len(), 2);
-        // Right-aligned means both token columns end at the same byte offset
-        // from the end of the line.
-        let end_of_9 = data_lines
-            .iter()
-            .find(|l| l.contains("p1"))
-            .unwrap()
-            .trim_end();
-        let end_of_123456 = data_lines
-            .iter()
-            .find(|l| l.contains("p2"))
-            .unwrap()
-            .trim_end();
+        // Both rows share the same trailing `id` column value ("sid" from
+        // session_for_render), so stripping it leaves the tokens column as the
+        // new right edge — which is where right-alignment is observable.
+        let strip_trailing_id = |l: &str| {
+            l.trim_end()
+                .strip_suffix("sid")
+                .expect("row should end with the hardcoded id column value")
+                .trim_end()
+                .to_string()
+        };
+        let end_of_9 = strip_trailing_id(data_lines.iter().find(|l| l.contains("p1")).unwrap());
+        let end_of_123456 =
+            strip_trailing_id(data_lines.iter().find(|l| l.contains("p2")).unwrap());
         assert!(end_of_9.ends_with('9'));
         assert!(end_of_123456.ends_with("123456"));
         // Right-alignment: the shorter value has leading whitespace padding

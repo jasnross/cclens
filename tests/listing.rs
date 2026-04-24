@@ -28,6 +28,7 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
     assert!(header.contains("project"));
     assert!(header.contains("title"));
     assert!(header.contains("tokens"));
+    assert!(header.contains("id"));
 
     // gamma has no assistant turns, so the zero-billable filter drops it.
     // Scope the check to non-header lines so we assert "no data row references
@@ -40,32 +41,57 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
         "expected no row to reference project 'gamma' (zero-billable filter); stdout was:\n{stdout}",
     );
 
-    // Right-aligned tokens end the row; anchor token assertions to the trimmed
-    // line end so timestamp digits can't spuriously match token digits.
+    // The `id` column is rightmost; right-aligned tokens sit just before it.
+    // Strip the trailing UUID to put tokens back at the line end so token
+    // assertions can anchor on the line end (avoiding spurious matches on
+    // timestamp digits).
+    let strip_trailing_uuid = |l: &str, uuid: &str| {
+        l.trim_end()
+            .strip_suffix(uuid)
+            .unwrap_or_else(|| panic!("row missing expected trailing UUID {uuid}:\n{l}"))
+            .trim_end()
+            .to_string()
+    };
+
+    let alpha_uuid = "aaaa1111-1111-1111-1111-111111111111";
     let alpha = lines
         .iter()
         .find(|l| l.contains("/test-cmd hello world"))
         .expect("alpha row missing");
     assert!(alpha.contains("alpha"));
-    assert!(alpha.trim_end().ends_with(" 650"), "alpha row: {alpha}");
+    assert!(alpha.contains(alpha_uuid), "alpha row missing id: {alpha}");
+    assert!(
+        strip_trailing_uuid(alpha, alpha_uuid).ends_with(" 650"),
+        "alpha row: {alpha}",
+    );
 
+    let beta_prose_uuid = "bbbb2222-2222-2222-2222-222222222222";
     let beta_prose = lines
         .iter()
         .find(|l| l.contains("How do I configure neovim folds?"))
         .expect("beta-prose row missing");
     assert!(beta_prose.contains("beta"));
     assert!(
-        beta_prose.trim_end().ends_with(" 100"),
+        beta_prose.contains(beta_prose_uuid),
+        "beta-prose row missing id: {beta_prose}",
+    );
+    assert!(
+        strip_trailing_uuid(beta_prose, beta_prose_uuid).ends_with(" 100"),
         "beta-prose row: {beta_prose}",
     );
 
+    let beta_late_uuid = "dddd4444-4444-4444-4444-444444444444";
     let beta_late = lines
         .iter()
         .find(|l| l.contains("after malformed"))
         .expect("after-malformed row missing");
     assert!(beta_late.contains("beta"));
     assert!(
-        beta_late.trim_end().ends_with(" 10"),
+        beta_late.contains(beta_late_uuid),
+        "beta-late row missing id: {beta_late}",
+    );
+    assert!(
+        strip_trailing_uuid(beta_late, beta_late_uuid).ends_with(" 10"),
         "beta-late row: {beta_late}",
     );
 
