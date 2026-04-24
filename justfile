@@ -12,7 +12,7 @@ test:
 
 # Format source files
 fmt:
-    cargo fmt
+    cargo +nightly fmt
 
 # Run clippy on all targets
 lint:
