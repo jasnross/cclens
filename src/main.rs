@@ -26,6 +26,11 @@ struct Cli {
 enum Command {
     /// List sessions (default).
     List,
+    /// Show per-exchange token breakdown for one session.
+    Show {
+        /// Full session UUID (matches a .jsonl filename stem under --projects-dir).
+        session_id: String,
+    },
 }
 
 fn default_projects_dir() -> PathBuf {
@@ -39,6 +44,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::List) {
         Command::List => run_list(&cli.projects_dir),
+        Command::Show { session_id } => run_show(&cli.projects_dir, &session_id),
     }
 }
 
@@ -63,6 +69,43 @@ fn run_list(projects_dir: &Path) -> anyhow::Result<()> {
     sessions.sort_by_key(|s| s.started_at);
     println!("{}", render_table(&sessions));
     Ok(())
+}
+
+fn run_show(projects_dir: &Path, session_id: &str) -> anyhow::Result<()> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        anyhow::bail!("session id must not be empty");
+    }
+    let project_entries = discover(projects_dir)?;
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for (_project_dir, jsonl_paths) in project_entries {
+        for jsonl_path in jsonl_paths {
+            let stem = jsonl_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if stem == session_id {
+                matches.push(jsonl_path);
+            }
+        }
+    }
+    match matches.as_slice() {
+        [] => anyhow::bail!("no session matches id {session_id}"),
+        [path] => {
+            let turns = parse_jsonl(path)?;
+            let exchanges = group_into_exchanges(&turns);
+            println!("{}", render_session(&exchanges));
+            Ok(())
+        }
+        paths => {
+            let joined = paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            anyhow::bail!("multiple sessions match id {session_id}:\n  {joined}")
+        }
+    }
 }
 
 // ---- domain ----
@@ -268,31 +311,143 @@ fn extract_title(turns: &[Turn], session_id: &str) -> String {
             continue;
         };
 
-        if let Some(s) = content.as_str() {
-            if SYNTHETIC_USER_CONTENT_PREFIXES
+        // Title-only skip: synthetic-prefix string content is harness noise, not
+        // the user's intent. The show grouper applies the same rule via
+        // `is_substantive_user_turn` before ever calling `user_display_string`.
+        if let Some(s) = content.as_str()
+            && SYNTHETIC_USER_CONTENT_PREFIXES
                 .iter()
                 .any(|p| s.starts_with(p))
-            {
-                continue;
-            }
-            if let Some(title) = extract_slash_command_title(s) {
-                return title;
-            }
-            return s.to_string();
+        {
+            continue;
         }
 
-        if let Some(arr) = content.as_array() {
-            for block in arr {
-                if block.get("type").and_then(Value::as_str) != Some("text") {
-                    continue;
-                }
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    return text.to_string();
-                }
-            }
+        if let Some(title) = user_display_string(content) {
+            return title;
         }
     }
     session_id.to_string()
+}
+
+/// Shared content-extraction primitive: returns the string we'd display for a
+/// user turn's content, or `None` if no displayable string can be derived.
+///
+/// - For string content: reconstructs a slash command if the content is a
+///   `<command-name>…` XML wrapper; otherwise returns the string as-is.
+/// - For array content: returns the first non-empty `"text"` block's text.
+/// - For all other `Value` shapes: returns `None`.
+///
+/// Used by both `extract_title` (list view) and `user_content_preview`
+/// (show view) so the two views agree on what counts as "what the user said".
+fn user_display_string(content: &Value) -> Option<String> {
+    if let Some(s) = content.as_str() {
+        if let Some(title) = extract_slash_command_title(s) {
+            return Some(title);
+        }
+        return Some(s.to_string());
+    }
+    if let Some(arr) = content.as_array() {
+        for block in arr {
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            if let Some(text) = block.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// `true` iff a user-role turn carries real user intent (as opposed to harness
+/// noise or tool-result-only array content). Used by the show grouper to decide
+/// which user turns start a new exchange.
+fn is_substantive_user_turn(turn: &Turn) -> bool {
+    match &turn.role {
+        Role::User => {}
+        Role::Assistant | Role::Attachment | Role::System | Role::Other(_) => return false,
+    }
+    let Some(content) = &turn.content else {
+        return false;
+    };
+    if let Some(s) = content.as_str() {
+        return !SYNTHETIC_USER_CONTENT_PREFIXES
+            .iter()
+            .any(|p| s.starts_with(p));
+    }
+    if let Some(arr) = content.as_array() {
+        return arr.iter().any(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.is_empty())
+        });
+    }
+    false
+}
+
+/// A user turn plus the cluster of consecutive assistant turns that follow it
+/// (up to the next substantive user turn). The `assistants` vec is empty when
+/// the user turn is orphaned at the end of a session with no response.
+#[derive(Debug)]
+struct Exchange<'a> {
+    user: &'a Turn,
+    assistants: Vec<&'a Turn>,
+}
+
+#[derive(Debug)]
+struct ExchangeInProgress<'a> {
+    user: &'a Turn,
+    assistants: Vec<&'a Turn>,
+}
+
+impl<'a> ExchangeInProgress<'a> {
+    fn finish(self) -> Exchange<'a> {
+        Exchange {
+            user: self.user,
+            assistants: self.assistants,
+        }
+    }
+}
+
+fn group_into_exchanges(turns: &[Turn]) -> Vec<Exchange<'_>> {
+    let mut exchanges: Vec<Exchange<'_>> = Vec::new();
+    let mut current: Option<ExchangeInProgress<'_>> = None;
+
+    for turn in turns {
+        match &turn.role {
+            Role::User => {
+                if is_substantive_user_turn(turn) {
+                    if let Some(existing) = current.take() {
+                        exchanges.push(existing.finish());
+                    }
+                    current = Some(ExchangeInProgress {
+                        user: turn,
+                        assistants: Vec::new(),
+                    });
+                }
+                // else: non-substantive user (synthetic wrapper or
+                // tool-result-only array) — absorbed, no row.
+            }
+            Role::Assistant => {
+                if let Some(builder) = current.as_mut() {
+                    builder.assistants.push(turn);
+                }
+                // else: assistant before any substantive user — dropped.
+            }
+            Role::Attachment | Role::System | Role::Other(_) => {
+                // Non-user/non-assistant — absorbed, no row.
+            }
+        }
+    }
+
+    if let Some(existing) = current.take() {
+        exchanges.push(existing.finish());
+    }
+    exchanges
 }
 
 fn extract_slash_command_title(s: &str) -> Option<String> {
@@ -361,6 +516,13 @@ const TITLE_MAX_CHARS: usize = 80;
 // reordering columns requires updating one place, not two.
 const TOKENS_COL_INDEX: usize = 3;
 
+// Indices of the numeric columns in `render_session`'s header:
+//   vec!["datetime", "role", "tokens", "cumulative", "content"]
+//                             idx 2    idx 3
+// Matches the `TOKENS_COL_INDEX` precedent above.
+const SHOW_TOKENS_COL_INDEX: usize = 2;
+const SHOW_CUMULATIVE_COL_INDEX: usize = 3;
+
 fn truncate_title(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -374,6 +536,14 @@ fn format_local(ts: DateTime<Utc>) -> String {
     ts.with_timezone(&chrono::Local)
         .format("%Y-%m-%d %H:%M")
         .to_string()
+}
+
+// Returns the empty string on `None` so `render_session` stays infallible
+// without `.unwrap()` (banned by the `unwrap_used` lint). In practice the
+// timestamp is always present for substantive user turns and assistant turns;
+// this branch exists only to keep the code panic-free.
+fn format_local_or_empty(ts: Option<DateTime<Utc>>) -> String {
+    ts.map_or_else(String::new, format_local)
 }
 
 fn render_table(sessions: &[Session]) -> String {
@@ -392,6 +562,131 @@ fn render_table(sessions: &[Session]) -> String {
     // column_mut returns Option; the column is guaranteed present because the
     // header above defines the tokens column at TOKENS_COL_INDEX.
     if let Some(col) = table.column_mut(TOKENS_COL_INDEX) {
+        col.set_cell_alignment(CellAlignment::Right);
+    }
+    format!("{table}")
+}
+
+fn user_content_preview(turn: &Turn) -> String {
+    // The grouper guarantees the turn is substantive, so `None` is unreachable
+    // in practice; `unwrap_or_default` keeps the renderer infallible without
+    // requiring `.unwrap()`.
+    turn.content
+        .as_ref()
+        .and_then(user_display_string)
+        .unwrap_or_default()
+}
+
+fn assistant_cluster_preview(assistants: &[&Turn]) -> String {
+    // First non-empty text block across the cluster.
+    for a in assistants {
+        let Some(Value::Array(blocks)) = a.content.as_ref() else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            if let Some(text) = block.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                return text.to_string();
+            }
+        }
+    }
+
+    // Fallback: deduped tool-use names, in order of first appearance.
+    let mut names: Vec<String> = Vec::new();
+    for a in assistants {
+        let Some(Value::Array(blocks)) = a.content.as_ref() else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            if let Some(name) = block.get("name").and_then(Value::as_str)
+                && !names.iter().any(|n| n == name)
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.join(", ")
+}
+
+fn count_tool_uses(assistants: &[&Turn]) -> u64 {
+    let mut n: u64 = 0;
+    for a in assistants {
+        let Some(Value::Array(blocks)) = a.content.as_ref() else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+fn render_session(exchanges: &[Exchange<'_>]) -> String {
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+    table.set_header(vec!["datetime", "role", "tokens", "cumulative", "content"]);
+    let mut cumulative: u64 = 0;
+
+    for exchange in exchanges {
+        let user_tokens_opt: Option<u64> = if exchange.assistants.is_empty() {
+            None
+        } else {
+            let sum = exchange
+                .assistants
+                .iter()
+                .filter_map(|t| t.usage.as_ref())
+                .map(|u| u.input + u.cache_creation)
+                .sum();
+            Some(sum)
+        };
+        let output_tokens: u64 = exchange
+            .assistants
+            .iter()
+            .filter_map(|t| t.usage.as_ref())
+            .map(|u| u.output)
+            .sum();
+
+        cumulative += user_tokens_opt.unwrap_or(0);
+        table.add_row(vec![
+            format_local_or_empty(exchange.user.timestamp),
+            "user".to_string(),
+            user_tokens_opt.map_or_else(|| "—".to_string(), |n| n.to_string()),
+            cumulative.to_string(),
+            truncate_title(&user_content_preview(exchange.user), TITLE_MAX_CHARS),
+        ]);
+
+        if let Some(first_assistant) = exchange.assistants.first() {
+            cumulative += output_tokens;
+            let preview = assistant_cluster_preview(&exchange.assistants);
+            let n_tools = count_tool_uses(&exchange.assistants);
+            let content = if n_tools > 0 {
+                format!("{preview} +{n_tools} tool uses")
+            } else {
+                preview
+            };
+            table.add_row(vec![
+                format_local_or_empty(first_assistant.timestamp),
+                "assistant".to_string(),
+                output_tokens.to_string(),
+                cumulative.to_string(),
+                truncate_title(&content, TITLE_MAX_CHARS),
+            ]);
+        }
+    }
+
+    if let Some(col) = table.column_mut(SHOW_TOKENS_COL_INDEX) {
+        col.set_cell_alignment(CellAlignment::Right);
+    }
+    if let Some(col) = table.column_mut(SHOW_CUMULATIVE_COL_INDEX) {
         col.set_cell_alignment(CellAlignment::Right);
     }
     format!("{table}")
@@ -853,5 +1148,544 @@ mod tests {
         // Right-alignment: the shorter value has leading whitespace padding
         // inside its column, so the line is the same length as the longer one.
         assert_eq!(end_of_9.len(), end_of_123456.len());
+    }
+
+    // --- show: additional helpers ---
+
+    fn assistant_turn_with_content(
+        content: Value,
+        input: u64,
+        output: u64,
+        cache_creation: u64,
+    ) -> Turn {
+        Turn {
+            timestamp: Some("2026-04-22T09:00:00Z".parse().unwrap()),
+            role: Role::Assistant,
+            model: Some("claude-opus-4-7".to_string()),
+            usage: Some(Usage {
+                input,
+                output,
+                cache_creation,
+                cache_read: 0,
+            }),
+            content: Some(content),
+            cwd: None,
+        }
+    }
+
+    fn user_turn_role_only(role: Role) -> Turn {
+        Turn {
+            timestamp: None,
+            role,
+            model: None,
+            usage: None,
+            content: Some(Value::String("whatever".to_string())),
+            cwd: None,
+        }
+    }
+
+    // --- is_substantive_user_turn ---
+
+    #[test]
+    fn is_substantive_user_turn_accepts_slash_command() {
+        let turn = user_string_turn("<command-name>/foo</command-name>");
+        assert!(is_substantive_user_turn(&turn));
+    }
+
+    #[test]
+    fn is_substantive_user_turn_accepts_plain_prose() {
+        let turn = user_string_turn("hello");
+        assert!(is_substantive_user_turn(&turn));
+    }
+
+    #[test]
+    fn is_substantive_user_turn_rejects_local_command_caveat() {
+        let turn = user_string_turn("<local-command-caveat>heads up</local-command-caveat>");
+        assert!(!is_substantive_user_turn(&turn));
+    }
+
+    #[test]
+    fn is_substantive_user_turn_rejects_local_command_stdout() {
+        let turn = user_string_turn("<local-command-stdout>output</local-command-stdout>");
+        assert!(!is_substantive_user_turn(&turn));
+    }
+
+    #[test]
+    fn is_substantive_user_turn_rejects_local_command_stderr() {
+        let turn = user_string_turn("<local-command-stderr>oops</local-command-stderr>");
+        assert!(!is_substantive_user_turn(&turn));
+    }
+
+    #[test]
+    fn is_substantive_user_turn_rejects_tool_result_only_array() {
+        let content = serde_json::json!([
+            { "type": "tool_result", "content": "..." },
+        ]);
+        assert!(!is_substantive_user_turn(&user_array_turn(content)));
+    }
+
+    #[test]
+    fn is_substantive_user_turn_accepts_array_with_text_block() {
+        let content = serde_json::json!([
+            { "type": "tool_result", "content": "..." },
+            { "type": "text", "text": "real prose" },
+        ]);
+        assert!(is_substantive_user_turn(&user_array_turn(content)));
+    }
+
+    #[test]
+    fn is_substantive_user_turn_rejects_empty_text_block() {
+        let content = serde_json::json!([
+            { "type": "tool_result", "content": "..." },
+            { "type": "text", "text": "" },
+        ]);
+        assert!(!is_substantive_user_turn(&user_array_turn(content)));
+    }
+
+    #[test]
+    fn is_substantive_user_turn_rejects_assistant_role() {
+        assert!(!is_substantive_user_turn(&user_turn_role_only(
+            Role::Assistant,
+        )));
+    }
+
+    // --- group_into_exchanges ---
+
+    #[test]
+    fn group_into_exchanges_collapses_tool_loop() {
+        let tool_result = serde_json::json!([
+            { "type": "tool_result", "tool_use_id": "x", "content": "ok" },
+        ]);
+        let tool_use = serde_json::json!([
+            { "type": "tool_use", "name": "Read", "id": "x", "input": {} },
+        ]);
+        let text = serde_json::json!([
+            { "type": "text", "text": "done" },
+        ]);
+        let turns = vec![
+            user_string_turn("hello"),
+            assistant_turn_with_content(tool_use, 1, 1, 0),
+            user_array_turn(tool_result),
+            assistant_turn_with_content(text, 1, 1, 0),
+        ];
+        let exchanges = group_into_exchanges(&turns);
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].assistants.len(), 2);
+    }
+
+    #[test]
+    fn group_into_exchanges_orphan_final_user() {
+        let text = serde_json::json!([{ "type": "text", "text": "reply" }]);
+        let turns = vec![
+            user_string_turn("first"),
+            assistant_turn_with_content(text, 1, 1, 0),
+            user_string_turn("second"),
+        ];
+        let exchanges = group_into_exchanges(&turns);
+        assert_eq!(exchanges.len(), 2);
+        assert!(exchanges[1].assistants.is_empty());
+    }
+
+    #[test]
+    fn group_into_exchanges_drops_assistant_before_any_user() {
+        let text = serde_json::json!([{ "type": "text", "text": "stray" }]);
+        let turns = vec![
+            assistant_turn_with_content(text.clone(), 1, 1, 0),
+            user_string_turn("hello"),
+            assistant_turn_with_content(text, 1, 1, 0),
+        ];
+        let exchanges = group_into_exchanges(&turns);
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].assistants.len(), 1);
+    }
+
+    #[test]
+    fn group_into_exchanges_skips_local_command_caveat() {
+        let text = serde_json::json!([{ "type": "text", "text": "reply" }]);
+        let turns = vec![
+            user_string_turn("<local-command-caveat>noise</local-command-caveat>"),
+            user_string_turn("real question"),
+            assistant_turn_with_content(text, 1, 1, 0),
+        ];
+        let exchanges = group_into_exchanges(&turns);
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].assistants.len(), 1);
+    }
+
+    #[test]
+    fn group_into_exchanges_handles_empty_input() {
+        let exchanges = group_into_exchanges(&[]);
+        assert!(exchanges.is_empty());
+    }
+
+    // --- user_display_string ---
+
+    #[test]
+    fn user_display_string_slash_command_roundtrip() {
+        let v = Value::String(
+            "<command-name>/foo</command-name><command-args>bar</command-args>".to_string(),
+        );
+        assert_eq!(user_display_string(&v), Some("/foo bar".to_string()));
+    }
+
+    #[test]
+    fn user_display_string_plain_prose_returns_as_is() {
+        let v = Value::String("hello world".to_string());
+        assert_eq!(user_display_string(&v), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn user_display_string_array_first_text_block() {
+        let v = serde_json::json!([
+            { "type": "tool_result", "content": "..." },
+            { "type": "text", "text": "hello" },
+        ]);
+        assert_eq!(user_display_string(&v), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn user_display_string_returns_none_for_tool_result_only_array() {
+        let v = serde_json::json!([
+            { "type": "tool_result", "content": "..." },
+        ]);
+        assert_eq!(user_display_string(&v), None);
+    }
+
+    #[test]
+    fn user_display_string_returns_none_for_unsupported_value_shapes() {
+        assert_eq!(user_display_string(&Value::Null), None);
+        assert_eq!(user_display_string(&Value::Bool(true)), None);
+        assert_eq!(user_display_string(&serde_json::json!(42)), None);
+        assert_eq!(user_display_string(&serde_json::json!({ "k": "v" })), None);
+    }
+
+    #[test]
+    fn extract_title_still_passes_after_refactor() {
+        // Redundancy guard: confirms the refactor to delegate through
+        // `user_display_string` didn't break the existing slash-command case.
+        let content = "<command-name>/tw-create-idea</command-name>\n\
+                       <command-args>build a CLI</command-args>";
+        let turns = vec![user_string_turn(content)];
+        assert_eq!(
+            extract_title(&turns, "fallback"),
+            "/tw-create-idea build a CLI",
+        );
+    }
+
+    // --- user_content_preview ---
+
+    #[test]
+    fn user_content_preview_delegates_to_user_display_string() {
+        let content = serde_json::json!([
+            { "type": "tool_result", "content": "..." },
+            { "type": "text", "text": "hello" },
+        ]);
+        let turn = user_array_turn(content);
+        assert_eq!(user_content_preview(&turn), "hello");
+    }
+
+    #[test]
+    fn user_content_preview_returns_empty_string_on_unreachable_none() {
+        let turn = Turn {
+            timestamp: None,
+            role: Role::User,
+            model: None,
+            usage: None,
+            content: Some(Value::Null),
+            cwd: None,
+        };
+        assert_eq!(user_content_preview(&turn), "");
+    }
+
+    // --- assistant_cluster_preview ---
+
+    #[test]
+    fn assistant_cluster_preview_first_text_block() {
+        // First assistant has only a tool_use; second opens with a text block.
+        let tu = serde_json::json!([
+            { "type": "tool_use", "name": "Read", "id": "x", "input": {} },
+        ]);
+        let tx = serde_json::json!([
+            { "type": "text", "text": "found it" },
+        ]);
+        let a1 = assistant_turn_with_content(tu, 0, 0, 0);
+        let a2 = assistant_turn_with_content(tx, 0, 0, 0);
+        let cluster: Vec<&Turn> = vec![&a1, &a2];
+        assert_eq!(assistant_cluster_preview(&cluster), "found it");
+    }
+
+    #[test]
+    fn assistant_cluster_preview_falls_back_to_deduped_tool_names() {
+        let tu_a = serde_json::json!([
+            { "type": "tool_use", "name": "Read", "id": "1", "input": {} },
+            { "type": "tool_use", "name": "Bash", "id": "2", "input": {} },
+        ]);
+        let tu_b = serde_json::json!([
+            { "type": "tool_use", "name": "Read", "id": "3", "input": {} },
+            { "type": "tool_use", "name": "Edit", "id": "4", "input": {} },
+        ]);
+        let a1 = assistant_turn_with_content(tu_a, 0, 0, 0);
+        let a2 = assistant_turn_with_content(tu_b, 0, 0, 0);
+        let cluster: Vec<&Turn> = vec![&a1, &a2];
+        assert_eq!(assistant_cluster_preview(&cluster), "Read, Bash, Edit");
+    }
+
+    #[test]
+    fn assistant_cluster_preview_empty_cluster_returns_empty_string() {
+        let cluster: Vec<&Turn> = Vec::new();
+        assert_eq!(assistant_cluster_preview(&cluster), "");
+    }
+
+    // --- count_tool_uses ---
+
+    #[test]
+    fn count_tool_uses_counts_across_cluster() {
+        let a_content = serde_json::json!([
+            { "type": "tool_use", "name": "Read", "id": "1", "input": {} },
+        ]);
+        let b_content = serde_json::json!([
+            { "type": "text", "text": "..." },
+            { "type": "tool_use", "name": "Bash", "id": "2", "input": {} },
+            { "type": "tool_use", "name": "Edit", "id": "3", "input": {} },
+        ]);
+        let a1 = assistant_turn_with_content(a_content, 0, 0, 0);
+        let a2 = assistant_turn_with_content(b_content, 0, 0, 0);
+        let cluster: Vec<&Turn> = vec![&a1, &a2];
+        assert_eq!(count_tool_uses(&cluster), 3);
+    }
+
+    #[test]
+    fn count_tool_uses_zero_for_text_only_cluster() {
+        let tx = serde_json::json!([{ "type": "text", "text": "hi" }]);
+        let a = assistant_turn_with_content(tx, 0, 0, 0);
+        let cluster: Vec<&Turn> = vec![&a];
+        assert_eq!(count_tool_uses(&cluster), 0);
+    }
+
+    // --- render_session ---
+
+    fn show_user_turn(content: &str, ts: &str) -> Turn {
+        Turn {
+            timestamp: Some(ts.parse().unwrap()),
+            role: Role::User,
+            model: None,
+            usage: None,
+            content: Some(Value::String(content.to_string())),
+            cwd: None,
+        }
+    }
+
+    fn show_assistant_turn(
+        content: Value,
+        input: u64,
+        output: u64,
+        cache_creation: u64,
+        ts: &str,
+    ) -> Turn {
+        Turn {
+            timestamp: Some(ts.parse().unwrap()),
+            role: Role::Assistant,
+            model: Some("claude-opus-4-7".to_string()),
+            usage: Some(Usage {
+                input,
+                output,
+                cache_creation,
+                cache_read: 0,
+            }),
+            content: Some(content),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn render_session_header_includes_all_five_columns() {
+        let out = render_session(&[]);
+        assert!(out.contains("datetime"));
+        assert!(out.contains("role"));
+        assert!(out.contains("tokens"));
+        assert!(out.contains("cumulative"));
+        assert!(out.contains("content"));
+    }
+
+    #[test]
+    fn render_session_orphan_user_shows_em_dash_and_preserves_cumulative() {
+        let u1 = show_user_turn("first", "2026-04-01T10:00:00Z");
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "reply" }]),
+            12000,
+            345,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        let u2 = show_user_turn("orphan", "2026-04-01T10:02:00Z");
+        // Assistant row tokens column = 345 (output), cumulative after it =
+        // 12000 + 345 = 12345.
+        let exchanges = vec![
+            Exchange {
+                user: &u1,
+                assistants: vec![&a1],
+            },
+            Exchange {
+                user: &u2,
+                assistants: Vec::new(),
+            },
+        ];
+        let out = render_session(&exchanges);
+        let lines: Vec<&str> = out.lines().collect();
+        let assistant_line = lines
+            .iter()
+            .find(|l| l.contains("reply"))
+            .expect("assistant row missing");
+        let orphan_line = lines
+            .iter()
+            .find(|l| l.contains("orphan"))
+            .expect("orphan row missing");
+
+        // Orphan row's tokens column shows the em-dash and cumulative is
+        // preserved from the prior row.
+        assert!(orphan_line.contains('—'));
+        assert!(orphan_line.contains("12345"));
+
+        // Strip the trailing content column so the numeric columns sit at the
+        // right edge, then verify em-dash and numeric strings right-align to
+        // the same character position.
+        let strip_content = |l: &str, marker: &str| {
+            let trimmed = l.trim_end();
+            let cut = trimmed
+                .rfind(marker)
+                .expect("marker should be in the content column");
+            trimmed[..cut].trim_end().to_string()
+        };
+        let a_cols = strip_content(assistant_line, "reply");
+        let o_cols = strip_content(orphan_line, "orphan");
+        assert!(a_cols.ends_with("12345"));
+        assert!(o_cols.ends_with("12345"));
+        // Right-aligned: the trailing cumulative columns end at the same
+        // character position, so the preceding lines (through tokens + spaces +
+        // cumulative) have the same scalar count. Compare by chars, not bytes,
+        // because `—` is 1 scalar but 3 UTF-8 bytes — `.len()` would report a
+        // spurious 2-byte difference even when columns are visually aligned.
+        assert_eq!(a_cols.chars().count(), o_cols.chars().count());
+    }
+
+    #[test]
+    fn render_session_cumulative_reaches_sum_of_billable() {
+        let u1 = show_user_turn("q1", "2026-04-01T10:00:00Z");
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "r1" }]),
+            100,
+            50,
+            200,
+            "2026-04-01T10:01:00Z",
+        );
+        let u2 = show_user_turn("q2", "2026-04-01T10:02:00Z");
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "r2" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:03:00Z",
+        );
+        let exchanges = vec![
+            Exchange {
+                user: &u1,
+                assistants: vec![&a1],
+            },
+            Exchange {
+                user: &u2,
+                assistants: vec![&a2],
+            },
+        ];
+        // Expected billable total = (100+50+200) + (10+20+0) = 380.
+        let out = render_session(&exchanges);
+        let last_line = out
+            .lines()
+            .rfind(|l| l.contains("r2"))
+            .expect("final assistant row missing");
+        assert!(
+            last_line.contains(" 380"),
+            "expected final cumulative 380 on last assistant row; got: {last_line}",
+        );
+    }
+
+    #[test]
+    fn render_session_right_aligns_numeric_columns() {
+        let u1 = show_user_turn("small", "2026-04-01T10:00:00Z");
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "s" }]),
+            0,
+            9,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        let u2 = show_user_turn("big", "2026-04-01T10:02:00Z");
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "b" }]),
+            0,
+            123_456,
+            0,
+            "2026-04-01T10:03:00Z",
+        );
+        let exchanges = vec![
+            Exchange {
+                user: &u1,
+                assistants: vec![&a1],
+            },
+            Exchange {
+                user: &u2,
+                assistants: vec![&a2],
+            },
+        ];
+        let out = render_session(&exchanges);
+        // The two assistant rows have content 's' and 'b'. Strip the content
+        // column so the cumulative column sits at the right edge.
+        let a_small = out
+            .lines()
+            .find(|l| l.trim_end().ends_with(" s"))
+            .expect("small assistant row missing");
+        let a_big = out
+            .lines()
+            .find(|l| l.trim_end().ends_with(" b"))
+            .expect("big assistant row missing");
+        let strip_tail = |l: &str, tail: &str| {
+            l.trim_end()
+                .strip_suffix(tail)
+                .unwrap_or(l)
+                .trim_end()
+                .to_string()
+        };
+        let small_cols = strip_tail(a_small, "s");
+        let big_cols = strip_tail(a_big, "b");
+        // Cumulative column values: 9 for small row, 9 + 123456 = 123465 for
+        // big row. Widths of tokens + cumulative parts must match (right-
+        // aligned to the same column boundaries).
+        assert!(small_cols.ends_with('9'));
+        assert!(big_cols.ends_with("123465"));
+        assert_eq!(small_cols.len(), big_cols.len());
+    }
+
+    #[test]
+    fn render_session_tool_use_suffix_appears_on_assistant_row() {
+        let u = show_user_turn("q", "2026-04-01T10:00:00Z");
+        let a = show_assistant_turn(
+            serde_json::json!([
+                { "type": "text", "text": "reading" },
+                { "type": "tool_use", "name": "Read", "id": "1", "input": {} },
+                { "type": "tool_use", "name": "Bash", "id": "2", "input": {} },
+            ]),
+            0,
+            1,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        let exchanges = vec![Exchange {
+            user: &u,
+            assistants: vec![&a],
+        }];
+        let out = render_session(&exchanges);
+        assert!(
+            out.contains("reading +2 tool uses"),
+            "expected tool-use suffix; got:\n{out}",
+        );
     }
 }

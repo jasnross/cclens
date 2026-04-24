@@ -1,0 +1,10 @@
+{"type":"permission-mode","mode":"default"}
+{"type":"user","timestamp":"2026-04-22T09:00:00Z","cwd":"/Users/test/show-fixture","message":{"content":"<command-name>/test-cmd</command-name>\n<command-args>demo</command-args>"}}
+{"type":"assistant","timestamp":"2026-04-22T09:01:00Z","cwd":"/Users/test/show-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":200,"cache_read_input_tokens":50},"content":[{"type":"tool_use","name":"Read","id":"tu_1","input":{"path":"/tmp/x"}}]}}
+{"type":"user","timestamp":"2026-04-22T09:02:00Z","cwd":"/Users/test/show-fixture","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"file contents"}]}}
+{"type":"assistant","timestamp":"2026-04-22T09:03:00Z","cwd":"/Users/test/show-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":150,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"reading the file"},{"type":"tool_use","name":"Bash","id":"tu_2","input":{"command":"ls"}}]}}
+{"type":"user","timestamp":"2026-04-22T09:04:00Z","cwd":"/Users/test/show-fixture","message":{"content":[{"type":"tool_result","tool_use_id":"tu_2","content":"command output"}]}}
+{"type":"assistant","timestamp":"2026-04-22T09:05:00Z","cwd":"/Users/test/show-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":5,"output_tokens":80,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"all done"}]}}
+{"type":"user","timestamp":"2026-04-22T09:06:00Z","cwd":"/Users/test/show-fixture","message":{"content":"follow-up question"}}
+{"type":"assistant","timestamp":"2026-04-22T09:07:00Z","cwd":"/Users/test/show-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":20,"output_tokens":60,"cache_creation_input_tokens":100,"cache_read_input_tokens":0},"content":[{"type":"text","text":"answer"}]}}
+{"type":"user","timestamp":"2026-04-22T09:08:00Z","cwd":"/Users/test/show-fixture","message":{"content":"third question with no response"}}

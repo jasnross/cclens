@@ -141,3 +141,160 @@ fn list_handles_empty_projects_dir() {
         "empty projects_dir should produce no data rows; got:\n{stdout}",
     );
 }
+
+#[test]
+fn show_renders_per_exchange_table_with_tool_loop_collapse_and_orphan_user() {
+    let out = Command::cargo_bin("cclens")
+        .unwrap()
+        .args(["--projects-dir"])
+        .arg(fixtures_dir())
+        .arg("show")
+        .arg("eeee5555-5555-5555-5555-555555555555")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    let header = lines
+        .iter()
+        .find(|l| l.contains("datetime"))
+        .expect("header row missing");
+    for col in ["role", "tokens", "cumulative", "content"] {
+        assert!(header.contains(col), "header missing {col}: {header}");
+    }
+
+    // Strip the trailing content-column marker, then trim padding, leaving the
+    // cumulative column at the right edge where its value can be anchored.
+    // Mirrors the `strip_trailing_uuid` discipline in the list test above.
+    let strip_trailing_marker = |line: &str, marker: &str| -> String {
+        let trimmed = line.trim_end();
+        let idx = trimmed
+            .rfind(marker)
+            .unwrap_or_else(|| panic!("row missing marker {marker:?}:\n{line}"));
+        trimmed[..idx].trim_end().to_string()
+    };
+
+    // (content-marker, tokens-column match, cumulative-column value)
+    // Tokens anchors use ` <N> ` (surrounding spaces) — small integers like
+    // `60` or `120` would otherwise collide with timestamp fragments. The
+    // orphan row pins on the em-dash directly.
+    //
+    // ` answer ` is space-padded because `answer` alone would also match
+    // inside `"third question with no response"`'s `"answer"`-adjacent
+    // context on some future fixture — the padded form restricts the match
+    // to whole-word occurrences in the rendered table.
+    let expected = [
+        ("/test-cmd demo", " 315 ", "315"),
+        ("reading the file +2 tool uses", " 280 ", "595"),
+        ("follow-up question", " 120 ", "715"),
+        (" answer ", " 60 ", "775"),
+        ("third question with no response", "—", "775"),
+    ];
+    let mut positions: Vec<usize> = Vec::with_capacity(expected.len());
+    for (marker, tokens, cumulative) in expected {
+        let idx = lines
+            .iter()
+            .position(|l| l.contains(marker))
+            .unwrap_or_else(|| panic!("row {marker:?} missing:\n{stdout}"));
+        let line = lines[idx];
+        assert!(
+            line.contains(tokens),
+            "row {marker:?} missing tokens {tokens:?}: {line}",
+        );
+        let cols = strip_trailing_marker(line, marker.trim());
+        assert!(
+            cols.ends_with(cumulative),
+            "row {marker:?} cumulative should be {cumulative}; got: {line}",
+        );
+        positions.push(idx);
+    }
+    for window in positions.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "expected chronological order; positions: {positions:?}",
+        );
+    }
+}
+
+#[test]
+fn show_errors_on_unknown_session_id() {
+    let unknown = "00000000-0000-0000-0000-000000000000";
+    let output = Command::cargo_bin("cclens")
+        .unwrap()
+        .args(["--projects-dir"])
+        .arg(fixtures_dir())
+        .arg("show")
+        .arg(unknown)
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8(output).unwrap();
+    assert!(
+        stderr.contains("no session"),
+        "stderr should contain 'no session'; got:\n{stderr}",
+    );
+    assert!(
+        stderr.contains(unknown),
+        "stderr should contain the unknown id; got:\n{stderr}",
+    );
+}
+
+#[test]
+fn show_works_on_zero_billable_session() {
+    let stdout_bytes = Command::cargo_bin("cclens")
+        .unwrap()
+        .args(["--projects-dir"])
+        .arg(fixtures_dir())
+        .arg("show")
+        .arg("cccc3333-3333-3333-3333-333333333333")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    let header = lines
+        .iter()
+        .find(|l| l.contains("datetime"))
+        .expect("header row missing");
+    for col in ["role", "tokens", "cumulative", "content"] {
+        assert!(
+            header.contains(col),
+            "header should contain column {col}; got: {header}",
+        );
+    }
+
+    let data_rows: Vec<&&str> = lines
+        .iter()
+        .filter(|l| l.contains("hello but nothing replies"))
+        .collect();
+    assert_eq!(
+        data_rows.len(),
+        1,
+        "expected exactly one data row; got {}:\n{stdout}",
+        data_rows.len(),
+    );
+    let row = data_rows[0];
+    // Strip the content-column marker so the cumulative column sits at the
+    // right edge, then pin the trailing value.
+    let trimmed = row.trim_end();
+    let idx = trimmed
+        .rfind("hello but nothing replies")
+        .expect("row missing content marker");
+    let cols = trimmed[..idx].trim_end();
+    assert!(
+        row.contains('—'),
+        "orphan row should show em-dash in tokens; got: {row}",
+    );
+    assert!(
+        cols.ends_with('0'),
+        "orphan row cumulative should be 0; got: {row}",
+    );
+}

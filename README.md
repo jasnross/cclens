@@ -11,7 +11,9 @@ stdout.
 cargo install --path .
 ```
 
-## Usage
+## Commands
+
+### list
 
 Bare invocation lists all sessions sorted oldest-first:
 
@@ -36,7 +38,7 @@ Point at a non-default location (e.g. a backup or sshfs mount) with
 $ cclens --projects-dir /mnt/backup/claude/projects list
 ```
 
-## Columns
+#### Columns
 
 - **datetime** — local-timezone start of the session (`YYYY-MM-DD HH:MM`).
 - **project** — final path segment of the session's working directory.
@@ -50,6 +52,36 @@ $ cclens --projects-dir /mnt/backup/claude/projects list
 Sessions with zero billable tokens are hidden. Malformed JSONL lines are
 silently skipped. One unreadable file or project directory does not abort
 the listing.
+
+### show
+
+Drill into a single session and see a per-exchange token breakdown:
+
+```sh
+$ cclens show <session-id>
+```
+
+The session ID argument must match a full session UUID exactly (case-
+sensitive; surrounding whitespace is trimmed). Tool-use round-trips
+(assistant tool call → user tool result → assistant reply) collapse into a
+single exchange; orphaned trailing user turns (no assistant response) render
+with `—` in the tokens column.
+
+Unlike `list`, `show` does not hide zero-billable sessions — it's an
+inspection tool and will render any valid session ID.
+
+#### Columns
+
+- **datetime** — local-timezone timestamp of the turn (`YYYY-MM-DD HH:MM`).
+- **role** — `user` or `assistant`.
+- **tokens** — per-row token total. User rows count
+  `input + cache_creation` across the following assistant cluster; assistant
+  rows count `output`. Orphan user rows show `—`.
+- **cumulative** — running sum of billable tokens through this row. Matches
+  the session's `list` tokens value at the final assistant row.
+- **content** — user prose (or slash-command reconstruction) on user rows;
+  assistant reply preview with an optional `+N tool uses` suffix on assistant
+  rows. Truncated to 80 characters with `…`.
 
 ## Development
 
