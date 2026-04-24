@@ -1,33 +1,20 @@
 // `allow-expect-in-tests` / `allow-unwrap-in-tests` in clippy.toml cover
 // code inside `#[test]` functions only. This file has module-level
-// helpers (`isolated_cache`, `run_cclens_with_env`) that use `unwrap`
-// and `expect`, so the file-wide allow is the minimum escape hatch —
-// per-item allows would also work but scatter the intent.
+// helpers that use `unwrap` and `expect`, so the file-wide allow is
+// the minimum escape hatch — per-item allows would also work but
+// scatter the intent.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::path::PathBuf;
+mod common;
 
-use assert_cmd::Command;
-
-fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/pricing")
-        .join(name)
-}
-
-fn fixture_url(name: &str) -> String {
-    format!("file://{}", fixture_path(name).display())
-}
+use common::{cclens_command, pricing_fixture_url};
 
 fn isolated_cache() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
 fn run_cclens_with_env(args: &[&str], pricing_url: &str, cache_dir: &std::path::Path) -> Vec<u8> {
-    Command::cargo_bin("cclens")
-        .unwrap()
-        .env("CCLENS_PRICING_URL", pricing_url)
-        .env("CCLENS_CACHE_DIR", cache_dir)
+    cclens_command(cache_dir, pricing_url)
         .args(args)
         .assert()
         .success()
@@ -43,10 +30,7 @@ fn run_cclens_expect_failure(
     pricing_url: &str,
     cache_dir: &std::path::Path,
 ) -> Vec<u8> {
-    Command::cargo_bin("cclens")
-        .unwrap()
-        .env("CCLENS_PRICING_URL", pricing_url)
-        .env("CCLENS_CACHE_DIR", cache_dir)
+    cclens_command(cache_dir, pricing_url)
         .args(args)
         .assert()
         .failure()
@@ -60,7 +44,7 @@ fn pricing_refresh_writes_cache() {
     let cache = isolated_cache();
     let stdout = run_cclens_with_env(
         &["pricing", "refresh"],
-        &fixture_url("litellm-mini.json"),
+        &pricing_fixture_url("litellm-mini.json"),
         cache.path(),
     );
     let out = String::from_utf8(stdout).unwrap();
@@ -85,12 +69,12 @@ fn pricing_info_reports_after_refresh() {
     // First refresh, then info.
     let _ = run_cclens_with_env(
         &["pricing", "refresh"],
-        &fixture_url("litellm-mini.json"),
+        &pricing_fixture_url("litellm-mini.json"),
         cache.path(),
     );
     let stdout = run_cclens_with_env(
         &["pricing", "info"],
-        &fixture_url("litellm-mini.json"),
+        &pricing_fixture_url("litellm-mini.json"),
         cache.path(),
     );
     let out = String::from_utf8(stdout).unwrap();
@@ -113,7 +97,7 @@ fn pricing_info_when_cache_missing() {
     let cache = isolated_cache();
     let stdout = run_cclens_with_env(
         &["pricing", "info"],
-        &fixture_url("litellm-mini.json"),
+        &pricing_fixture_url("litellm-mini.json"),
         cache.path(),
     );
     let out = String::from_utf8(stdout).unwrap();
@@ -131,12 +115,12 @@ fn pricing_refresh_reports_previous_size() {
     // non-zero previous size.
     let _ = run_cclens_with_env(
         &["pricing", "refresh"],
-        &fixture_url("litellm-empty.json"),
+        &pricing_fixture_url("litellm-empty.json"),
         cache.path(),
     );
     let stdout = run_cclens_with_env(
         &["pricing", "refresh"],
-        &fixture_url("litellm-mini.json"),
+        &pricing_fixture_url("litellm-mini.json"),
         cache.path(),
     );
     let out = String::from_utf8(stdout).unwrap();
@@ -157,7 +141,7 @@ fn pricing_refresh_failure_preserves_previous_cache() {
     let cache = isolated_cache();
     let _ = run_cclens_with_env(
         &["pricing", "refresh"],
-        &fixture_url("litellm-mini.json"),
+        &pricing_fixture_url("litellm-mini.json"),
         cache.path(),
     );
     let cache_file = cache.path().join("litellm-pricing.json");
@@ -192,7 +176,7 @@ fn pricing_info_on_corrupt_cache() {
 
     let stdout = run_cclens_with_env(
         &["pricing", "info"],
-        &fixture_url("litellm-mini.json"),
+        &pricing_fixture_url("litellm-mini.json"),
         cache.path(),
     );
     let out = String::from_utf8(stdout).unwrap();

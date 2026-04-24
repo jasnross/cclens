@@ -14,11 +14,6 @@
 //! Claude's 200k-tier rates and includes `cache_read` tokens (which
 //! `Usage::billable()` deliberately excludes).
 
-// Phase 3 is still pending — aggregation and rendering will consume
-// `cost_for_turn` / `cost_for_components`. Silence dead-code warnings
-// module-wide until those wiring points land.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -375,7 +370,7 @@ fn resolve_catalog_url() -> String {
 /// - anything else — treat as a filesystem path.
 fn fetch_catalog_body(url: &str) -> Result<String, PricingError> {
     if let Some(path) = url.strip_prefix("file://") {
-        return Ok(fs::read_to_string(path)?);
+        return fs::read_to_string(path).map_err(|e| PricingError::Fetch(e.to_string()));
     }
     if url.starts_with("http://") || url.starts_with("https://") {
         let agent = ureq::AgentBuilder::new()
@@ -389,7 +384,7 @@ fn fetch_catalog_body(url: &str) -> Result<String, PricingError> {
             .into_string()
             .map_err(|e| PricingError::Fetch(e.to_string()));
     }
-    Ok(fs::read_to_string(url)?)
+    fs::read_to_string(url).map_err(|e| PricingError::Fetch(e.to_string()))
 }
 
 // ---- cache ----

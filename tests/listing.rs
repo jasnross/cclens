@@ -1,17 +1,23 @@
-use std::path::PathBuf;
+// Listing/show integration tests must be hermetic — they all set
+// `CCLENS_PRICING_URL` to a local fixture and `CCLENS_CACHE_DIR` to a
+// fresh tempdir so they never read or write the user's real cache.
 
-use assert_cmd::Command;
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
-fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/projects")
+mod common;
+
+use common::{cclens_command, pricing_fixture_url, projects_fixture_dir};
+
+fn isolated_cache() -> tempfile::TempDir {
+    tempfile::tempdir().expect("tempdir")
 }
 
 #[test]
 fn list_renders_sessions_oldest_first_with_correct_totals() {
-    let out = Command::cargo_bin("cclens")
-        .unwrap()
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
         .args(["--projects-dir"])
-        .arg(fixtures_dir())
+        .arg(projects_fixture_dir())
         .arg("list")
         .assert()
         .success()
@@ -25,14 +31,12 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
         .iter()
         .find(|l| l.contains("datetime"))
         .expect("header row missing");
-    assert!(header.contains("project"));
-    assert!(header.contains("title"));
-    assert!(header.contains("tokens"));
-    assert!(header.contains("id"));
+    for col in ["project", "title", "tokens", "cost", "id"] {
+        assert!(header.contains(col), "header missing {col}: {header}");
+    }
 
-    // gamma has no assistant turns, so the zero-billable filter drops it.
-    // Scope the check to non-header lines so we assert "no data row references
-    // gamma" specifically (the header doesn't mention project names).
+    // gamma has no assistant turns, so the zero-billable AND zero-cost
+    // filter drops it. Scope the check to non-header lines.
     assert!(
         lines
             .iter()
@@ -41,29 +45,55 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
         "expected no row to reference project 'gamma' (zero-billable filter); stdout was:\n{stdout}",
     );
 
-    // The `id` column is rightmost; right-aligned tokens sit just before it.
-    // Strip the trailing UUID to put tokens back at the line end so token
-    // assertions can anchor on the line end (avoiding spurious matches on
-    // timestamp digits).
-    let strip_trailing_uuid = |l: &str, uuid: &str| {
-        l.trim_end()
+    // Column order is now: datetime project title tokens cost id.
+    // Strip the trailing UUID, then strip the cost cell (always
+    // present since fixtures use `claude-opus-4-7`), to put tokens
+    // back at the line end for the per-row token assertions.
+    let strip_uuid_and_cost = |l: &str, uuid: &str| -> (String, String) {
+        let after_uuid = l
+            .trim_end()
             .strip_suffix(uuid)
             .unwrap_or_else(|| panic!("row missing expected trailing UUID {uuid}:\n{l}"))
-            .trim_end()
-            .to_string()
+            .trim_end();
+        // The cost cell is `$X.XXXX` for any priced session.
+        let dollar_idx = after_uuid
+            .rfind('$')
+            .unwrap_or_else(|| panic!("expected `$` cost cell in row:\n{l}"));
+        let cost_cell = after_uuid[dollar_idx..].to_string();
+        let pre_cost = after_uuid[..dollar_idx].trim_end().to_string();
+        (pre_cost, cost_cell)
     };
 
+    // Hand-computed costs from the pricing fixture's claude-opus-4-7
+    // rates (input=15e-6, output=75e-6, cache_creation=18.75e-6,
+    // cache_read=1.5e-6) applied to each session's assistant turns.
+    //
+    // alpha: turn1 (100,200,300,9999) + turn2 (50,0,0,0)
+    //   = 0.0015 + 0.015 + 0.005625 + 0.0149985  + 0.00075
+    //   = 0.0378735 → "$0.0379"
+    //
+    // beta-prose: turn (10,90,0,0)
+    //   = 0.00015 + 0.00675
+    //   = 0.0069 → "$0.0069"
+    //
+    // beta-after-malformed: turn (5,5,0,0)
+    //   = 0.000075 + 0.000375
+    //   = 0.00045 → "$0.0004" (Rust's `{:.4}` banker's-rounds the
+    //   tie-on-an-odd-digit, plus the f64 representation of 0.00045
+    //   is slightly less than the rational value, so it rounds down)
     let alpha_uuid = "aaaa1111-1111-1111-1111-111111111111";
     let alpha = lines
         .iter()
         .find(|l| l.contains("/test-cmd hello world"))
         .expect("alpha row missing");
     assert!(alpha.contains("alpha"));
-    assert!(alpha.contains(alpha_uuid), "alpha row missing id: {alpha}");
+    assert!(alpha.contains(alpha_uuid));
+    let (alpha_pre_cost, alpha_cost) = strip_uuid_and_cost(alpha, alpha_uuid);
     assert!(
-        strip_trailing_uuid(alpha, alpha_uuid).ends_with(" 650"),
-        "alpha row: {alpha}",
+        alpha_pre_cost.ends_with(" 650"),
+        "alpha tokens column: {alpha_pre_cost}",
     );
+    assert_eq!(alpha_cost, "$0.0379", "alpha cost cell");
 
     let beta_prose_uuid = "bbbb2222-2222-2222-2222-222222222222";
     let beta_prose = lines
@@ -71,14 +101,13 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
         .find(|l| l.contains("How do I configure neovim folds?"))
         .expect("beta-prose row missing");
     assert!(beta_prose.contains("beta"));
+    assert!(beta_prose.contains(beta_prose_uuid));
+    let (beta_prose_pre, beta_prose_cost) = strip_uuid_and_cost(beta_prose, beta_prose_uuid);
     assert!(
-        beta_prose.contains(beta_prose_uuid),
-        "beta-prose row missing id: {beta_prose}",
+        beta_prose_pre.ends_with(" 100"),
+        "beta-prose tokens: {beta_prose_pre}",
     );
-    assert!(
-        strip_trailing_uuid(beta_prose, beta_prose_uuid).ends_with(" 100"),
-        "beta-prose row: {beta_prose}",
-    );
+    assert_eq!(beta_prose_cost, "$0.0069", "beta-prose cost cell");
 
     let beta_late_uuid = "dddd4444-4444-4444-4444-444444444444";
     let beta_late = lines
@@ -86,19 +115,16 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
         .find(|l| l.contains("after malformed"))
         .expect("after-malformed row missing");
     assert!(beta_late.contains("beta"));
+    assert!(beta_late.contains(beta_late_uuid));
+    let (beta_late_pre, beta_late_cost) = strip_uuid_and_cost(beta_late, beta_late_uuid);
     assert!(
-        beta_late.contains(beta_late_uuid),
-        "beta-late row missing id: {beta_late}",
+        beta_late_pre.ends_with(" 10"),
+        "beta-late tokens: {beta_late_pre}",
     );
-    assert!(
-        strip_trailing_uuid(beta_late, beta_late_uuid).ends_with(" 10"),
-        "beta-late row: {beta_late}",
-    );
+    assert_eq!(beta_late_cost, "$0.0004", "beta-late cost cell");
 
-    // Ordering: alpha (2026-04-01) appears before beta-prose (2026-04-15)
-    // which appears before beta-after-malformed (2026-04-20). Use full-title
-    // markers so a future fixture containing a bare `/test-cmd` doesn't steal
-    // the alpha lookup.
+    // Ordering: alpha (2026-04-01) < beta-prose (2026-04-15) <
+    // beta-after-malformed (2026-04-20).
     let alpha_idx = lines
         .iter()
         .position(|l| l.contains("/test-cmd hello world"))
@@ -117,9 +143,9 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
 
 #[test]
 fn list_handles_empty_projects_dir() {
+    let cache = isolated_cache();
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("cclens")
-        .unwrap()
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
         .args(["--projects-dir"])
         .arg(tmp.path())
         .arg("list")
@@ -130,8 +156,6 @@ fn list_handles_empty_projects_dir() {
         .clone();
     let stdout = String::from_utf8(out).unwrap();
     // With no sessions, the only non-empty lines should be the header.
-    // Guards against a future regression that emits a spurious warning
-    // or placeholder row on empty input.
     let data_lines: Vec<&str> = stdout
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.contains("datetime"))
@@ -144,10 +168,10 @@ fn list_handles_empty_projects_dir() {
 
 #[test]
 fn show_renders_per_exchange_table_with_tool_loop_collapse_and_orphan_user() {
-    let out = Command::cargo_bin("cclens")
-        .unwrap()
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
         .args(["--projects-dir"])
-        .arg(fixtures_dir())
+        .arg(projects_fixture_dir())
         .arg("show")
         .arg("eeee5555-5555-5555-5555-555555555555")
         .assert()
@@ -162,39 +186,74 @@ fn show_renders_per_exchange_table_with_tool_loop_collapse_and_orphan_user() {
         .iter()
         .find(|l| l.contains("datetime"))
         .expect("header row missing");
-    for col in ["role", "tokens", "cumulative", "content"] {
+    for col in [
+        "role",
+        "tokens",
+        "cost",
+        "cumulative",
+        "cum_cost",
+        "content",
+    ] {
         assert!(header.contains(col), "header missing {col}: {header}");
     }
 
-    // Strip the trailing content-column marker, then trim padding, leaving the
-    // cumulative column at the right edge where its value can be anchored.
-    // Mirrors the `strip_trailing_uuid` discipline in the list test above.
-    let strip_trailing_marker = |line: &str, marker: &str| -> String {
-        let trimmed = line.trim_end();
-        let idx = trimmed
-            .rfind(marker)
-            .unwrap_or_else(|| panic!("row missing marker {marker:?}:\n{line}"));
-        trimmed[..idx].trim_end().to_string()
-    };
-
-    // (content-marker, tokens-column match, cumulative-column value)
-    // Tokens anchors use ` <N> ` (surrounding spaces) — small integers like
-    // `60` or `120` would otherwise collide with timestamp fragments. The
-    // orphan row pins on the em-dash directly.
+    // (content-marker, tokens, cost, cumulative, cum_cost) for each
+    // visible row.
     //
-    // ` answer ` is space-padded because `answer` alone would also match
-    // inside `"third question with no response"`'s `"answer"`-adjacent
-    // context on some future fixture — the padded form restricts the match
-    // to whole-word occurrences in the rendered table.
+    // Costs are computed from the fixture's claude-opus-4-7 rates
+    // applied to the per-row token decomposition (user rows get
+    // input + cache_creation + cache_read costs across the assistant
+    // cluster; assistant rows get output costs across the cluster).
+    //
+    // Exchange 1 (/test-cmd demo) has 3 assistant turns:
+    //   T3: in=100 out=50 cc=200 cr=50
+    //   T5: in=10  out=150 cc=0 cr=0
+    //   T7: in=5   out=80  cc=0 cr=0
+    //   user-row cost = (115*15 + 200*18.75 + 50*1.5) * 1e-6
+    //                 = 0.001725 + 0.00375 + 0.000075
+    //                 = 0.00555 → "$0.0056"
+    //   asst-row cost = (50+150+80) * 75e-6 = 280 * 0.000075
+    //                 = 0.021 → "$0.0210"
+    //   running cum_cost (with f64 accumulation):
+    //     0.00555  (user row)              → "$0.0056"
+    //     0.02655  (asst row)              → "$0.0265"
+    //     0.028725 (exchange 2 user row)   → "$0.0287"
+    //     0.033225 (exchange 2 asst row)   → "$0.0332"
+    //     0.033225 (orphan row, +Some(0))  → "$0.0332"
+    //
+    // Some `:.4` outputs end in *4 / *5 rather than the rational
+    // half-even result because of f64 representation: e.g. 0.02655
+    // is stored as 0.026549999..., which rounds to 0.0265.
+    //
+    // Exchange 2 (follow-up question) has 1 assistant turn:
+    //   T9: in=20 out=60 cc=100 cr=0
+    //   user-row cost = (20*15 + 100*18.75 + 0) * 1e-6
+    //                 = 0.0003 + 0.001875 = 0.002175 → "$0.0022"
+    //   asst-row cost = 60*75e-6 = 0.0045 → "$0.0045"
+    //
+    // Exchange 3 (third question, orphan): tokens=`—` cost=`—`
+    //   user_cost_delta = Some(0.0) so cum_cost stays at 0.033225.
     let expected = [
-        ("/test-cmd demo", " 315 ", "315"),
-        ("reading the file +2 tool uses", " 280 ", "595"),
-        ("follow-up question", " 120 ", "715"),
-        (" answer ", " 60 ", "775"),
-        ("third question with no response", "—", "775"),
+        ("/test-cmd demo", " 315 ", "$0.0056", "315", "$0.0056"),
+        (
+            "reading the file +2 tool uses",
+            " 280 ",
+            "$0.0210",
+            "595",
+            "$0.0265",
+        ),
+        ("follow-up question", " 120 ", "$0.0022", "715", "$0.0287"),
+        (" answer ", " 60 ", "$0.0045", "775", "$0.0332"),
+        (
+            "third question with no response",
+            "—",
+            "—",
+            "775",
+            "$0.0332",
+        ),
     ];
     let mut positions: Vec<usize> = Vec::with_capacity(expected.len());
-    for (marker, tokens, cumulative) in expected {
+    for (marker, tokens, cost, cumulative, cum_cost) in expected {
         let idx = lines
             .iter()
             .position(|l| l.contains(marker))
@@ -204,10 +263,17 @@ fn show_renders_per_exchange_table_with_tool_loop_collapse_and_orphan_user() {
             line.contains(tokens),
             "row {marker:?} missing tokens {tokens:?}: {line}",
         );
-        let cols = strip_trailing_marker(line, marker.trim());
         assert!(
-            cols.ends_with(cumulative),
-            "row {marker:?} cumulative should be {cumulative}; got: {line}",
+            line.contains(cost),
+            "row {marker:?} missing cost {cost:?}: {line}",
+        );
+        assert!(
+            line.contains(cumulative),
+            "row {marker:?} missing cumulative {cumulative:?}: {line}",
+        );
+        assert!(
+            line.contains(cum_cost),
+            "row {marker:?} missing cum_cost {cum_cost:?}: {line}",
         );
         positions.push(idx);
     }
@@ -221,11 +287,11 @@ fn show_renders_per_exchange_table_with_tool_loop_collapse_and_orphan_user() {
 
 #[test]
 fn show_errors_on_unknown_session_id() {
+    let cache = isolated_cache();
     let unknown = "00000000-0000-0000-0000-000000000000";
-    let output = Command::cargo_bin("cclens")
-        .unwrap()
+    let output = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
         .args(["--projects-dir"])
-        .arg(fixtures_dir())
+        .arg(projects_fixture_dir())
         .arg("show")
         .arg(unknown)
         .assert()
@@ -246,10 +312,10 @@ fn show_errors_on_unknown_session_id() {
 
 #[test]
 fn show_works_on_zero_billable_session() {
-    let stdout_bytes = Command::cargo_bin("cclens")
-        .unwrap()
+    let cache = isolated_cache();
+    let stdout_bytes = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
         .args(["--projects-dir"])
-        .arg(fixtures_dir())
+        .arg(projects_fixture_dir())
         .arg("show")
         .arg("cccc3333-3333-3333-3333-333333333333")
         .assert()
@@ -264,11 +330,15 @@ fn show_works_on_zero_billable_session() {
         .iter()
         .find(|l| l.contains("datetime"))
         .expect("header row missing");
-    for col in ["role", "tokens", "cumulative", "content"] {
-        assert!(
-            header.contains(col),
-            "header should contain column {col}; got: {header}",
-        );
+    for col in [
+        "role",
+        "tokens",
+        "cost",
+        "cumulative",
+        "cum_cost",
+        "content",
+    ] {
+        assert!(header.contains(col), "header missing {col}: {header}");
     }
 
     let data_rows: Vec<&&str> = lines
@@ -282,19 +352,31 @@ fn show_works_on_zero_billable_session() {
         data_rows.len(),
     );
     let row = data_rows[0];
-    // Strip the content-column marker so the cumulative column sits at the
-    // right edge, then pin the trailing value.
+
+    // Orphan user row: tokens=`—`, cost=`—` (display), but the
+    // accumulator delta is Some(0.0) so cum_cost is `$0.0000` (not
+    // `—`). cumulative is 0 since no assistant turn contributed.
+    assert!(
+        row.contains('—'),
+        "orphan row should show em-dash in tokens/cost; got: {row}",
+    );
+    assert!(
+        row.contains("$0.0000"),
+        "orphan row cum_cost should be $0.0000; got: {row}",
+    );
+    // Strip content marker, then trailing `$0.0000` (cum_cost), then
+    // the trailing `0` (cumulative) check is what we want.
     let trimmed = row.trim_end();
     let idx = trimmed
         .rfind("hello but nothing replies")
         .expect("row missing content marker");
-    let cols = trimmed[..idx].trim_end();
+    let after_content = trimmed[..idx].trim_end();
+    let after_cum_cost = after_content
+        .strip_suffix("$0.0000")
+        .expect("cum_cost should be $0.0000")
+        .trim_end();
     assert!(
-        row.contains('—'),
-        "orphan row should show em-dash in tokens; got: {row}",
-    );
-    assert!(
-        cols.ends_with('0'),
+        after_cum_cost.ends_with('0'),
         "orphan row cumulative should be 0; got: {row}",
     );
 }

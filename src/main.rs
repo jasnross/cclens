@@ -14,7 +14,10 @@ use serde_json::Value;
 // ---- cli ----
 
 #[derive(Parser)]
-#[command(name = "cclens", about = "Browse Claude Code conversations")]
+#[command(
+    name = "cclens",
+    about = "Browse Claude Code conversations (tokens + cost)"
+)]
 struct Cli {
     /// Directory to scan for project conversations.
     #[arg(long, default_value_os_t = default_projects_dir())]
@@ -27,8 +30,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// List sessions (default).
+    ///
+    /// The `cost` column includes `cache_read` tokens (priced at the
+    /// discounted cache-read rate) — the `tokens` column does not.
     List,
-    /// Show per-exchange token breakdown for one session.
+    /// Show per-exchange token + cost breakdown for one session.
+    ///
+    /// Per-row `cost` and running `cum_cost` columns include
+    /// `cache_read` tokens; the `tokens` and `cumulative` columns do
+    /// not. A row's `cost` cell renders `—` when its model is unknown
+    /// to the pricing catalog; once an unknown-model row appears,
+    /// every subsequent `cum_cost` cell also renders `—`.
     Show {
         /// Full session UUID (matches a .jsonl filename stem under --projects-dir).
         session_id: String,
@@ -65,6 +77,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_list(projects_dir: &Path) -> anyhow::Result<()> {
+    let catalog = pricing::load_catalog();
     let project_entries = discover(projects_dir)?;
     let mut sessions = Vec::new();
     for (project_dir, jsonl_paths) in project_entries {
@@ -77,7 +90,7 @@ fn run_list(projects_dir: &Path) -> anyhow::Result<()> {
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if let Some(session) = aggregate(&project_dir, session_id, turns) {
+            if let Some(session) = aggregate(&project_dir, session_id, turns, &catalog) {
                 sessions.push(session);
             }
         }
@@ -145,9 +158,10 @@ fn run_show(projects_dir: &Path, session_id: &str) -> anyhow::Result<()> {
     match matches.as_slice() {
         [] => anyhow::bail!("no session matches id {session_id}"),
         [path] => {
+            let catalog = pricing::load_catalog();
             let turns = parse_jsonl(path)?;
             let exchanges = group_into_exchanges(&turns);
-            println!("{}", render_session(&exchanges));
+            println!("{}", render_session(&exchanges, &catalog));
             Ok(())
         }
         paths => {
@@ -172,6 +186,12 @@ struct Session {
     title: String,
     turns: Vec<Turn>,
     total_billable: u64,
+    /// `Some(sum)` only if every assistant turn's cost resolved to
+    /// `Some(_)`. A single unknown-model assistant turn collapses the
+    /// whole session to `None` (strict propagation, no partial sums)
+    /// — the rendered `cost` cell becomes `—`. Diverges from
+    /// `total_billable` by including `cache_read` tokens.
+    total_cost: Option<f64>,
 }
 
 impl Session {
@@ -304,9 +324,24 @@ fn raw_to_turn(raw: RawLine) -> Option<Turn> {
 
 // ---- aggregation ----
 
-fn aggregate(project_dir: &Path, session_id: String, turns: Vec<Turn>) -> Option<Session> {
+fn aggregate(
+    project_dir: &Path,
+    session_id: String,
+    turns: Vec<Turn>,
+    catalog: &pricing::PricingCatalog,
+) -> Option<Session> {
     let total_billable: u64 = turns.iter().filter_map(billable_from_turn).sum();
-    if total_billable == 0 {
+    let total_cost = total_session_cost(&turns, catalog);
+    // Drop the session only when it's zero-billable AND its cost is
+    // *known* to be exactly zero. A session with only `cache_read`
+    // tokens has `total_billable == 0` but a non-zero `total_cost` —
+    // keep it visible. A session whose cost couldn't be resolved
+    // (`None` from an unknown-model assistant turn) also stays
+    // visible and renders as `—`. Using `matches!(_, Some(c) if c ==
+    // 0.0)` rather than `unwrap_or(0.0) == 0.0` is what preserves the
+    // second case — `unwrap_or(0.0)` would silently treat `None` as
+    // zero and drop the session.
+    if total_billable == 0 && matches!(total_cost, Some(c) if c == 0.0) {
         return None;
     }
     let started_at = turns.iter().filter_map(|t| t.timestamp).min()?;
@@ -321,6 +356,7 @@ fn aggregate(project_dir: &Path, session_id: String, turns: Vec<Turn>) -> Option
         title,
         turns,
         total_billable,
+        total_cost,
     })
 }
 
@@ -329,6 +365,29 @@ fn billable_from_turn(turn: &Turn) -> Option<u64> {
         Role::Assistant => turn.usage.as_ref().map(Usage::billable),
         Role::User | Role::Attachment | Role::System | Role::Other(_) => None,
     }
+}
+
+/// Sum per-assistant-turn costs with strict `None` propagation. User /
+/// attachment / system / other-role turns contribute nothing and never
+/// collapse the result to `None`. A single assistant turn that the
+/// catalog can't price collapses the whole session to `None`.
+fn total_session_cost(turns: &[Turn], catalog: &pricing::PricingCatalog) -> Option<f64> {
+    let mut sum = 0.0;
+    for turn in turns {
+        match &turn.role {
+            Role::Assistant => {}
+            Role::User | Role::Attachment | Role::System | Role::Other(_) => continue,
+        }
+        let Some(usage) = turn.usage.as_ref() else {
+            // Assistant turn with no usage is treated as zero-cost
+            // (matches `billable_from_turn`'s None → 0 fold via
+            // `filter_map`); does not collapse the total to `None`.
+            continue;
+        };
+        let cost = catalog.cost_for_turn(usage, turn.model.as_deref())?;
+        sum += cost;
+    }
+    Some(sum)
 }
 
 fn derive_project_short_name(project_dir: &Path, turns: &[Turn]) -> String {
@@ -567,16 +626,27 @@ fn discover(projects_dir: &Path) -> anyhow::Result<Vec<(PathBuf, Vec<PathBuf>)>>
 
 const TITLE_MAX_CHARS: usize = 80;
 
-// Index of the tokens column in the header vector below. Kept as a const so
-// reordering columns requires updating one place, not two.
+// Indices of numeric columns in `render_table`'s header:
+//   vec!["datetime", "project", "title", "tokens", "cost", "id"]
+//                                         idx 3    idx 4
+// Right-alignment is applied at these positions; reordering the header
+// requires updating these constants in lockstep.
 const TOKENS_COL_INDEX: usize = 3;
+const COST_COL_INDEX: usize = 4;
 
-// Indices of the numeric columns in `render_session`'s header:
-//   vec!["datetime", "role", "tokens", "cumulative", "content"]
-//                             idx 2    idx 3
-// Matches the `TOKENS_COL_INDEX` precedent above.
+// Indices of numeric columns in `render_session`'s header:
+//   vec!["datetime", "role", "tokens", "cost", "cumulative", "cum_cost", "content"]
+//                             idx 2    idx 3   idx 4         idx 5
 const SHOW_TOKENS_COL_INDEX: usize = 2;
-const SHOW_CUMULATIVE_COL_INDEX: usize = 3;
+const SHOW_COST_COL_INDEX: usize = 3;
+const SHOW_CUMULATIVE_COL_INDEX: usize = 4;
+const SHOW_CUM_COST_COL_INDEX: usize = 5;
+
+/// Format an optional cost as `$X.XXXX` or `—` for the unknown-model
+/// case. Centralized so list and show share the exact same vocabulary.
+fn format_cost_opt(c: Option<f64>) -> String {
+    c.map_or_else(|| "—".to_string(), |n| format!("${n:.4}"))
+}
 
 fn truncate_title(s: &str, max: usize) -> String {
     // Collapse internal whitespace runs (including `\n`, `\t`) to a single
@@ -611,19 +681,23 @@ fn format_local_or_empty(ts: Option<DateTime<Utc>>) -> String {
 fn render_table(sessions: &[Session]) -> String {
     let mut table = Table::new();
     table.load_preset(NOTHING);
-    table.set_header(vec!["datetime", "project", "title", "tokens", "id"]);
+    table.set_header(vec!["datetime", "project", "title", "tokens", "cost", "id"]);
     for session in sessions {
         table.add_row(vec![
             format_local(session.started_at),
             session.project_short_name.clone(),
             truncate_title(&session.title, TITLE_MAX_CHARS),
             session.total_billable.to_string(),
+            format_cost_opt(session.total_cost),
             session.id.clone(),
         ]);
     }
-    // column_mut returns Option; the column is guaranteed present because the
-    // header above defines the tokens column at TOKENS_COL_INDEX.
+    // column_mut returns Option; the columns are guaranteed present because
+    // the header above defines them at the indices.
     if let Some(col) = table.column_mut(TOKENS_COL_INDEX) {
+        col.set_cell_alignment(CellAlignment::Right);
+    }
+    if let Some(col) = table.column_mut(COST_COL_INDEX) {
         col.set_cell_alignment(CellAlignment::Right);
     }
     format!("{table}")
@@ -677,6 +751,37 @@ fn assistant_cluster_preview(assistants: &[&Turn]) -> String {
     names.join(", ")
 }
 
+/// Sum costs across an assistant cluster with strict `None`
+/// propagation. The closure picks which token components count for
+/// this row (e.g. `(input, 0, cache_creation, cache_read)` for the
+/// user row, `(0, output, 0, 0)` for the assistant row). Any single
+/// turn the catalog can't price collapses the whole sum to `None`,
+/// matching the session-level rule.
+fn strict_fold_assistant_cost(
+    assistants: &[&Turn],
+    catalog: &pricing::PricingCatalog,
+    pick: impl Fn(&Usage) -> (u64, u64, u64, u64),
+) -> Option<f64> {
+    let mut sum = 0.0;
+    for turn in assistants {
+        let Some(usage) = turn.usage.as_ref() else {
+            // Assistant turn with no usage: zero contribution, does
+            // not collapse the sum to `None`.
+            continue;
+        };
+        let (input, output, cache_creation, cache_read) = pick(usage);
+        let cost = catalog.cost_for_components(
+            input,
+            output,
+            cache_creation,
+            cache_read,
+            turn.model.as_deref(),
+        )?;
+        sum += cost;
+    }
+    Some(sum)
+}
+
 fn count_tool_uses(assistants: &[&Turn]) -> u64 {
     let mut n: u64 = 0;
     for a in assistants {
@@ -692,11 +797,28 @@ fn count_tool_uses(assistants: &[&Turn]) -> u64 {
     n
 }
 
-fn render_session(exchanges: &[Exchange<'_>]) -> String {
+/// Strict-fold the running cost: both `Some` → sum; either `None` →
+/// stays `None` for this row and every subsequent row. Callers retain
+/// the previous accumulator value so a `None` "latches" through every
+/// later row, matching the unknown-model propagation contract.
+fn fold_cum_cost(prev: Option<f64>, delta: Option<f64>) -> Option<f64> {
+    prev.zip(delta).map(|(a, b)| a + b)
+}
+
+fn render_session(exchanges: &[Exchange<'_>], catalog: &pricing::PricingCatalog) -> String {
     let mut table = Table::new();
     table.load_preset(NOTHING);
-    table.set_header(vec!["datetime", "role", "tokens", "cumulative", "content"]);
+    table.set_header(vec![
+        "datetime",
+        "role",
+        "tokens",
+        "cost",
+        "cumulative",
+        "cum_cost",
+        "content",
+    ]);
     let mut cumulative: u64 = 0;
+    let mut cum_cost: Option<f64> = Some(0.0);
 
     for exchange in exchanges {
         let user_tokens_opt: Option<u64> = if exchange.assistants.is_empty() {
@@ -717,17 +839,44 @@ fn render_session(exchanges: &[Exchange<'_>]) -> String {
             .map(|u| u.output)
             .sum();
 
+        // Per-row cost decomposes into a *displayed* cost (what the
+        // cell shows) and an *accumulator delta* (what's added to the
+        // running cum_cost). They diverge on the orphan-user case:
+        // an empty assistant cluster displays `—` but contributes
+        // `Some(0.0)` to the running total — same way `cumulative +=
+        // user_tokens_opt.unwrap_or(0)` treats orphans as a no-op.
+        // For non-empty clusters they're equal: any unknown-model turn
+        // collapses both to `None`, latching cum_cost through the rest
+        // of the session.
+        let (user_cost_display, user_cost_delta) = if exchange.assistants.is_empty() {
+            (None, Some(0.0))
+        } else {
+            let cost = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+                (usage.input, 0, usage.cache_creation, usage.cache_read)
+            });
+            (cost, cost)
+        };
+
         cumulative += user_tokens_opt.unwrap_or(0);
+        cum_cost = fold_cum_cost(cum_cost, user_cost_delta);
         table.add_row(vec![
             format_local_or_empty(exchange.user.timestamp),
             "user".to_string(),
             user_tokens_opt.map_or_else(|| "—".to_string(), |n| n.to_string()),
+            format_cost_opt(user_cost_display),
             cumulative.to_string(),
+            format_cost_opt(cum_cost),
             truncate_title(&user_content_preview(exchange.user), TITLE_MAX_CHARS),
         ]);
 
         if let Some(first_assistant) = exchange.assistants.first() {
+            let assistant_cost =
+                strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+                    (0, usage.output, 0, 0)
+                });
             cumulative += output_tokens;
+            cum_cost = fold_cum_cost(cum_cost, assistant_cost);
+
             let preview = assistant_cluster_preview(&exchange.assistants);
             let n_tools = count_tool_uses(&exchange.assistants);
             let content = if n_tools > 0 {
@@ -739,7 +888,9 @@ fn render_session(exchanges: &[Exchange<'_>]) -> String {
                 format_local_or_empty(first_assistant.timestamp),
                 "assistant".to_string(),
                 output_tokens.to_string(),
+                format_cost_opt(assistant_cost),
                 cumulative.to_string(),
+                format_cost_opt(cum_cost),
                 truncate_title(&content, TITLE_MAX_CHARS),
             ]);
         }
@@ -748,7 +899,13 @@ fn render_session(exchanges: &[Exchange<'_>]) -> String {
     if let Some(col) = table.column_mut(SHOW_TOKENS_COL_INDEX) {
         col.set_cell_alignment(CellAlignment::Right);
     }
+    if let Some(col) = table.column_mut(SHOW_COST_COL_INDEX) {
+        col.set_cell_alignment(CellAlignment::Right);
+    }
     if let Some(col) = table.column_mut(SHOW_CUMULATIVE_COL_INDEX) {
+        col.set_cell_alignment(CellAlignment::Right);
+    }
+    if let Some(col) = table.column_mut(SHOW_CUM_COST_COL_INDEX) {
         col.set_cell_alignment(CellAlignment::Right);
     }
     format!("{table}")
@@ -920,7 +1077,12 @@ mod tests {
             user_string_turn("hello"),
             assistant_turn_with_usage(0, 0, 0),
         ];
-        let result = aggregate(Path::new("/tmp/fake-project"), "abc".to_string(), turns);
+        let result = aggregate(
+            Path::new("/tmp/fake-project"),
+            "abc".to_string(),
+            turns,
+            &pricing::PricingCatalog::empty(),
+        );
         assert!(result.is_none());
     }
 
@@ -931,9 +1093,58 @@ mod tests {
             assistant_turn_with_usage(100, 0, 0),
             assistant_turn_with_usage(200, 0, 0),
         ];
-        let session = aggregate(Path::new("/tmp/fake-project"), "abc".to_string(), turns)
-            .expect("zero-billable filter should not fire");
+        let session = aggregate(
+            Path::new("/tmp/fake-project"),
+            "abc".to_string(),
+            turns,
+            &pricing::PricingCatalog::empty(),
+        )
+        .expect("zero-billable filter should not fire");
         assert_eq!(session.total_billable, 300);
+        // Empty catalog can't price the assistant turns; total_cost
+        // collapses to None per the strict-propagation rule.
+        assert_eq!(session.total_cost, None);
+    }
+
+    #[test]
+    fn aggregate_keeps_unknown_model_zero_billable_session() {
+        // Regression: previously the zero-billable filter used
+        // `total_cost.unwrap_or(0.0) == 0.0`, which silently dropped
+        // sessions whose cost was unresolved (`None`). Such sessions
+        // must stay visible — the row will render `—` in the cost
+        // cell, prompting the user to investigate.
+        //
+        // Construct a session with one zero-billable assistant turn
+        // (so `total_billable == 0`) on an unknown model (so
+        // `total_cost == None`). The filter must not drop it.
+        let turns = vec![
+            user_string_turn("hi"),
+            Turn {
+                timestamp: Some("2026-04-01T10:00:00Z".parse().unwrap()),
+                role: Role::Assistant,
+                model: Some("claude-fake-9-9".to_string()),
+                usage: Some(Usage {
+                    input: 0,
+                    output: 0,
+                    cache_creation: 0,
+                    // Non-zero cache_read makes cost_for_components
+                    // bypass the all-zero short-circuit; with an empty
+                    // catalog the lookup misses and total_cost is None.
+                    cache_read: 100,
+                }),
+                content: None,
+                cwd: None,
+            },
+        ];
+        let session = aggregate(
+            Path::new("/tmp/fake-project"),
+            "abc".to_string(),
+            turns,
+            &pricing::PricingCatalog::empty(),
+        )
+        .expect("unknown-model zero-billable session must NOT be filtered out");
+        assert_eq!(session.total_billable, 0);
+        assert_eq!(session.total_cost, None);
     }
 
     // --- parser ---
@@ -998,6 +1209,7 @@ mod tests {
             Path::new("/tmp/encoded-dir-name"),
             "abc".to_string(),
             vec![turn_with_cwd],
+            &pricing::PricingCatalog::empty(),
         )
         .unwrap();
         assert_eq!(session.project_short_name, "redis-tui");
@@ -1022,6 +1234,7 @@ mod tests {
             Path::new("/tmp/-Users-jasonr-encoded"),
             "abc".to_string(),
             vec![turn_no_cwd],
+            &pricing::PricingCatalog::empty(),
         )
         .unwrap();
         assert_eq!(session.project_short_name, "-Users-jasonr-encoded");
@@ -1145,6 +1358,16 @@ mod tests {
         total_billable: u64,
         started_at: &str,
     ) -> Session {
+        session_for_render_with_cost(project, title, total_billable, None, started_at)
+    }
+
+    fn session_for_render_with_cost(
+        project: &str,
+        title: &str,
+        total_billable: u64,
+        total_cost: Option<f64>,
+        started_at: &str,
+    ) -> Session {
         let ts: DateTime<Utc> = started_at.parse().unwrap();
         Session {
             id: "sid".to_string(),
@@ -1154,6 +1377,7 @@ mod tests {
             title: title.to_string(),
             turns: Vec::new(),
             total_billable,
+            total_cost,
         }
     }
 
@@ -1199,7 +1423,13 @@ mod tests {
     }
 
     #[test]
-    fn render_table_right_aligns_tokens_column() {
+    fn render_table_right_aligns_tokens_and_cost_columns() {
+        // After Phase 3 the column order is:
+        //   datetime | project | title | tokens | cost | id
+        // Both rows below have unknown-model totals (None catalog), so
+        // every cost cell renders `—`. Stripping `sid` then `—` exposes
+        // the tokens column as the new right edge — same alignment
+        // verification as before, just two strip steps instead of one.
         let sessions = vec![
             session_for_render("p1", "t1", 9, "2026-04-01T10:00:00Z"),
             session_for_render("p2", "t2", 123_456, "2026-04-02T10:00:00Z"),
@@ -1210,24 +1440,25 @@ mod tests {
             .filter(|l| l.contains("p1") || l.contains("p2"))
             .collect();
         assert_eq!(data_lines.len(), 2);
-        // Both rows share the same trailing `id` column value ("sid" from
-        // session_for_render), so stripping it leaves the tokens column as the
-        // new right edge — which is where right-alignment is observable.
-        let strip_trailing_id = |l: &str| {
-            l.trim_end()
+        let strip_trailing = |l: &str| {
+            let after_id = l
+                .trim_end()
                 .strip_suffix("sid")
                 .expect("row should end with the hardcoded id column value")
+                .trim_end();
+            after_id
+                .strip_suffix('—')
+                .expect("cost cell should be em-dash for unknown-model session")
                 .trim_end()
                 .to_string()
         };
-        let end_of_9 = strip_trailing_id(data_lines.iter().find(|l| l.contains("p1")).unwrap());
-        let end_of_123456 =
-            strip_trailing_id(data_lines.iter().find(|l| l.contains("p2")).unwrap());
-        assert!(end_of_9.ends_with('9'));
-        assert!(end_of_123456.ends_with("123456"));
-        // Right-alignment: the shorter value has leading whitespace padding
-        // inside its column, so the line is the same length as the longer one.
-        assert_eq!(end_of_9.len(), end_of_123456.len());
+        let end_of_9 = strip_trailing(data_lines.iter().find(|l| l.contains("p1")).unwrap());
+        let end_of_123456 = strip_trailing(data_lines.iter().find(|l| l.contains("p2")).unwrap());
+        assert!(end_of_9.ends_with('9'), "got: {end_of_9}");
+        assert!(end_of_123456.ends_with("123456"), "got: {end_of_123456}");
+        // Right-alignment: shorter value has leading whitespace padding,
+        // so the prefix-up-to-tokens has the same scalar count for both.
+        assert_eq!(end_of_9.chars().count(), end_of_123456.chars().count());
     }
 
     // --- show: additional helpers ---
@@ -1658,12 +1889,14 @@ mod tests {
     }
 
     #[test]
-    fn render_session_header_includes_all_five_columns() {
-        let out = render_session(&[]);
+    fn render_session_header_includes_all_seven_columns() {
+        let out = render_session(&[], &pricing::PricingCatalog::empty());
         assert!(out.contains("datetime"));
         assert!(out.contains("role"));
         assert!(out.contains("tokens"));
+        assert!(out.contains("cost"));
         assert!(out.contains("cumulative"));
+        assert!(out.contains("cum_cost"));
         assert!(out.contains("content"));
     }
 
@@ -1690,7 +1923,7 @@ mod tests {
                 assistants: Vec::new(),
             },
         ];
-        let out = render_session(&exchanges);
+        let out = render_session(&exchanges, &pricing::PricingCatalog::empty());
         let lines: Vec<&str> = out.lines().collect();
         let assistant_line = lines
             .iter()
@@ -1706,20 +1939,27 @@ mod tests {
         assert!(orphan_line.contains('—'));
         assert!(orphan_line.contains("12345"));
 
-        // Strip the trailing content column so the numeric columns sit at the
-        // right edge, then verify em-dash and numeric strings right-align to
-        // the same character position.
-        let strip_content = |l: &str, marker: &str| {
+        // Strip the trailing content column AND the cum_cost column so
+        // the cumulative column sits at the new right edge. Both rows
+        // here use an empty catalog, so every cum_cost cell renders `—`.
+        // Pop content first (variable text), then pop the trailing `—`,
+        // then we can pin on the numeric `cumulative` value.
+        let strip_to_cumulative = |l: &str, content_marker: &str| {
             let trimmed = l.trim_end();
             let cut = trimmed
-                .rfind(marker)
-                .expect("marker should be in the content column");
-            trimmed[..cut].trim_end().to_string()
+                .rfind(content_marker)
+                .expect("content marker should be in the content column");
+            let after_content = trimmed[..cut].trim_end();
+            after_content
+                .strip_suffix('—')
+                .expect("cum_cost should be em-dash for unknown-model session")
+                .trim_end()
+                .to_string()
         };
-        let a_cols = strip_content(assistant_line, "reply");
-        let o_cols = strip_content(orphan_line, "orphan");
-        assert!(a_cols.ends_with("12345"));
-        assert!(o_cols.ends_with("12345"));
+        let a_cols = strip_to_cumulative(assistant_line, "reply");
+        let o_cols = strip_to_cumulative(orphan_line, "orphan");
+        assert!(a_cols.ends_with("12345"), "got: {a_cols}");
+        assert!(o_cols.ends_with("12345"), "got: {o_cols}");
         // Right-aligned: the trailing cumulative columns end at the same
         // character position, so the preceding lines (through tokens + spaces +
         // cumulative) have the same scalar count. Compare by chars, not bytes,
@@ -1757,7 +1997,7 @@ mod tests {
             },
         ];
         // Expected billable total = (100+50+200) + (10+20+0) = 380.
-        let out = render_session(&exchanges);
+        let out = render_session(&exchanges, &pricing::PricingCatalog::empty());
         let last_line = out
             .lines()
             .rfind(|l| l.contains("r2"))
@@ -1796,9 +2036,12 @@ mod tests {
                 assistants: vec![&a2],
             },
         ];
-        let out = render_session(&exchanges);
-        // The two assistant rows have content 's' and 'b'. Strip the content
-        // column so the cumulative column sits at the right edge.
+        let out = render_session(&exchanges, &pricing::PricingCatalog::empty());
+        // After Phase 3 the column order is:
+        //   datetime | role | tokens | cost | cumulative | cum_cost | content
+        // With an empty catalog, both `cost` and `cum_cost` render as
+        // `—`. Strip content, then the trailing `—` (cum_cost) so the
+        // cumulative column sits at the right edge.
         let a_small = out
             .lines()
             .find(|l| l.trim_end().ends_with(" s"))
@@ -1807,21 +2050,22 @@ mod tests {
             .lines()
             .find(|l| l.trim_end().ends_with(" b"))
             .expect("big assistant row missing");
-        let strip_tail = |l: &str, tail: &str| {
-            l.trim_end()
-                .strip_suffix(tail)
-                .unwrap_or(l)
+        let strip_to_cumulative = |l: &str, tail: &str| {
+            let after_content = l.trim_end().strip_suffix(tail).unwrap_or(l).trim_end();
+            after_content
+                .strip_suffix('—')
+                .expect("cum_cost should be em-dash with empty catalog")
                 .trim_end()
                 .to_string()
         };
-        let small_cols = strip_tail(a_small, "s");
-        let big_cols = strip_tail(a_big, "b");
+        let small_cols = strip_to_cumulative(a_small, "s");
+        let big_cols = strip_to_cumulative(a_big, "b");
         // Cumulative column values: 9 for small row, 9 + 123456 = 123465 for
-        // big row. Widths of tokens + cumulative parts must match (right-
-        // aligned to the same column boundaries).
-        assert!(small_cols.ends_with('9'));
-        assert!(big_cols.ends_with("123465"));
-        assert_eq!(small_cols.len(), big_cols.len());
+        // big row. Widths of tokens + cost + cumulative parts must
+        // match (all three are right-aligned to the same boundaries).
+        assert!(small_cols.ends_with('9'), "got: {small_cols}");
+        assert!(big_cols.ends_with("123465"), "got: {big_cols}");
+        assert_eq!(small_cols.chars().count(), big_cols.chars().count());
     }
 
     #[test]
@@ -1842,7 +2086,7 @@ mod tests {
             user: &u,
             assistants: vec![&a],
         }];
-        let out = render_session(&exchanges);
+        let out = render_session(&exchanges, &pricing::PricingCatalog::empty());
         assert!(
             out.contains("reading +2 tool uses"),
             "expected tool-use suffix; got:\n{out}",

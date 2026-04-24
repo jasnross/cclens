@@ -46,12 +46,18 @@ $ cclens --projects-dir /mnt/backup/claude/projects list
   ran, truncated to 80 characters with `…`.
 - **tokens** — sum of billable tokens (`input + output + cache_creation`)
   across every assistant turn, including subagent/sidechain turns.
+- **cost** — per-session USD cost (`$X.XXXX`), summed from the same turns,
+  computed via the LiteLLM pricing catalog. Diverges from `tokens` by
+  including `cache_read` tokens (priced at the discounted cache-read
+  rate). Renders `—` if any assistant turn has an unknown model — strict
+  no-partial-sums propagation.
 - **id** — the session UUID, taken from the JSONL filename in
   `~/.claude/projects/`.
 
-Sessions with zero billable tokens are hidden. Malformed JSONL lines are
-silently skipped. One unreadable file or project directory does not abort
-the listing.
+Sessions with zero billable tokens **and** zero cost are hidden — sessions
+that are non-zero-cost only via `cache_read` stay visible. Malformed JSONL
+lines are silently skipped. One unreadable file or project directory does
+not abort the listing.
 
 ### show
 
@@ -77,11 +83,36 @@ inspection tool and will render any valid session ID.
 - **tokens** — per-row token total. User rows count
   `input + cache_creation` across the following assistant cluster; assistant
   rows count `output`. Orphan user rows show `—`.
+- **cost** — per-row USD cost (`$X.XXXX`). User rows price `input +
+  cache_creation + cache_read`; assistant rows price `output`. Includes
+  `cache_read` (the `tokens` column doesn't). Orphan user rows show `—`.
+  Any unknown-model row shows `—`.
 - **cumulative** — running sum of billable tokens through this row. Matches
   the session's `list` tokens value at the final assistant row.
+- **cum_cost** — running USD cost through this row. Strict propagation:
+  once any row is `—` (unknown model), every subsequent `cum_cost`
+  cell is also `—`.
 - **content** — user prose (or slash-command reconstruction) on user rows;
   assistant reply preview with an optional `+N tool uses` suffix on assistant
   rows. Truncated to 80 characters with `…`.
+
+### pricing
+
+`cclens pricing refresh` re-fetches the LiteLLM catalog and overwrites
+the cache atomically. `cclens pricing info` prints the cache path,
+size, last-modified time, and Claude-entry count.
+
+The catalog is fetched on first run (one synchronous HTTPS GET to
+`raw.githubusercontent.com`). It does not auto-expire; refresh is
+explicit. If the fetch fails, every cost cell renders `—` and a single
+stderr warning is printed — `list` and `show` still work.
+
+The cache lives at `dirs::cache_dir()/cclens/litellm-pricing.json`
+(macOS: `~/Library/Caches/cclens/`; Linux: `~/.cache/cclens/`). Two
+env vars override defaults:
+- `CCLENS_CACHE_DIR` — alternative cache directory
+- `CCLENS_PRICING_URL` — alternative catalog URL (accepts `http(s)://`,
+  `file://<absolute-path>`, or a plain filesystem path)
 
 ## Development
 

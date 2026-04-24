@@ -1,0 +1,4 @@
+{"type":"user","timestamp":"2026-04-23T09:00:00Z","cwd":"/Users/test/cost-fixture","message":{"content":"<synthetic>"}}
+{"type":"assistant","timestamp":"2026-04-23T09:00:05Z","cwd":"/Users/test/cost-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"synthetic-only assistant turn"}]}}
+{"type":"user","timestamp":"2026-04-23T09:01:00Z","cwd":"/Users/test/cost-fixture","message":{"content":"real user prompt"}}
+{"type":"assistant","timestamp":"2026-04-23T09:01:05Z","cwd":"/Users/test/cost-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":40,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"real reply"}]}}
