@@ -73,7 +73,7 @@ Run `cargo fmt && cargo clippy --all-targets -- -D warnings` before committing.
 
 ## Source Layout
 
-The crate is currently a single `src/main.rs` file, sectioned with `// ---- x ----`
+The crate is mostly a single `src/main.rs` file, sectioned with `// ---- x ----`
 banner comments. The sections (in order) are:
 
 ```
@@ -86,6 +86,20 @@ discovery     ← projects_dir walk → (project_dir, [jsonl_paths])
 rendering     ← comfy-table setup, truncate_title, format_local, render_table
 tests         ← inline #[cfg(test)] mod tests
 ```
+
+One pipeline section lives in its own file:
+
+```
+pricing       ← src/pricing.rs — LiteLLM-catalog types, model lookup,
+                tiered cost math (fetch/cache I/O and subcommand
+                handlers will land as that scope grows in)
+```
+
+`pricing` was promoted from a banner section to its own module on day one
+because its eventual responsibilities (HTTP fetch, cache I/O,
+deserialization, lookup, cost math, subcommand handlers) push it past
+comfortable banner territory — even though the current scope is
+deliberately narrower than that.
 
 When a section grows large enough that the banners hurt more than help,
 promote it to its own module file. Prefer the modern Rust module convention
