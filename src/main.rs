@@ -33,6 +33,19 @@ enum Command {
         /// Full session UUID (matches a .jsonl filename stem under --projects-dir).
         session_id: String,
     },
+    /// Manage the pricing catalog cache.
+    Pricing {
+        #[command(subcommand)]
+        action: PricingAction,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum PricingAction {
+    /// Re-fetch the `LiteLLM` pricing catalog and overwrite the cache.
+    Refresh,
+    /// Print cache path, size, mtime, and Claude-entry count.
+    Info,
 }
 
 fn default_projects_dir() -> PathBuf {
@@ -47,6 +60,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::List) {
         Command::List => run_list(&cli.projects_dir),
         Command::Show { session_id } => run_show(&cli.projects_dir, &session_id),
+        Command::Pricing { action } => run_pricing(action),
     }
 }
 
@@ -71,6 +85,43 @@ fn run_list(projects_dir: &Path) -> anyhow::Result<()> {
     sessions.sort_by_key(|s| s.started_at);
     println!("{}", render_table(&sessions));
     Ok(())
+}
+
+fn run_pricing(action: PricingAction) -> anyhow::Result<()> {
+    match action {
+        PricingAction::Refresh => {
+            let report = pricing::refresh_catalog()?;
+            println!("Refreshed catalog at {}", report.path.display());
+            println!(
+                "  previous size: {} bytes → new size: {} bytes",
+                report.previous_size, report.new_size,
+            );
+            println!("  Claude entries: {}", report.entry_count);
+            Ok(())
+        }
+        PricingAction::Info => {
+            let info = pricing::cache_info();
+            match info.path {
+                Some(path) => println!("Cache path: {}", path.display()),
+                None => println!("Cache path: (no cache directory available)"),
+            }
+            println!("  exists: {}", info.exists);
+            let mtime = info.last_modified.map_or_else(
+                || "(never)".to_string(),
+                |ts| {
+                    let dt: chrono::DateTime<chrono::Local> = ts.into();
+                    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                },
+            );
+            println!("  last modified: {mtime}");
+            println!("  size: {} bytes", info.size);
+            let entries = info
+                .entry_count
+                .map_or_else(|| "(unreadable)".to_string(), |n| n.to_string());
+            println!("  Claude entries: {entries}");
+            Ok(())
+        }
+    }
 }
 
 fn run_show(projects_dir: &Path, session_id: &str) -> anyhow::Result<()> {

@@ -1,22 +1,30 @@
 //! Pricing catalog and cost calculation.
 //!
-//! Phase 1 scope: types, model lookup, cost math. HTTP fetch and cache I/O
-//! land in Phase 2; aggregation and rendering integration in Phase 3.
+//! Public API:
+//! - `load_catalog()` — infallible; degrades to an empty catalog on any
+//!   failure, emitting one stderr warning per process. Called by `list`
+//!   and `show`.
+//! - `refresh_catalog()` — explicit refresh; returns `anyhow::Result` so
+//!   `cclens pricing refresh` can exit nonzero on failure.
+//! - `cache_info()` — infallible stat-like report for
+//!   `cclens pricing info`.
 //!
-//! The public API is intentionally infallible for the hot path:
-//! `load_catalog` (added in Phase 2) returns a `PricingCatalog` even on
-//! failure — falling back to an empty catalog whose lookups all return
-//! `None`. This keeps `cclens list` and `cclens show` resilient to network
-//! outages and corrupt caches; callers render `—` for every cost cell in
-//! that state.
+//! The catalog comes from `LiteLLM`'s
+//! `model_prices_and_context_window.json`. Pricing is computed with
+//! Claude's 200k-tier rates and includes `cache_read` tokens (which
+//! `Usage::billable()` deliberately excludes).
 
-// Several items defined here are consumed only by tests in Phase 1 and by
-// Phase 2/3 integration points that haven't landed yet. Silence dead-code
-// warnings at the module level for now; the attribute is removed in the
-// phase that fully wires the module into `main.rs`.
+// Phase 3 is still pending — aggregation and rendering will consume
+// `cost_for_turn` / `cost_for_components`. Silence dead-code warnings
+// module-wide until those wiring points land.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::time::SystemTime;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -316,6 +324,267 @@ impl PricingCatalog {
             usage.cache_read,
             model,
         )
+    }
+}
+
+// ---- fetch ----
+
+/// `LiteLLM`'s canonical pricing catalog URL. Used unless the caller
+/// overrides via `CCLENS_PRICING_URL` (both for integration tests and
+/// as a power-user escape hatch if GitHub is unreachable).
+const LITELLM_CATALOG_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+
+/// Env var that overrides `LITELLM_CATALOG_URL`. Accepts `http(s)://`,
+/// `file://`, or a plain filesystem path.
+const CCLENS_PRICING_URL_ENV: &str = "CCLENS_PRICING_URL";
+
+/// Env var that overrides the XDG cache directory (useful for hermetic
+/// integration tests and for users who want the cache somewhere other
+/// than `dirs::cache_dir()/cclens/`).
+const CCLENS_CACHE_DIR_ENV: &str = "CCLENS_CACHE_DIR";
+
+/// Cache filename within whichever directory `resolve_cache_file` picks.
+const CACHE_FILENAME: &str = "litellm-pricing.json";
+
+/// HTTP timeouts for the catalog fetch. `load_catalog` is on the hot
+/// path for `cclens list` — an unbounded fetch would let a slow or
+/// unreachable mirror hang an interactive CLI indefinitely. 5s to
+/// establish the connection is generous for a single-hop GitHub CDN;
+/// 30s total read covers the ~1.3 MB payload on slow connections.
+const FETCH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const FETCH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn resolve_catalog_url() -> String {
+    match std::env::var(CCLENS_PRICING_URL_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => LITELLM_CATALOG_URL.to_owned(),
+    }
+}
+
+/// Fetch the catalog body from `url`.
+///
+/// Dispatches on scheme so tests can point at a `file://` fixture
+/// without a trait abstraction:
+/// - `file://` — strip the two-slash prefix and read from disk.
+///   Only `file://<absolute-path>` is supported; `file://host/path`
+///   is **not** (the "host" component would be silently misread as
+///   the start of the path).
+/// - `http(s)://` — synchronous GET via `ureq` with hard timeouts
+///   (see `FETCH_CONNECT_TIMEOUT` / `FETCH_READ_TIMEOUT`).
+/// - anything else — treat as a filesystem path.
+fn fetch_catalog_body(url: &str) -> Result<String, PricingError> {
+    if let Some(path) = url.strip_prefix("file://") {
+        return Ok(fs::read_to_string(path)?);
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(FETCH_CONNECT_TIMEOUT)
+            .timeout_read(FETCH_READ_TIMEOUT)
+            .build();
+        return agent
+            .get(url)
+            .call()
+            .map_err(|e| PricingError::Fetch(e.to_string()))?
+            .into_string()
+            .map_err(|e| PricingError::Fetch(e.to_string()));
+    }
+    Ok(fs::read_to_string(url)?)
+}
+
+// ---- cache ----
+
+/// Resolve the cache file path. `None` means no cache is available for
+/// this process (neither `CCLENS_CACHE_DIR` nor `dirs::cache_dir()`
+/// returned a usable path — extremely rare, and degrades to "fetch on
+/// every run").
+///
+/// An empty `CCLENS_CACHE_DIR=""` falls through to `dirs::cache_dir()`
+/// rather than being interpreted as "use CWD" — a user setting the env
+/// var to empty almost certainly means "unset" rather than "use the
+/// current directory" (which would silently write pricing caches into
+/// arbitrary project dirs).
+fn resolve_cache_file() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var(CCLENS_CACHE_DIR_ENV)
+        && !custom.is_empty()
+    {
+        return Some(PathBuf::from(custom).join(CACHE_FILENAME));
+    }
+    dirs::cache_dir().map(|p| p.join("cclens").join(CACHE_FILENAME))
+}
+
+fn read_cache(path: &Path) -> Result<String, PricingError> {
+    Ok(fs::read_to_string(path)?)
+}
+
+/// Atomically persist `body` at `path` via a same-directory tempfile
+/// plus rename. This protects against a Ctrl-C during `pricing refresh`
+/// leaving a partially-written, unparseable cache file on disk.
+fn write_cache_atomic(path: &Path, body: &str) -> Result<(), PricingError> {
+    let parent = path.parent().ok_or_else(|| {
+        PricingError::CacheWrite(format!("cache path has no parent: {}", path.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|e| PricingError::CacheWrite(e.to_string()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| PricingError::CacheWrite(e.to_string()))?;
+    tmp.as_file_mut()
+        .write_all(body.as_bytes())
+        .map_err(|e| PricingError::CacheWrite(e.to_string()))?;
+    tmp.persist(path)
+        .map_err(|e| PricingError::CacheWrite(e.to_string()))?;
+    Ok(())
+}
+
+// ---- load ----
+
+/// Gate for the first-run warning so we print it at most once per
+/// process — even if both `run_list` and `run_show` were to end up
+/// calling `load_catalog` on the same invocation.
+static WARN_ONCE: Once = Once::new();
+
+fn warn_once(message: &str) {
+    WARN_ONCE.call_once(|| {
+        eprintln!("cclens: {message}");
+    });
+}
+
+/// Load the pricing catalog, fetching on first run and degrading to an
+/// empty catalog on any failure.
+///
+/// Contract: **infallible**. A missing cache triggers a one-time fetch
+/// from `resolve_catalog_url()`; a successful fetch is persisted
+/// atomically. Failures (no cache path, fetch failure, parse failure)
+/// fold into an empty catalog and emit a single stderr warning per
+/// process. Callers need not branch on success/failure — lookups against
+/// an empty catalog return `None` and rendering naturally prints `—`.
+pub(crate) fn load_catalog() -> PricingCatalog {
+    let Some(path) = resolve_cache_file() else {
+        warn_once("no cache directory available; cost columns will show —");
+        return PricingCatalog::empty();
+    };
+
+    if path.exists() {
+        match read_cache(&path).and_then(|body| PricingCatalog::from_raw_json(&body)) {
+            Ok(catalog) => return catalog,
+            Err(e) => {
+                warn_once(&format!(
+                    "failed to load pricing cache at {}: {e}; cost columns will show —",
+                    path.display(),
+                ));
+                return PricingCatalog::empty();
+            }
+        }
+    }
+
+    let url = resolve_catalog_url();
+    let body = match fetch_catalog_body(&url) {
+        Ok(body) => body,
+        Err(e) => {
+            warn_once(&format!(
+                "failed to fetch pricing catalog from {url}: {e}; \
+                 cost columns will show —",
+            ));
+            return PricingCatalog::empty();
+        }
+    };
+    // Parse before writing. A bad remote payload (404 HTML, captive
+    // portal, gzip artifact) would otherwise clobber any pre-existing
+    // cache and leave every subsequent run unable to recover until
+    // `pricing refresh` succeeds again.
+    let catalog = match PricingCatalog::from_raw_json(&body) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            warn_once(&format!(
+                "fetched pricing catalog but failed to parse: {e}; \
+                 cost columns will show —",
+            ));
+            return PricingCatalog::empty();
+        }
+    };
+    if let Err(e) = write_cache_atomic(&path, &body) {
+        warn_once(&format!(
+            "fetched pricing catalog but failed to cache at {}: {e}",
+            path.display(),
+        ));
+    }
+    catalog
+}
+
+/// Result of an explicit `cclens pricing refresh`.
+pub(crate) struct RefreshReport {
+    pub(crate) path: PathBuf,
+    pub(crate) previous_size: u64,
+    pub(crate) new_size: u64,
+    pub(crate) entry_count: usize,
+}
+
+/// Explicit refresh. Unlike `load_catalog`, this is fallible so the CLI
+/// can exit nonzero on a failed user-requested refresh.
+///
+/// The sequence is fetch → parse → write: on a bad fetch or an
+/// unparseable response, the pre-existing cache is left intact so a
+/// transient remote hiccup never destroys a known-good catalog.
+pub(crate) fn refresh_catalog() -> anyhow::Result<RefreshReport> {
+    let path = resolve_cache_file()
+        .ok_or_else(|| anyhow::anyhow!("no cache directory available for pricing catalog"))?;
+    let previous_size = fs::metadata(&path).map_or(0, |m| m.len());
+    let url = resolve_catalog_url();
+    let body =
+        fetch_catalog_body(&url).map_err(|e| anyhow::anyhow!("fetch failed from {url}: {e}"))?;
+    let catalog =
+        PricingCatalog::from_raw_json(&body).map_err(|e| anyhow::anyhow!("parse failed: {e}"))?;
+    write_cache_atomic(&path, &body).map_err(|e| anyhow::anyhow!("cache write failed: {e}"))?;
+    let new_size = fs::metadata(&path).map_or(0, |m| m.len());
+    Ok(RefreshReport {
+        path,
+        previous_size,
+        new_size,
+        entry_count: catalog.claude_entry_count(),
+    })
+}
+
+/// Diagnostic report for `cclens pricing info`.
+///
+/// Infallible by design: `pricing info` is *the* tool the user runs
+/// when something is wrong with the cache, so it must still report
+/// path / size / mtime even when the JSON is corrupt. `entry_count ==
+/// None` signals "file exists but couldn't be parsed".
+pub(crate) struct CacheInfo {
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) exists: bool,
+    pub(crate) last_modified: Option<SystemTime>,
+    pub(crate) size: u64,
+    pub(crate) entry_count: Option<usize>,
+}
+
+pub(crate) fn cache_info() -> CacheInfo {
+    let Some(path) = resolve_cache_file() else {
+        return CacheInfo {
+            path: None,
+            exists: false,
+            last_modified: None,
+            size: 0,
+            entry_count: None,
+        };
+    };
+    let meta = fs::metadata(&path).ok();
+    let exists = meta.is_some();
+    let size = meta.as_ref().map_or(0, fs::Metadata::len);
+    let last_modified = meta.and_then(|m| m.modified().ok());
+    let entry_count = if exists {
+        read_cache(&path)
+            .ok()
+            .and_then(|body| PricingCatalog::from_raw_json(&body).ok())
+            .map(|c| c.claude_entry_count())
+    } else {
+        None
+    };
+    CacheInfo {
+        path: Some(path),
+        exists,
+        last_modified,
+        size,
+        entry_count,
     }
 }
 
