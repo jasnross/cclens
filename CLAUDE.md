@@ -8,6 +8,30 @@ A tiny Rust CLI that lists Claude Code conversations: when they happened, what
 project they were in, what they were about, and how many tokens they consumed.
 It reads `~/.claude/projects/` and prints a plain aligned table to stdout.
 
+## Project Status
+
+**cclens is pre-1.0.** The CLI surface (subcommands, flag names, defaults), the
+rendered output format, and the library API exposed by `src/lib.rs` are all
+expected to evolve. This is the cheapest time to make foundational changes —
+once we ship 1.0 and users start depending on stable flags, output, and import
+paths, every assumption hardens and refactors get expensive.
+
+When weighing design decisions:
+
+- Refactorings and breaking changes are on the table. Weigh the tradeoffs, but
+  don't reflexively defer hard changes to "later" — later is when they're
+  harder to make.
+- If components are difficult to fit together, abstractions are trending toward
+  leaky, or a change is awkward to implement, treat that friction as a signal
+  to reshape the surrounding code rather than work around it.
+- **"First make the change easy, then make the easy change."** When the next
+  feature feels awkward, the right first step is often to refactor so the
+  feature drops in cleanly — then add it.
+
+This bias toward refactoring does not override scope discipline. Improve what
+you touch in service of the current task; surface larger structural changes as
+their own work rather than smuggling them into unrelated commits.
+
 ## Commands
 
 ```sh
@@ -184,3 +208,12 @@ constant all live in `aggregation` because that's the only place they run.
 titles are user-authored text and frequently contain multi-byte characters.
 Any new truncation or width logic must operate on `chars()` (or a grapheme
 iterator where stricter correctness is needed), never on byte slices.
+
+### Snapshot tests are reviewable assertions, not contracts
+
+`tests/snapshots.rs` locks byte-for-byte rendering of `list` and `show` via
+`insta` so that any change to output is visible in review. When output changes
+intentionally — a new column, a tweaked label, a different default sort —
+accept the new baseline with `cargo insta review` rather than contorting code
+to preserve the old bytes. While cclens is pre-1.0 (see Project Status), a
+failing snapshot is a prompt to confirm intent, not a regression to avoid.
