@@ -1,0 +1,4 @@
+{"type":"permission-mode","mode":"default"}
+{"type":"file-history-snapshot","filesSnapshot":{}}
+{"type":"user","timestamp":"2026-04-10T10:00:00Z","cwd":"/Users/test/snap","message":{"content":"This is a deliberately long single-line prompt designed to exceed eighty characters and exercise the title truncation path."}}
+{"type":"assistant","timestamp":"2026-04-10T10:00:05Z","cwd":"/Users/test/snap","message":{"model":"claude-opus-4-7","usage":{"input_tokens":20,"output_tokens":60,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"Acknowledged"}]}}

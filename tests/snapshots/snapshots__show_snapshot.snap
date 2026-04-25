@@ -1,0 +1,8 @@
+---
+source: tests/snapshots.rs
+assertion_line: 62
+expression: stdout
+---
+ datetime          role       tokens     cost  cumulative  cum_cost  content           
+ 2026-04-01 10:00  user           40  $0.0006          40   $0.0006  /list-files src/  
+ 2026-04-01 10:00  assistant      80  $0.0060         120   $0.0066  Listing files now

@@ -1,0 +1,10 @@
+---
+source: tests/snapshots.rs
+assertion_line: 39
+expression: stdout
+---
+ datetime          project  title                                                                             tokens     cost  id                                   
+ 2026-04-01 10:00  snap     /list-files src/                                                                     120  $0.0066  aaaa0001-0001-0001-0001-000000000001 
+ 2026-04-05 10:00  snap     How do I configure neovim folds?                                                      60  $0.0038  bbbb0002-0002-0002-0002-000000000002 
+ 2026-04-10 10:00  snap     This is a deliberately long single-line prompt designed to exceed eighty charac…      80  $0.0048  cccc0003-0003-0003-0003-000000000003 
+ 2026-04-15 10:00  snap     First question to set up the orphan                                                   55  $0.0032  dddd0004-0004-0004-0004-000000000004

@@ -1,0 +1,4 @@
+{"type":"permission-mode","mode":"default"}
+{"type":"file-history-snapshot","filesSnapshot":{}}
+{"type":"user","timestamp":"2026-04-05T10:00:00Z","cwd":"/Users/test/snap","message":{"content":"How do I configure neovim folds?"}}
+{"type":"assistant","timestamp":"2026-04-05T10:00:05Z","cwd":"/Users/test/snap","message":{"model":"claude-opus-4-7","usage":{"input_tokens":12,"output_tokens":48,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"Use foldmethod=indent"}]}}

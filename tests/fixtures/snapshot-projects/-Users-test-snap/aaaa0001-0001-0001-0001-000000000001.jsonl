@@ -1,0 +1,4 @@
+{"type":"permission-mode","mode":"default"}
+{"type":"file-history-snapshot","filesSnapshot":{}}
+{"type":"user","timestamp":"2026-04-01T10:00:00Z","cwd":"/Users/test/snap","message":{"content":"<command-name>/list-files</command-name>\n<command-args>src/</command-args>"}}
+{"type":"assistant","timestamp":"2026-04-01T10:00:05Z","cwd":"/Users/test/snap","message":{"model":"claude-opus-4-7","usage":{"input_tokens":40,"output_tokens":80,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"Listing files now"}]}}
