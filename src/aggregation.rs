@@ -11,8 +11,7 @@
 //! - `exchange_filter_totals(&Exchange<'_>, &PricingCatalog) -> (u64, Option<f64>)`.
 //! - `user_display_string(&Value) -> Option<String>` — the canonical
 //!   "what the user said" extractor; called by `extract_title` here and
-//!   by the rendering layer's `user_content_preview` (currently in
-//!   `main.rs`; promoted to its own library module in Phase 7).
+//!   by `rendering::user_content_preview`.
 
 use std::path::Path;
 
@@ -165,7 +164,7 @@ fn is_synthetic_user_text(s: &str) -> bool {
 /// `is_substantive_user_turn` delegates to this function — a turn is
 /// substantive iff this returns `Some(_)`.
 #[must_use]
-pub fn user_display_string(content: &Value) -> Option<String> {
+pub(crate) fn user_display_string(content: &Value) -> Option<String> {
     if let Some(s) = content.as_str() {
         if is_synthetic_user_text(s) {
             return None;
@@ -311,7 +310,7 @@ pub fn group_into_exchanges(turns: &[Turn]) -> Vec<Exchange<'_>> {
 /// continues to compute its own row decomposition inline because that's
 /// a presentation concern (user-row vs assistant-row token slicing).
 #[must_use]
-pub fn exchange_filter_totals(
+pub(crate) fn exchange_filter_totals(
     exchange: &Exchange<'_>,
     catalog: &PricingCatalog,
 ) -> (u64, Option<f64>) {

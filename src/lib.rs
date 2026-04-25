@@ -9,3 +9,4 @@ pub mod domain;
 pub mod filter;
 pub mod parsing;
 pub mod pricing;
+pub mod rendering;
