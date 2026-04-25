@@ -73,41 +73,56 @@ Run `cargo fmt && cargo clippy --all-targets -- -D warnings` before committing.
 
 ## Source Layout
 
-The crate is mostly a single `src/main.rs` file, sectioned with `// ---- x ----`
-banner comments. The sections (in order) are:
+The crate compiles as two crates from the same `src/` tree: a library
+(`src/lib.rs`, root for the seven promoted modules) and a binary
+(`src/main.rs`, root for orchestration plus the CLI submodule). Both
+are named `cclens`; the binary consumes the library via
+`use cclens::...`.
+
+Library modules (declared `pub mod` in `src/lib.rs`, one file each
+under `src/<name>.rs`, in pipeline order):
 
 ```
-cli           ← clap parser, main entry, run_list
-domain        ← Session, Turn, Role, Usage (the internal types)
+domain        ← Session, Turn, Role, Usage, CacheCreation
 parsing       ← RawLine / RawMessage / RawUsage + parse_jsonl + raw_to_turn
-aggregation   ← turn list → Session (title extraction, short-name derivation,
-                zero-billable filter)
 discovery     ← projects_dir walk → (project_dir, [jsonl_paths])
-rendering     ← comfy-table setup, truncate_title, format_local, render_table
-tests         ← inline #[cfg(test)] mod tests
+aggregation   ← turn list → Session; Exchange grouping;
+                title extraction; project short-name derivation;
+                zero-billable filter
+pricing       ← LiteLLM-catalog fetch/cache/lookup, tiered cost math,
+                pricing-subcommand handlers
+rendering     ← comfy-table render_table (list view) and render_session
+                (show view), plus per-row formatters
+filter        ← Thresholds value type — the cross-boundary primitive
+                that lets rendering accept --min-tokens / --min-cost
+                without depending on clap
 ```
 
-One pipeline section lives in its own file:
+Binary entry point (`src/main.rs`):
 
-```
-pricing       ← src/pricing.rs — LiteLLM-catalog types, model lookup,
-                tiered cost math (fetch/cache I/O and subcommand
-                handlers will land as that scope grows in)
-```
+- Declares `mod cli;` (binary-only — `src/cli.rs` is **not** in
+  `lib.rs`) so library code cannot reach into clap-derived types.
+- Imports library modules via `use cclens::...`.
+- Holds `main`, `run_list`, `run_show`, `run_pricing`, the per-project
+  `dedup_assistant_turns` orchestration helper, and `stem_matches`.
 
-`pricing` was promoted from a banner section to its own module on day one
-because its eventual responsibilities (HTTP fetch, cache I/O,
-deserialization, lookup, cost math, subcommand handlers) push it past
-comfortable banner territory — even though the current scope is
-deliberately narrower than that.
+Binary CLI submodule (`src/cli.rs`):
 
-When a section grows large enough that the banners hurt more than help,
-promote it to its own module file. Prefer the modern Rust module convention
-(`src/parsing.rs`) over `mod.rs`. The gityard repo is the reference for how
-the split should look.
+- `Cli` / `Command` / `PricingAction` clap parser types.
+- `FilterArgs` — flattened `--min-tokens` / `--min-cost` flags with a
+  `.thresholds()` constructor that produces a library `Thresholds`.
+- `default_projects_dir`, `emit_empty_result_hint`.
 
-Integration tests live in `tests/listing.rs` and use `assert_cmd` against
-fixtures under `tests/fixtures/projects/`.
+Each library module file opens with a `//!` doc comment listing its
+public API surface. The gityard repo is the reference for the
+split's overall shape (flat `src/<name>.rs` files, `lib.rs` of pure
+`pub mod` declarations, `main.rs` with binary-only `mod cli;`).
+
+Integration tests live in `tests/listing.rs` (and sibling files) and
+use `assert_cmd` against fixtures under `tests/fixtures/projects/`.
+Snapshot regression tests in `tests/snapshots.rs` use `insta` against
+a dedicated fixture tree at `tests/fixtures/snapshot-projects/` and
+lock byte-for-byte rendering of `list` and `show`.
 
 ## Design Principles
 
