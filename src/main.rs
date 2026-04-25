@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use comfy_table::presets::NOTHING;
 use comfy_table::{CellAlignment, Table};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,10 @@ enum Command {
     ///
     /// The `cost` column includes `cache_read` tokens (priced at the
     /// discounted cache-read rate) — the `tokens` column does not.
-    List,
+    List {
+        #[command(flatten)]
+        filters: FilterArgs,
+    },
     /// Show per-exchange token + cost breakdown for one session.
     ///
     /// Per-row `cost` and running `cum_cost` columns include
@@ -44,12 +47,80 @@ enum Command {
     Show {
         /// Full session UUID (matches a .jsonl filename stem under --projects-dir).
         session_id: String,
+        #[command(flatten)]
+        filters: FilterArgs,
     },
     /// Manage the pricing catalog cache.
     Pricing {
         #[command(subcommand)]
         action: PricingAction,
     },
+}
+
+/// Shared `--min-tokens` / `--min-cost` thresholds for `list` and
+/// `show`. Flattened into both subcommands via `#[command(flatten)]`;
+/// deliberately not flattened into `pricing` (so `pricing refresh
+/// --min-tokens 1` is a clap parse error, not a silent no-op).
+///
+/// The `Copy` bound matters: a threshold pair is two scalar `Option`s,
+/// and copying them around the renderer avoids borrow plumbing without
+/// adding a closure.
+#[derive(Args, Debug, Clone, Copy, Default)]
+struct FilterArgs {
+    /// Show only rows with at least N billable tokens (e.g. --min-tokens 50000)
+    #[arg(long)]
+    min_tokens: Option<u64>,
+    /// Show only rows costing at least USD, e.g. --min-cost 0.50; unknown-cost rows excluded
+    #[arg(long)]
+    min_cost: Option<f64>,
+}
+
+impl FilterArgs {
+    /// Returns true iff (tokens, cost) clears every active threshold.
+    /// `cost == None` (unknown model / unpriceable) fails any active
+    /// `--min-cost` check; absent thresholds always pass. The two
+    /// `is_none_or` calls collapse "no threshold OR threshold met" into
+    /// one line each — the boolean and `&&`s the per-axis decisions
+    /// into a logical AND.
+    fn matches(&self, tokens: u64, cost: Option<f64>) -> bool {
+        let tokens_ok = self.min_tokens.is_none_or(|t| tokens >= t);
+        let cost_ok = self.min_cost.is_none_or(|c| cost.is_some_and(|n| n >= c));
+        tokens_ok && cost_ok
+    }
+
+    /// True iff at least one filter flag is active. Used to gate the
+    /// empty-result stderr hint — when no filter is active, an empty
+    /// result is just an empty `projects_dir` and gets no hint.
+    fn any_active(&self) -> bool {
+        self.min_tokens.is_some() || self.min_cost.is_some()
+    }
+
+    /// Format the active flags for the empty-result stderr hint:
+    /// `--min-tokens 50000`, `--min-cost 0.50`, or both joined by a
+    /// space. Cost is formatted with `{}` (Rust's default float
+    /// formatter, shortest round-trip representation) so small
+    /// thresholds like `--min-cost 0.0001` round-trip faithfully —
+    /// `{:.2}` would truncate them to `--min-cost 0.00`.
+    fn describe_active(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(t) = self.min_tokens {
+            parts.push(format!("--min-tokens {t}"));
+        }
+        if let Some(c) = self.min_cost {
+            parts.push(format!("--min-cost {c}"));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Emit `note: no rows matched <flags>` to stderr when filters dropped
+/// every row. No-op when no filter is active so the pre-existing
+/// "empty `projects_dir` produces no stderr" contract is preserved.
+fn emit_empty_result_hint(filters: &FilterArgs) {
+    if !filters.any_active() {
+        return;
+    }
+    eprintln!("note: no rows matched {}", filters.describe_active());
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -69,14 +140,19 @@ fn default_projects_dir() -> PathBuf {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::List) {
-        Command::List => run_list(&cli.projects_dir),
-        Command::Show { session_id } => run_show(&cli.projects_dir, &session_id),
+    match cli.command.unwrap_or(Command::List {
+        filters: FilterArgs::default(),
+    }) {
+        Command::List { filters } => run_list(&cli.projects_dir, filters),
+        Command::Show {
+            session_id,
+            filters,
+        } => run_show(&cli.projects_dir, &session_id, filters),
         Command::Pricing { action } => run_pricing(action),
     }
 }
 
-fn run_list(projects_dir: &Path) -> anyhow::Result<()> {
+fn run_list(projects_dir: &Path, filters: FilterArgs) -> anyhow::Result<()> {
     let catalog = pricing::load_catalog();
     let project_entries = discover(projects_dir)?;
     let mut sessions = Vec::new();
@@ -90,13 +166,22 @@ fn run_list(projects_dir: &Path) -> anyhow::Result<()> {
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if let Some(session) = aggregate(&project_dir, session_id, turns, &catalog) {
+            // The new threshold filter sits *after* `aggregate`'s
+            // existing zero-billable pre-pass, so it composes
+            // additively rather than altering the "session is
+            // meaningful" contract.
+            if let Some(session) = aggregate(&project_dir, session_id, turns, &catalog)
+                && filters.matches(session.total_billable, session.total_cost)
+            {
                 sessions.push(session);
             }
         }
     }
     sessions.sort_by_key(|s| s.started_at);
     println!("{}", render_table(&sessions));
+    if sessions.is_empty() {
+        emit_empty_result_hint(&filters);
+    }
     Ok(())
 }
 
@@ -137,7 +222,7 @@ fn run_pricing(action: PricingAction) -> anyhow::Result<()> {
     }
 }
 
-fn run_show(projects_dir: &Path, session_id: &str) -> anyhow::Result<()> {
+fn run_show(projects_dir: &Path, session_id: &str, filters: FilterArgs) -> anyhow::Result<()> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         anyhow::bail!("session id must not be empty");
@@ -161,7 +246,11 @@ fn run_show(projects_dir: &Path, session_id: &str) -> anyhow::Result<()> {
             let catalog = pricing::load_catalog();
             let turns = parse_jsonl(path)?;
             let exchanges = group_into_exchanges(&turns);
-            println!("{}", render_session(&exchanges, &catalog));
+            let (rendered, rows_shown) = render_session(&exchanges, &catalog, &filters);
+            println!("{rendered}");
+            if rows_shown == 0 {
+                emit_empty_result_hint(&filters);
+            }
             Ok(())
         }
         paths => {
@@ -564,6 +653,50 @@ fn group_into_exchanges(turns: &[Turn]) -> Vec<Exchange<'_>> {
     exchanges
 }
 
+/// Exchange-level (`tokens`, `cost`) for filter decisions.
+///
+/// `tokens` matches `Session.total_billable` semantics across the
+/// exchange's assistant cluster: `input + output + cache_creation`.
+/// `cost` matches `Session.total_cost` semantics: a strict fold over
+/// the cluster, collapsing to `None` if any single assistant turn has
+/// an unknown model (so any active `--min-cost` excludes the row).
+///
+/// Orphan exchanges (no assistants) yield `(0, None)` — `None` cost
+/// because there is no priced cluster to sum, so any active
+/// `--min-cost` excludes the orphan, and `--min-tokens >= 1` excludes
+/// it via the zero token count.
+///
+/// These totals are for filter decisions only — `render_session`
+/// continues to compute its own row decomposition inline because that's
+/// a presentation concern (user-row vs assistant-row token slicing).
+fn exchange_filter_totals(
+    exchange: &Exchange<'_>,
+    catalog: &pricing::PricingCatalog,
+) -> (u64, Option<f64>) {
+    if exchange.assistants.is_empty() {
+        return (0, None);
+    }
+    let tokens: u64 = exchange
+        .assistants
+        .iter()
+        .filter_map(|t| t.usage.as_ref())
+        .map(Usage::billable)
+        .sum();
+    let mut sum = 0.0;
+    for turn in &exchange.assistants {
+        let Some(usage) = turn.usage.as_ref() else {
+            // Assistant turn with no usage contributes zero (matches
+            // `total_session_cost`'s rule); does not collapse the sum.
+            continue;
+        };
+        let Some(cost) = catalog.cost_for_turn(usage, turn.model.as_deref()) else {
+            return (tokens, None);
+        };
+        sum += cost;
+    }
+    (tokens, Some(sum))
+}
+
 fn extract_slash_command_title(s: &str) -> Option<String> {
     let name_open = s.find("<command-name>")?;
     let name_content_start = name_open + "<command-name>".len();
@@ -805,7 +938,24 @@ fn fold_cum_cost(prev: Option<f64>, delta: Option<f64>) -> Option<f64> {
     prev.zip(delta).map(|(a, b)| a + b)
 }
 
-fn render_session(exchanges: &[Exchange<'_>], catalog: &pricing::PricingCatalog) -> String {
+/// Render the per-exchange table.
+///
+/// Returns `(rendered, rows_shown)`. `rows_shown` counts physical
+/// rendered rows (1 for an orphan-only visible exchange, 2 for a
+/// normal visible exchange). `run_show` uses `rows_shown == 0` to
+/// decide whether to emit the empty-result stderr hint.
+///
+/// Filtering happens here rather than in a pre-pass so that
+/// `cumulative` and `cum_cost` continue to fold over **every**
+/// exchange — the running totals on visible rows must still match the
+/// session-level `list` totals, which means the renderer needs both
+/// the unfiltered slice (for accumulation) and the predicate (for
+/// skipping `add_row`).
+fn render_session(
+    exchanges: &[Exchange<'_>],
+    catalog: &pricing::PricingCatalog,
+    filters: &FilterArgs,
+) -> (String, usize) {
     let mut table = Table::new();
     table.load_preset(NOTHING);
     table.set_header(vec![
@@ -819,8 +969,12 @@ fn render_session(exchanges: &[Exchange<'_>], catalog: &pricing::PricingCatalog)
     ]);
     let mut cumulative: u64 = 0;
     let mut cum_cost: Option<f64> = Some(0.0);
+    let mut rows_shown: usize = 0;
 
     for exchange in exchanges {
+        let (ex_tokens, ex_cost) = exchange_filter_totals(exchange, catalog);
+        let visible = filters.matches(ex_tokens, ex_cost);
+
         let user_tokens_opt: Option<u64> = if exchange.assistants.is_empty() {
             None
         } else {
@@ -859,15 +1013,18 @@ fn render_session(exchanges: &[Exchange<'_>], catalog: &pricing::PricingCatalog)
 
         cumulative += user_tokens_opt.unwrap_or(0);
         cum_cost = fold_cum_cost(cum_cost, user_cost_delta);
-        table.add_row(vec![
-            format_local_or_empty(exchange.user.timestamp),
-            "user".to_string(),
-            user_tokens_opt.map_or_else(|| "—".to_string(), |n| n.to_string()),
-            format_cost_opt(user_cost_display),
-            cumulative.to_string(),
-            format_cost_opt(cum_cost),
-            truncate_title(&user_content_preview(exchange.user), TITLE_MAX_CHARS),
-        ]);
+        if visible {
+            table.add_row(vec![
+                format_local_or_empty(exchange.user.timestamp),
+                "user".to_string(),
+                user_tokens_opt.map_or_else(|| "—".to_string(), |n| n.to_string()),
+                format_cost_opt(user_cost_display),
+                cumulative.to_string(),
+                format_cost_opt(cum_cost),
+                truncate_title(&user_content_preview(exchange.user), TITLE_MAX_CHARS),
+            ]);
+            rows_shown += 1;
+        }
 
         if let Some(first_assistant) = exchange.assistants.first() {
             let assistant_cost =
@@ -877,22 +1034,25 @@ fn render_session(exchanges: &[Exchange<'_>], catalog: &pricing::PricingCatalog)
             cumulative += output_tokens;
             cum_cost = fold_cum_cost(cum_cost, assistant_cost);
 
-            let preview = assistant_cluster_preview(&exchange.assistants);
-            let n_tools = count_tool_uses(&exchange.assistants);
-            let content = if n_tools > 0 {
-                format!("{preview} +{n_tools} tool uses")
-            } else {
-                preview
-            };
-            table.add_row(vec![
-                format_local_or_empty(first_assistant.timestamp),
-                "assistant".to_string(),
-                output_tokens.to_string(),
-                format_cost_opt(assistant_cost),
-                cumulative.to_string(),
-                format_cost_opt(cum_cost),
-                truncate_title(&content, TITLE_MAX_CHARS),
-            ]);
+            if visible {
+                let preview = assistant_cluster_preview(&exchange.assistants);
+                let n_tools = count_tool_uses(&exchange.assistants);
+                let content = if n_tools > 0 {
+                    format!("{preview} +{n_tools} tool uses")
+                } else {
+                    preview
+                };
+                table.add_row(vec![
+                    format_local_or_empty(first_assistant.timestamp),
+                    "assistant".to_string(),
+                    output_tokens.to_string(),
+                    format_cost_opt(assistant_cost),
+                    cumulative.to_string(),
+                    format_cost_opt(cum_cost),
+                    truncate_title(&content, TITLE_MAX_CHARS),
+                ]);
+                rows_shown += 1;
+            }
         }
     }
 
@@ -908,7 +1068,7 @@ fn render_session(exchanges: &[Exchange<'_>], catalog: &pricing::PricingCatalog)
     if let Some(col) = table.column_mut(SHOW_CUM_COST_COL_INDEX) {
         col.set_cell_alignment(CellAlignment::Right);
     }
-    format!("{table}")
+    (format!("{table}"), rows_shown)
 }
 
 // ---- tests ----
@@ -971,7 +1131,7 @@ mod tests {
     #[test]
     fn explicit_list_parses_as_list_variant() {
         let cli = Cli::try_parse_from(["cclens", "list"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::List)));
+        assert!(matches!(cli.command, Some(Command::List { .. })));
     }
 
     #[test]
@@ -1890,7 +2050,12 @@ mod tests {
 
     #[test]
     fn render_session_header_includes_all_seven_columns() {
-        let out = render_session(&[], &pricing::PricingCatalog::empty());
+        let (out, rows_shown) = render_session(
+            &[],
+            &pricing::PricingCatalog::empty(),
+            &FilterArgs::default(),
+        );
+        assert_eq!(rows_shown, 0);
         assert!(out.contains("datetime"));
         assert!(out.contains("role"));
         assert!(out.contains("tokens"));
@@ -1923,7 +2088,11 @@ mod tests {
                 assistants: Vec::new(),
             },
         ];
-        let out = render_session(&exchanges, &pricing::PricingCatalog::empty());
+        let (out, _) = render_session(
+            &exchanges,
+            &pricing::PricingCatalog::empty(),
+            &FilterArgs::default(),
+        );
         let lines: Vec<&str> = out.lines().collect();
         let assistant_line = lines
             .iter()
@@ -1997,7 +2166,11 @@ mod tests {
             },
         ];
         // Expected billable total = (100+50+200) + (10+20+0) = 380.
-        let out = render_session(&exchanges, &pricing::PricingCatalog::empty());
+        let (out, _) = render_session(
+            &exchanges,
+            &pricing::PricingCatalog::empty(),
+            &FilterArgs::default(),
+        );
         let last_line = out
             .lines()
             .rfind(|l| l.contains("r2"))
@@ -2036,7 +2209,11 @@ mod tests {
                 assistants: vec![&a2],
             },
         ];
-        let out = render_session(&exchanges, &pricing::PricingCatalog::empty());
+        let (out, _) = render_session(
+            &exchanges,
+            &pricing::PricingCatalog::empty(),
+            &FilterArgs::default(),
+        );
         // After Phase 3 the column order is:
         //   datetime | role | tokens | cost | cumulative | cum_cost | content
         // With an empty catalog, both `cost` and `cum_cost` render as
@@ -2086,10 +2263,226 @@ mod tests {
             user: &u,
             assistants: vec![&a],
         }];
-        let out = render_session(&exchanges, &pricing::PricingCatalog::empty());
+        let (out, _) = render_session(
+            &exchanges,
+            &pricing::PricingCatalog::empty(),
+            &FilterArgs::default(),
+        );
         assert!(
             out.contains("reading +2 tool uses"),
             "expected tool-use suffix; got:\n{out}",
         );
+    }
+
+    // --- FilterArgs ---
+
+    #[test]
+    fn filter_args_matches_no_filters_passes_everything() {
+        let f = FilterArgs::default();
+        assert!(f.matches(0, None));
+        assert!(f.matches(0, Some(0.0)));
+        assert!(f.matches(1_000_000, Some(1.0)));
+    }
+
+    #[test]
+    fn filter_args_matches_min_tokens_only() {
+        let f = FilterArgs {
+            min_tokens: Some(100),
+            min_cost: None,
+        };
+        // Boundary: at threshold passes (>=).
+        assert!(f.matches(100, None));
+        assert!(f.matches(100, Some(0.0)));
+        // Above threshold passes regardless of cost.
+        assert!(f.matches(101, None));
+        // Below threshold fails regardless of cost.
+        assert!(!f.matches(99, Some(1.0)));
+        assert!(!f.matches(0, None));
+    }
+
+    #[test]
+    fn filter_args_matches_min_cost_only() {
+        let f = FilterArgs {
+            min_tokens: None,
+            min_cost: Some(0.50),
+        };
+        // Boundary: at threshold passes.
+        assert!(f.matches(0, Some(0.50)));
+        assert!(f.matches(1_000_000, Some(0.50)));
+        // Above threshold passes.
+        assert!(f.matches(0, Some(0.51)));
+        // Below threshold fails.
+        assert!(!f.matches(1_000_000, Some(0.49)));
+        // None cost is excluded by any active --min-cost.
+        assert!(!f.matches(1_000_000, None));
+        // Some(0.0) is excluded by any positive threshold.
+        assert!(!f.matches(1_000_000, Some(0.0)));
+        // ...but accepted by a 0.0 threshold.
+        let zero = FilterArgs {
+            min_tokens: None,
+            min_cost: Some(0.0),
+        };
+        assert!(zero.matches(0, Some(0.0)));
+        // None still excluded even by 0.0 threshold (None means
+        // "unpriceable", which can't clear a cost gate).
+        assert!(!zero.matches(0, None));
+    }
+
+    #[test]
+    fn filter_args_matches_both_is_logical_and() {
+        let f = FilterArgs {
+            min_tokens: Some(100),
+            min_cost: Some(0.10),
+        };
+        // Both clear → pass.
+        assert!(f.matches(100, Some(0.10)));
+        assert!(f.matches(500, Some(1.00)));
+        // Tokens fail, cost clears → fail.
+        assert!(!f.matches(50, Some(1.00)));
+        // Tokens clear, cost fails → fail.
+        assert!(!f.matches(500, Some(0.05)));
+        // Tokens clear, cost is None → fail.
+        assert!(!f.matches(500, None));
+        // Both fail → fail.
+        assert!(!f.matches(0, None));
+    }
+
+    #[test]
+    fn filter_args_describe_active_formats_each_combination() {
+        let tokens_only = FilterArgs {
+            min_tokens: Some(50_000),
+            min_cost: None,
+        };
+        assert_eq!(tokens_only.describe_active(), "--min-tokens 50000");
+
+        let cost_only = FilterArgs {
+            min_tokens: None,
+            min_cost: Some(0.50),
+        };
+        assert_eq!(cost_only.describe_active(), "--min-cost 0.5");
+
+        let both = FilterArgs {
+            min_tokens: Some(50_000),
+            min_cost: Some(0.50),
+        };
+        assert_eq!(both.describe_active(), "--min-tokens 50000 --min-cost 0.5",);
+
+        // Regression guard: the default `{}` formatter must round-trip
+        // small values faithfully — `{:.2}` would truncate this to
+        // `--min-cost 0.00`.
+        let small = FilterArgs {
+            min_tokens: None,
+            min_cost: Some(0.0001),
+        };
+        assert!(
+            small.describe_active().contains("--min-cost 0.0001"),
+            "expected 0.0001 to round-trip; got: {}",
+            small.describe_active(),
+        );
+    }
+
+    // --- exchange_filter_totals ---
+
+    #[test]
+    fn exchange_filter_totals_orphan_is_zero_and_none() {
+        let u = show_user_turn("orphan", "2026-04-01T10:00:00Z");
+        let exchange = Exchange {
+            user: &u,
+            assistants: Vec::new(),
+        };
+        let (tokens, cost) = exchange_filter_totals(&exchange, &pricing::PricingCatalog::empty());
+        assert_eq!(tokens, 0);
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn exchange_filter_totals_sums_billable_across_cluster() {
+        // Two assistant turns on a known model. Use the litellm-mini
+        // fixture's claude-opus-4-7 rates: input=15e-6, output=75e-6,
+        // cache_creation=18.75e-6, cache_read=1.5e-6.
+        let u = show_user_turn("q", "2026-04-01T10:00:00Z");
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "a1" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "a2" }]),
+            5,
+            15,
+            100,
+            "2026-04-01T10:02:00Z",
+        );
+        let exchange = Exchange {
+            user: &u,
+            assistants: vec![&a1, &a2],
+        };
+        let catalog = sample_catalog();
+        let (tokens, cost) = exchange_filter_totals(&exchange, &catalog);
+        // Tokens = (10+20+0) + (5+15+100) = 30 + 120 = 150.
+        assert_eq!(tokens, 150);
+        // Cost = a1 (10*15e-6 + 20*75e-6) + a2 (5*15e-6 + 15*75e-6 + 100*18.75e-6)
+        //      = (0.00015 + 0.0015) + (0.000075 + 0.001125 + 0.001875)
+        //      = 0.00165 + 0.003075
+        //      = 0.004725
+        let actual = cost.expect("cost should be Some");
+        assert!(
+            (actual - 0.004_725).abs() < 1e-9,
+            "expected ~0.004725, got {actual}",
+        );
+    }
+
+    #[test]
+    fn exchange_filter_totals_unknown_model_collapses_cost() {
+        // Mix one known-model assistant with one unknown-model one;
+        // tokens still sum but cost collapses to None.
+        let u = show_user_turn("q", "2026-04-01T10:00:00Z");
+        let known = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "known" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        let unknown = Turn {
+            timestamp: Some("2026-04-01T10:02:00Z".parse().unwrap()),
+            role: Role::Assistant,
+            model: Some("claude-fake-9-9".to_string()),
+            usage: Some(Usage {
+                input: 5,
+                output: 15,
+                cache_creation: 0,
+                cache_read: 0,
+            }),
+            content: Some(serde_json::json!([{ "type": "text", "text": "?" }])),
+            cwd: None,
+        };
+        let exchange = Exchange {
+            user: &u,
+            assistants: vec![&known, &unknown],
+        };
+        let catalog = sample_catalog();
+        let (tokens, cost) = exchange_filter_totals(&exchange, &catalog);
+        // Tokens = (input+output+cache_creation) per turn = (10+20)+(5+15);
+        // both clusters have zero cache_creation here.
+        assert_eq!(tokens, (10 + 20) + (5 + 15));
+        assert_eq!(cost, None);
+    }
+
+    /// Build a small in-memory pricing catalog matching the
+    /// `litellm-mini.json` fixture's claude-opus-4-7 rates. Avoids a
+    /// disk fetch in unit tests.
+    fn sample_catalog() -> pricing::PricingCatalog {
+        let raw = r#"{
+            "claude-opus-4-7": {
+                "input_cost_per_token": 0.000015,
+                "output_cost_per_token": 0.000075,
+                "cache_creation_input_token_cost": 0.00001875,
+                "cache_read_input_token_cost": 0.0000015
+            }
+        }"#;
+        pricing::PricingCatalog::from_raw_json(raw).expect("test catalog parse")
     }
 }

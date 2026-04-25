@@ -99,7 +99,7 @@ pub(crate) struct PricingCatalog {
 /// public entry point folds them into an empty catalog + single stderr
 /// warning.
 #[derive(Debug, Error)]
-enum PricingError {
+pub(crate) enum PricingError {
     #[error("failed to fetch pricing catalog: {0}")]
     Fetch(String),
     #[error("failed to read pricing cache: {0}")]
@@ -133,7 +133,7 @@ impl PricingCatalog {
     /// deliberately permissive — any Claude-ish key is kept because the
     /// lookup chain below further narrows by exact / prefixed / longest-
     /// substring matching.
-    fn from_raw_json(json: &str) -> Result<Self, PricingError> {
+    pub(crate) fn from_raw_json(json: &str) -> Result<Self, PricingError> {
         let raw: HashMap<String, RawPricingEntry> = serde_json::from_str(json)?;
         let mut entries = HashMap::new();
         for (key, entry) in raw {

@@ -59,6 +59,25 @@ that are non-zero-cost only via `cache_read` stay visible. Malformed JSONL
 lines are silently skipped. One unreadable file or project directory does
 not abort the listing.
 
+#### Filtering
+
+Two flags narrow the result set; both apply to `list` and `show`:
+
+- `--min-tokens <N>` — show only rows with at least N billable tokens
+  (e.g. `--min-tokens 50000`).
+- `--min-cost <USD>` — show only rows costing at least USD (e.g.
+  `--min-cost 0.50`).
+
+When both are passed, both must clear (logical AND). Rows whose cost is
+unknown (renders `—` in the `cost` column — i.e. an unknown-model row)
+are excluded by any active `--min-cost`. Orphan user exchanges in
+`show` (whose `tokens` cell renders `—`) are excluded by any
+`--min-tokens >= 1`.
+
+If the filter drops every row, stdout still prints the table header,
+stderr prints a one-line hint (`note: no rows matched <flags>`), and
+the exit code is 0.
+
 ### show
 
 Drill into a single session and see a per-exchange token breakdown:
@@ -95,6 +114,14 @@ inspection tool and will render any valid session ID.
 - **content** — user prose (or slash-command reconstruction) on user rows;
   assistant reply preview with an optional `+N tool uses` suffix on assistant
   rows. Truncated to 80 characters with `…`.
+
+The `--min-tokens` / `--min-cost` flags described under
+[Filtering](#filtering) work on `show` too — the filter unit is a
+collapsed exchange (so a user row and its assistant row are shown or
+hidden together). `cumulative` and `cum_cost` continue to fold over
+**every** exchange so the final visible row's running totals match
+the session's `list` totals — visible cells may "jump" between rows
+when the filter drops middle exchanges.
 
 ### pricing
 

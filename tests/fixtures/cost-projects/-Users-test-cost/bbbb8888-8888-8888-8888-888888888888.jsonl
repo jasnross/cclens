@@ -1,0 +1,6 @@
+{"type":"user","timestamp":"2026-04-22T08:00:00Z","cwd":"/Users/test/cost-fixture","message":{"content":"first question"}}
+{"type":"assistant","timestamp":"2026-04-22T08:00:05Z","cwd":"/Users/test/cost-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":40,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"first answer"}]}}
+{"type":"user","timestamp":"2026-04-22T08:01:00Z","cwd":"/Users/test/cost-fixture","message":{"content":"big question"}}
+{"type":"assistant","timestamp":"2026-04-22T08:01:05Z","cwd":"/Users/test/cost-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":400,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"big answer"}]}}
+{"type":"user","timestamp":"2026-04-22T08:02:00Z","cwd":"/Users/test/cost-fixture","message":{"content":"third question"}}
+{"type":"assistant","timestamp":"2026-04-22T08:02:05Z","cwd":"/Users/test/cost-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":40,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"third answer"}]}}
