@@ -24,7 +24,7 @@ use std::time::SystemTime;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{CacheCreation, Usage};
+use crate::domain::{CacheCreation, Usage};
 
 // ---- raw schema ----
 
@@ -116,7 +116,7 @@ pub(crate) struct ClaudePricing {
 /// degraded startup). Used by `aggregation` to compute per-session totals
 /// and by `rendering` to compute per-turn cells in the `show` view.
 #[derive(Debug, Default)]
-pub(crate) struct PricingCatalog {
+pub struct PricingCatalog {
     entries: HashMap<String, ClaudePricing>,
 }
 
@@ -125,7 +125,7 @@ pub(crate) struct PricingCatalog {
 /// public entry point folds them into an empty catalog + single stderr
 /// warning.
 #[derive(Debug, Error)]
-pub(crate) enum PricingError {
+pub enum PricingError {
     #[error("failed to fetch pricing catalog: {0}")]
     Fetch(String),
     #[error("failed to read pricing cache: {0}")]
@@ -139,7 +139,8 @@ pub(crate) enum PricingError {
 // ---- lookup ----
 
 impl PricingCatalog {
-    pub(crate) fn empty() -> Self {
+    #[must_use]
+    pub fn empty() -> Self {
         Self {
             entries: HashMap::new(),
         }
@@ -159,7 +160,12 @@ impl PricingCatalog {
     /// deliberately permissive — any Claude-ish key is kept because the
     /// lookup chain below further narrows by exact / prefixed / longest-
     /// substring matching.
-    pub(crate) fn from_raw_json(json: &str) -> Result<Self, PricingError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `PricingError::Parse` if `json` is not a valid `LiteLLM`
+    /// catalog payload.
+    pub fn from_raw_json(json: &str) -> Result<Self, PricingError> {
         let raw: HashMap<String, RawPricingEntry> = serde_json::from_str(json)?;
         let mut entries = HashMap::new();
         for (key, entry) in raw {
@@ -333,7 +339,7 @@ impl PricingCatalog {
     /// miss — strict `None` propagation is the contract that Phase 3's
     /// session and running-total folds rely on.
     #[must_use]
-    pub(crate) fn cost_for_components(
+    pub fn cost_for_components(
         &self,
         input: u64,
         output: u64,
@@ -358,7 +364,7 @@ impl PricingCatalog {
     /// Thin wrapper over `cost_for_components` for callers that already
     /// hold a `Usage`.
     #[must_use]
-    pub(crate) fn cost_for_turn(&self, usage: &Usage, model: Option<&str>) -> Option<f64> {
+    pub fn cost_for_turn(&self, usage: &Usage, model: Option<&str>) -> Option<f64> {
         self.cost_for_components(
             usage.input,
             usage.output,
@@ -499,7 +505,8 @@ fn warn_once(message: &str) {
 /// fold into an empty catalog and emit a single stderr warning per
 /// process. Callers need not branch on success/failure — lookups against
 /// an empty catalog return `None` and rendering naturally prints `—`.
-pub(crate) fn load_catalog() -> PricingCatalog {
+#[must_use]
+pub fn load_catalog() -> PricingCatalog {
     let Some(path) = resolve_cache_file() else {
         warn_once("no cache directory available; cost columns will show —");
         return PricingCatalog::empty();
@@ -553,11 +560,11 @@ pub(crate) fn load_catalog() -> PricingCatalog {
 }
 
 /// Result of an explicit `cclens pricing refresh`.
-pub(crate) struct RefreshReport {
-    pub(crate) path: PathBuf,
-    pub(crate) previous_size: u64,
-    pub(crate) new_size: u64,
-    pub(crate) entry_count: usize,
+pub struct RefreshReport {
+    pub path: PathBuf,
+    pub previous_size: u64,
+    pub new_size: u64,
+    pub entry_count: usize,
 }
 
 /// Explicit refresh. Unlike `load_catalog`, this is fallible so the CLI
@@ -566,7 +573,13 @@ pub(crate) struct RefreshReport {
 /// The sequence is fetch → parse → write: on a bad fetch or an
 /// unparseable response, the pre-existing cache is left intact so a
 /// transient remote hiccup never destroys a known-good catalog.
-pub(crate) fn refresh_catalog() -> anyhow::Result<RefreshReport> {
+///
+/// # Errors
+///
+/// Returns an error if no cache directory is available, the catalog
+/// fetch fails (network, HTTP status), the response body fails to
+/// parse as a `LiteLLM` catalog, or the cache file write fails.
+pub fn refresh_catalog() -> anyhow::Result<RefreshReport> {
     let path = resolve_cache_file()
         .ok_or_else(|| anyhow::anyhow!("no cache directory available for pricing catalog"))?;
     let previous_size = fs::metadata(&path).map_or(0, |m| m.len());
@@ -591,15 +604,16 @@ pub(crate) fn refresh_catalog() -> anyhow::Result<RefreshReport> {
 /// when something is wrong with the cache, so it must still report
 /// path / size / mtime even when the JSON is corrupt. `entry_count ==
 /// None` signals "file exists but couldn't be parsed".
-pub(crate) struct CacheInfo {
-    pub(crate) path: Option<PathBuf>,
-    pub(crate) exists: bool,
-    pub(crate) last_modified: Option<SystemTime>,
-    pub(crate) size: u64,
-    pub(crate) entry_count: Option<usize>,
+pub struct CacheInfo {
+    pub path: Option<PathBuf>,
+    pub exists: bool,
+    pub last_modified: Option<SystemTime>,
+    pub size: u64,
+    pub entry_count: Option<usize>,
 }
 
-pub(crate) fn cache_info() -> CacheInfo {
+#[must_use]
+pub fn cache_info() -> CacheInfo {
     let Some(path) = resolve_cache_file() else {
         return CacheInfo {
             path: None,

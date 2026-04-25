@@ -1,17 +1,17 @@
-mod pricing;
-
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use cclens::domain::{CacheCreation, Role, Session, Turn, Usage};
 use cclens::filter::Thresholds;
+use cclens::pricing;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use comfy_table::presets::NOTHING;
 use comfy_table::{CellAlignment, Table};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 // ---- cli ----
@@ -318,86 +318,6 @@ fn run_show(projects_dir: &Path, session_id: &str, filters: FilterArgs) -> anyho
 fn stem_matches(path: &Path, session_id: &str) -> bool {
     path.file_stem()
         .is_some_and(|s| s.to_string_lossy() == session_id)
-}
-
-// ---- domain ----
-
-#[derive(Debug, Serialize)]
-struct Session {
-    id: String,
-    project_short_name: String,
-    started_at: DateTime<Utc>,
-    last_activity: DateTime<Utc>,
-    title: String,
-    turns: Vec<Turn>,
-    total_billable: u64,
-    /// `Some(sum)` only if every assistant turn's cost resolved to
-    /// `Some(_)`. A single unknown-model assistant turn collapses the
-    /// whole session to `None` (strict propagation, no partial sums)
-    /// — the rendered `cost` cell becomes `—`. Diverges from
-    /// `total_billable` by including `cache_read` tokens.
-    total_cost: Option<f64>,
-}
-
-impl Session {
-    #[allow(dead_code)]
-    fn duration(&self) -> chrono::Duration {
-        self.last_activity - self.started_at
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct Turn {
-    timestamp: Option<DateTime<Utc>>,
-    role: Role,
-    model: Option<String>,
-    message_id: Option<String>,
-    request_id: Option<String>,
-    usage: Option<Usage>,
-    content: Option<Value>,
-    cwd: Option<PathBuf>,
-}
-
-#[derive(Debug, Serialize)]
-enum Role {
-    User,
-    Assistant,
-    Attachment,
-    System,
-    Other(String),
-}
-
-#[derive(Debug, Serialize)]
-struct Usage {
-    input: u64,
-    output: u64,
-    cache_creation: CacheCreation,
-    cache_read: u64,
-}
-
-impl Usage {
-    fn billable(&self) -> u64 {
-        self.input + self.output + self.cache_creation.total()
-    }
-}
-
-/// Cache-creation token counts split by ephemeral lifetime. The 5m and
-/// 1h buckets are billed at distinct rates (the 1h rate is roughly
-/// 1.6× the 5m rate for opus-4-7), so cclens keeps them separate from
-/// `RawUsage` through to `pricing::cost_for_components`. Crate-root
-/// items are visible to descendant modules by default; `pricing.rs`
-/// names this type in its signature and reads its fields without any
-/// visibility modifier.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-struct CacheCreation {
-    ephemeral_5m: u64,
-    ephemeral_1h: u64,
-}
-
-impl CacheCreation {
-    fn total(&self) -> u64 {
-        self.ephemeral_5m + self.ephemeral_1h
-    }
 }
 
 // ---- parsing ----
@@ -1311,22 +1231,6 @@ mod tests {
             "expected default projects_dir to end in .claude/projects, got {:?}",
             cli.projects_dir,
         );
-    }
-
-    // --- domain helpers ---
-
-    #[test]
-    fn usage_billable_sums_three_fields() {
-        let u = Usage {
-            input: 6,
-            output: 1186,
-            cache_creation: CacheCreation {
-                ephemeral_5m: 18998,
-                ephemeral_1h: 0,
-            },
-            cache_read: 17317,
-        };
-        assert_eq!(u.billable(), 20190);
     }
 
     // --- title extraction ---

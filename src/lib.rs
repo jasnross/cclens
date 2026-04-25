@@ -3,4 +3,6 @@
 //! test suite. Each promoted module documents its own public API in a
 //! `//!` doc comment; this file only declares the modules.
 
+pub mod domain;
 pub mod filter;
+pub mod pricing;
