@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use cclens::filter::Thresholds;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use comfy_table::presets::NOTHING;
@@ -78,16 +79,16 @@ struct FilterArgs {
 }
 
 impl FilterArgs {
-    /// Returns true iff (tokens, cost) clears every active threshold.
-    /// `cost == None` (unknown model / unpriceable) fails any active
-    /// `--min-cost` check; absent thresholds always pass. The two
-    /// `is_none_or` calls collapse "no threshold OR threshold met" into
-    /// one line each — the boolean and `&&`s the per-axis decisions
-    /// into a logical AND.
-    fn matches(&self, tokens: u64, cost: Option<f64>) -> bool {
-        let tokens_ok = self.min_tokens.is_none_or(|t| tokens >= t);
-        let cost_ok = self.min_cost.is_none_or(|c| cost.is_some_and(|n| n >= c));
-        tokens_ok && cost_ok
+    /// Project the clap-derived flags into the library-side `Thresholds`.
+    /// `FilterArgs` is binary-only (clap-derived); `Thresholds` lives in
+    /// the library crate and is what `render_session` (and any future
+    /// library consumer of the threshold predicate) takes — keeping the
+    /// library/CLI seam free of clap dependencies.
+    fn thresholds(&self) -> Thresholds {
+        Thresholds {
+            min_tokens: self.min_tokens,
+            min_cost: self.min_cost,
+        }
     }
 
     /// True iff at least one filter flag is active. Used to gate the
@@ -181,7 +182,9 @@ fn run_list(projects_dir: &Path, filters: FilterArgs) -> anyhow::Result<()> {
             // additively rather than altering the "session is
             // meaningful" contract.
             if let Some(session) = aggregate(&project_dir, session_id, turns, &catalog)
-                && filters.matches(session.total_billable, session.total_cost)
+                && filters
+                    .thresholds()
+                    .matches(session.total_billable, session.total_cost)
             {
                 sessions.push(session);
             }
@@ -304,7 +307,7 @@ fn run_show(projects_dir: &Path, session_id: &str, filters: FilterArgs) -> anyho
     let turns =
         target_turns.ok_or_else(|| anyhow::anyhow!("no session matches id {session_id}"))?;
     let exchanges = group_into_exchanges(&turns);
-    let (rendered, rows_shown) = render_session(&exchanges, &catalog, &filters);
+    let (rendered, rows_shown) = render_session(&exchanges, &catalog, filters.thresholds());
     println!("{rendered}");
     if rows_shown == 0 {
         emit_empty_result_hint(&filters);
@@ -1103,7 +1106,7 @@ fn fold_cum_cost(prev: Option<f64>, delta: Option<f64>) -> Option<f64> {
 fn render_session(
     exchanges: &[Exchange<'_>],
     catalog: &pricing::PricingCatalog,
-    filters: &FilterArgs,
+    thresholds: Thresholds,
 ) -> (String, usize) {
     let mut table = Table::new();
     table.load_preset(NOTHING);
@@ -1122,7 +1125,7 @@ fn render_session(
 
     for exchange in exchanges {
         let (ex_tokens, ex_cost) = exchange_filter_totals(exchange, catalog);
-        let visible = filters.matches(ex_tokens, ex_cost);
+        let visible = thresholds.matches(ex_tokens, ex_cost);
 
         let user_tokens_opt: Option<u64> = if exchange.assistants.is_empty() {
             None
@@ -2414,7 +2417,7 @@ mod tests {
         let (out, rows_shown) = render_session(
             &[],
             &pricing::PricingCatalog::empty(),
-            &FilterArgs::default(),
+            Thresholds::default(),
         );
         assert_eq!(rows_shown, 0);
         assert!(out.contains("datetime"));
@@ -2452,7 +2455,7 @@ mod tests {
         let (out, _) = render_session(
             &exchanges,
             &pricing::PricingCatalog::empty(),
-            &FilterArgs::default(),
+            Thresholds::default(),
         );
         let lines: Vec<&str> = out.lines().collect();
         let assistant_line = lines
@@ -2530,7 +2533,7 @@ mod tests {
         let (out, _) = render_session(
             &exchanges,
             &pricing::PricingCatalog::empty(),
-            &FilterArgs::default(),
+            Thresholds::default(),
         );
         let last_line = out
             .lines()
@@ -2573,7 +2576,7 @@ mod tests {
         let (out, _) = render_session(
             &exchanges,
             &pricing::PricingCatalog::empty(),
-            &FilterArgs::default(),
+            Thresholds::default(),
         );
         // After Phase 3 the column order is:
         //   datetime | role | tokens | cost | cumulative | cum_cost | content
@@ -2627,7 +2630,7 @@ mod tests {
         let (out, _) = render_session(
             &exchanges,
             &pricing::PricingCatalog::empty(),
-            &FilterArgs::default(),
+            Thresholds::default(),
         );
         assert!(
             out.contains("reading +2 tool uses"),
@@ -2636,77 +2639,6 @@ mod tests {
     }
 
     // --- FilterArgs ---
-
-    #[test]
-    fn filter_args_matches_no_filters_passes_everything() {
-        let f = FilterArgs::default();
-        assert!(f.matches(0, None));
-        assert!(f.matches(0, Some(0.0)));
-        assert!(f.matches(1_000_000, Some(1.0)));
-    }
-
-    #[test]
-    fn filter_args_matches_min_tokens_only() {
-        let f = FilterArgs {
-            min_tokens: Some(100),
-            min_cost: None,
-        };
-        // Boundary: at threshold passes (>=).
-        assert!(f.matches(100, None));
-        assert!(f.matches(100, Some(0.0)));
-        // Above threshold passes regardless of cost.
-        assert!(f.matches(101, None));
-        // Below threshold fails regardless of cost.
-        assert!(!f.matches(99, Some(1.0)));
-        assert!(!f.matches(0, None));
-    }
-
-    #[test]
-    fn filter_args_matches_min_cost_only() {
-        let f = FilterArgs {
-            min_tokens: None,
-            min_cost: Some(0.50),
-        };
-        // Boundary: at threshold passes.
-        assert!(f.matches(0, Some(0.50)));
-        assert!(f.matches(1_000_000, Some(0.50)));
-        // Above threshold passes.
-        assert!(f.matches(0, Some(0.51)));
-        // Below threshold fails.
-        assert!(!f.matches(1_000_000, Some(0.49)));
-        // None cost is excluded by any active --min-cost.
-        assert!(!f.matches(1_000_000, None));
-        // Some(0.0) is excluded by any positive threshold.
-        assert!(!f.matches(1_000_000, Some(0.0)));
-        // ...but accepted by a 0.0 threshold.
-        let zero = FilterArgs {
-            min_tokens: None,
-            min_cost: Some(0.0),
-        };
-        assert!(zero.matches(0, Some(0.0)));
-        // None still excluded even by 0.0 threshold (None means
-        // "unpriceable", which can't clear a cost gate).
-        assert!(!zero.matches(0, None));
-    }
-
-    #[test]
-    fn filter_args_matches_both_is_logical_and() {
-        let f = FilterArgs {
-            min_tokens: Some(100),
-            min_cost: Some(0.10),
-        };
-        // Both clear → pass.
-        assert!(f.matches(100, Some(0.10)));
-        assert!(f.matches(500, Some(1.00)));
-        // Tokens fail, cost clears → fail.
-        assert!(!f.matches(50, Some(1.00)));
-        // Tokens clear, cost fails → fail.
-        assert!(!f.matches(500, Some(0.05)));
-        // Tokens clear, cost is None → fail.
-        assert!(!f.matches(500, None));
-        // Both fail → fail.
-        assert!(!f.matches(0, None));
-    }
 
     #[test]
     fn filter_args_describe_active_formats_each_combination() {
