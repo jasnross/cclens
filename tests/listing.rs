@@ -6,7 +6,12 @@
 
 mod common;
 
-use common::{cclens_command, pricing_fixture_url, projects_fixture_dir};
+use std::time::{Duration, SystemTime};
+
+use common::{
+    cclens_command, copy_fixture_to_tempdir_with_mtimes, dedup_projects_fixture_dir,
+    pricing_fixture_url, projects_fixture_dir,
+};
 
 fn isolated_cache() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
@@ -307,6 +312,148 @@ fn show_errors_on_unknown_session_id() {
     assert!(
         stderr.contains(unknown),
         "stderr should contain the unknown id; got:\n{stderr}",
+    );
+}
+
+#[test]
+fn list_dedups_resumed_session_assistant_turns() {
+    // Two .jsonl files in one project share an assistant turn:
+    //   dddd0001 (original, mtime older): msg_A (input 100), msg_B (input 200)
+    //   dddd0002 (resumed,  mtime newer): msg_A (replay), msg_C (input 400),
+    //                                     msg_D (sidechain, input 800)
+    //
+    // With dedup: original keeps msg_A + msg_B → tokens=300; resumed
+    // sees msg_A as already-seen and drops it, so it shows
+    // msg_C + msg_D → tokens=1200 (NOT 1300, which would be the
+    // un-deduped sum).
+    let cache = isolated_cache();
+    let original_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let resumed_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_500);
+    let project = copy_fixture_to_tempdir_with_mtimes(
+        &dedup_projects_fixture_dir(),
+        &[
+            ("dddd0001-0001-0001-0001-000000000001.jsonl", original_mtime),
+            ("dddd0002-0002-0002-0002-000000000002.jsonl", resumed_mtime),
+        ],
+    );
+
+    let stdout_bytes = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(project.path())
+        .arg("list")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).unwrap();
+
+    let original_uuid = "dddd0001-0001-0001-0001-000000000001";
+    let resumed_uuid = "dddd0002-0002-0002-0002-000000000002";
+
+    let original_row = stdout
+        .lines()
+        .find(|l| l.contains(original_uuid))
+        .unwrap_or_else(|| panic!("original row missing:\n{stdout}"));
+    let resumed_row = stdout
+        .lines()
+        .find(|l| l.contains(resumed_uuid))
+        .unwrap_or_else(|| panic!("resumed row missing:\n{stdout}"));
+
+    // Strip trailing UUID + cost cell to expose the tokens column
+    // at the line end.
+    let strip_uuid_and_cost = |l: &str, uuid: &str| -> String {
+        let after_uuid = l
+            .trim_end()
+            .strip_suffix(uuid)
+            .unwrap_or_else(|| panic!("row missing uuid {uuid}: {l}"))
+            .trim_end();
+        let dollar_idx = after_uuid
+            .rfind('$')
+            .unwrap_or_else(|| panic!("expected `$` cost cell:\n{l}"));
+        after_uuid[..dollar_idx].trim_end().to_string()
+    };
+    let original_pre_cost = strip_uuid_and_cost(original_row, original_uuid);
+    let resumed_pre_cost = strip_uuid_and_cost(resumed_row, resumed_uuid);
+    assert!(
+        original_pre_cost.ends_with(" 300"),
+        "original tokens should be 300; got: {original_pre_cost}",
+    );
+    assert!(
+        resumed_pre_cost.ends_with(" 1200"),
+        "resumed tokens should be 1200 (msg_A replayed turn deduped); \
+         got: {resumed_pre_cost}",
+    );
+    assert!(
+        !resumed_pre_cost.ends_with(" 1300"),
+        "resumed must NOT include msg_A — that is the dedup regression; \
+         got: {resumed_pre_cost}",
+    );
+}
+
+#[test]
+fn show_dedups_resumed_session() {
+    // `cclens show <resumed_uuid>` must reflect the same dedup as
+    // `list`: the rendered table for the resumed session shows only
+    // msg_C and the sidechain msg_D, not the replayed msg_A.
+    let cache = isolated_cache();
+    let original_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let resumed_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_500);
+    let project = copy_fixture_to_tempdir_with_mtimes(
+        &dedup_projects_fixture_dir(),
+        &[
+            ("dddd0001-0001-0001-0001-000000000001.jsonl", original_mtime),
+            ("dddd0002-0002-0002-0002-000000000002.jsonl", resumed_mtime),
+        ],
+    );
+
+    let stdout_bytes = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(project.path())
+        .arg("show")
+        .arg("dddd0002-0002-0002-0002-000000000002")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).unwrap();
+
+    // The replayed assistant text must NOT appear in the resumed
+    // session's rendered table — it was filtered out by dedup before
+    // the session was rendered.
+    assert!(
+        !stdout.contains("replayed reply A"),
+        "replayed turn should be filtered out by dedup; got:\n{stdout}",
+    );
+
+    // The first new turn's text drives the assistant-cluster preview
+    // (`assistant_cluster_preview` returns the cluster's first
+    // non-empty text block), so its content is visible.
+    assert!(
+        stdout.contains("reply C (new)"),
+        "new turn msg_C should be visible; got:\n{stdout}",
+    );
+
+    // The user-row tokens column sums (input + cache_creation) across
+    // the assistant cluster. With dedup: msg_C (input 400) + msg_D
+    // sidechain (input 800) = 1200. Without dedup, the replayed msg_A
+    // would inflate this to 1300 — so 1200 confirms the dedup, AND
+    // confirms the sidechain still contributes its tokens (the
+    // alternative — a regression that filtered sidechains by role
+    // flag — would yield 400, not 1200).
+    let user_row = stdout
+        .lines()
+        .find(|l| l.contains("resumed prompt"))
+        .unwrap_or_else(|| panic!("user row missing:\n{stdout}"));
+    assert!(
+        user_row.contains(" 1200 "),
+        "user row tokens should be 1200 (msg_C 400 + sidechain msg_D 800); \
+         got: {user_row}",
+    );
+    assert!(
+        !user_row.contains(" 1300 "),
+        "user row must NOT include msg_A replay tokens; got: {user_row}",
     );
 }
 

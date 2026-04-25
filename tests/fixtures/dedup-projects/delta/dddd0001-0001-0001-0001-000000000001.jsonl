@@ -1,0 +1,3 @@
+{"type":"user","timestamp":"2026-04-23T10:00:00Z","cwd":"/Users/test/delta","message":{"content":"original prompt"}}
+{"type":"assistant","timestamp":"2026-04-23T10:00:05Z","cwd":"/Users/test/delta","requestId":"req_A","message":{"id":"msg_A","model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"reply A"}]}}
+{"type":"assistant","timestamp":"2026-04-23T10:00:10Z","cwd":"/Users/test/delta","requestId":"req_B","message":{"id":"msg_B","model":"claude-opus-4-7","usage":{"input_tokens":200,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"reply B"}]}}
