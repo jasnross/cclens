@@ -368,13 +368,32 @@ enum Role {
 struct Usage {
     input: u64,
     output: u64,
-    cache_creation: u64,
+    cache_creation: CacheCreation,
     cache_read: u64,
 }
 
 impl Usage {
     fn billable(&self) -> u64 {
-        self.input + self.output + self.cache_creation
+        self.input + self.output + self.cache_creation.total()
+    }
+}
+
+/// Cache-creation token counts split by ephemeral lifetime. The 5m and
+/// 1h buckets are billed at distinct rates (the 1h rate is roughly
+/// 1.6× the 5m rate for opus-4-7), so cclens keeps them separate from
+/// `RawUsage` through to `pricing::cost_for_components`. Crate-root
+/// items are visible to descendant modules by default; `pricing.rs`
+/// names this type in its signature and reads its fields without any
+/// visibility modifier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct CacheCreation {
+    ephemeral_5m: u64,
+    ephemeral_1h: u64,
+}
+
+impl CacheCreation {
+    fn total(&self) -> u64 {
+        self.ephemeral_5m + self.ephemeral_1h
     }
 }
 
@@ -414,17 +433,58 @@ struct RawUsage {
     input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    /// Legacy flat scalar — older transcripts emit only this field;
+    /// modern transcripts emit the structured `cache_creation` object
+    /// instead. The adapter `into_usage` prefers the structured form
+    /// when either bucket is non-zero, falling back to the scalar
+    /// (treated as 5m).
     #[serde(default)]
     cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_creation: RawCacheCreation,
     #[serde(default)]
     cache_read_input_tokens: u64,
 }
 
+/// On-disk shape of the modern `cache_creation` object emitted by
+/// recent Claude Code builds:
+/// `{"ephemeral_5m_input_tokens": N, "ephemeral_1h_input_tokens": M}`.
+/// Older transcripts omit this and emit only the legacy flat scalar
+/// `cache_creation_input_tokens` on `RawUsage`; both fields are kept
+/// on `RawUsage` so cclens can read either shape.
+#[derive(Debug, Default, Deserialize)]
+struct RawCacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
+}
+
 fn into_usage(raw: &RawUsage) -> Usage {
+    // Prefer the modern bucketed object when present. Treat "either
+    // bucket non-zero" as the signal — an explicit
+    // `{ephemeral_5m: 0, ephemeral_1h: 0}` is observationally
+    // equivalent to falling through to the legacy scalar (also 0 if
+    // missing, or the only field set on older transcripts).
+    let cache_creation = if raw.cache_creation.ephemeral_5m_input_tokens > 0
+        || raw.cache_creation.ephemeral_1h_input_tokens > 0
+    {
+        CacheCreation {
+            ephemeral_5m: raw.cache_creation.ephemeral_5m_input_tokens,
+            ephemeral_1h: raw.cache_creation.ephemeral_1h_input_tokens,
+        }
+    } else {
+        // Legacy transcripts: the flat scalar is treated as 5m so it
+        // prices identically to today's behavior.
+        CacheCreation {
+            ephemeral_5m: raw.cache_creation_input_tokens,
+            ephemeral_1h: 0,
+        }
+    };
     Usage {
         input: raw.input_tokens,
         output: raw.output_tokens,
-        cache_creation: raw.cache_creation_input_tokens,
+        cache_creation,
         cache_read: raw.cache_read_input_tokens,
     }
 }
@@ -976,13 +1036,13 @@ fn assistant_cluster_preview(assistants: &[&Turn]) -> String {
 /// Sum costs across an assistant cluster with strict `None`
 /// propagation. The closure picks which token components count for
 /// this row (e.g. `(input, 0, cache_creation, cache_read)` for the
-/// user row, `(0, output, 0, 0)` for the assistant row). Any single
-/// turn the catalog can't price collapses the whole sum to `None`,
-/// matching the session-level rule.
+/// user row, `(0, output, CacheCreation::default(), 0)` for the
+/// assistant row). Any single turn the catalog can't price collapses
+/// the whole sum to `None`, matching the session-level rule.
 fn strict_fold_assistant_cost(
     assistants: &[&Turn],
     catalog: &pricing::PricingCatalog,
-    pick: impl Fn(&Usage) -> (u64, u64, u64, u64),
+    pick: impl Fn(&Usage) -> (u64, u64, CacheCreation, u64),
 ) -> Option<f64> {
     let mut sum = 0.0;
     for turn in assistants {
@@ -1071,7 +1131,7 @@ fn render_session(
                 .assistants
                 .iter()
                 .filter_map(|t| t.usage.as_ref())
-                .map(|u| u.input + u.cache_creation)
+                .map(|u| u.input + u.cache_creation.total())
                 .sum();
             Some(sum)
         };
@@ -1118,7 +1178,7 @@ fn render_session(
         if let Some(first_assistant) = exchange.assistants.first() {
             let assistant_cost =
                 strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
-                    (0, usage.output, 0, 0)
+                    (0, usage.output, CacheCreation::default(), 0)
                 });
             cumulative += output_tokens;
             cum_cost = fold_cum_cost(cum_cost, assistant_cost);
@@ -1198,6 +1258,8 @@ mod tests {
     }
 
     fn assistant_turn_with_usage(input: u64, output: u64, cache_creation: u64) -> Turn {
+        // Helper takes a flat u64 for backwards-compatible test
+        // ergonomics; treated as 5m, matching the legacy wire scalar.
         Turn {
             timestamp: Some("2026-04-01T10:00:00Z".parse().unwrap()),
             role: Role::Assistant,
@@ -1207,7 +1269,10 @@ mod tests {
             usage: Some(Usage {
                 input,
                 output,
-                cache_creation,
+                cache_creation: CacheCreation {
+                    ephemeral_5m: cache_creation,
+                    ephemeral_1h: 0,
+                },
                 cache_read: 0,
             }),
             content: None,
@@ -1252,7 +1317,10 @@ mod tests {
         let u = Usage {
             input: 6,
             output: 1186,
-            cache_creation: 18998,
+            cache_creation: CacheCreation {
+                ephemeral_5m: 18998,
+                ephemeral_1h: 0,
+            },
             cache_read: 17317,
         };
         assert_eq!(u.billable(), 20190);
@@ -1383,7 +1451,7 @@ mod tests {
                 usage: Some(Usage {
                     input: 0,
                     output: 0,
-                    cache_creation: 0,
+                    cache_creation: CacheCreation::default(),
                     // Non-zero cache_read makes cost_for_components
                     // bypass the all-zero short-circuit; with an empty
                     // catalog the lookup misses and total_cost is None.
@@ -1426,6 +1494,76 @@ mod tests {
 
         let turns = parse_jsonl(&path).unwrap();
         assert_eq!(turns.len(), 2);
+    }
+
+    #[test]
+    fn into_usage_prefers_bucketed_over_legacy_scalar() {
+        // Modern wire shape only — structured cache_creation present,
+        // legacy scalar absent.
+        let bucketed: RawUsage = serde_json::from_str(
+            r#"{"input_tokens":0,"output_tokens":0,
+                "cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":200},
+                "cache_read_input_tokens":0}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            into_usage(&bucketed).cache_creation,
+            CacheCreation {
+                ephemeral_5m: 100,
+                ephemeral_1h: 200,
+            },
+        );
+
+        // Legacy wire shape only — flat scalar treated as 5m.
+        let legacy: RawUsage = serde_json::from_str(
+            r#"{"input_tokens":0,"output_tokens":0,
+                "cache_creation_input_tokens":300,"cache_read_input_tokens":0}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            into_usage(&legacy).cache_creation,
+            CacheCreation {
+                ephemeral_5m: 300,
+                ephemeral_1h: 0,
+            },
+        );
+
+        // Both present — bucketed wins (structured is the modern,
+        // higher-fidelity shape).
+        let both: RawUsage = serde_json::from_str(
+            r#"{"input_tokens":0,"output_tokens":0,
+                "cache_creation_input_tokens":999,
+                "cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":200},
+                "cache_read_input_tokens":0}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            into_usage(&both).cache_creation,
+            CacheCreation {
+                ephemeral_5m: 100,
+                ephemeral_1h: 200,
+            },
+        );
+
+        // Edge: bucketed object explicitly present with both buckets
+        // zero AND the legacy scalar non-zero. The "either bucket
+        // non-zero" predicate routes this to the legacy branch — a
+        // future refactor that flipped to "object present at all"
+        // would silently lose the legacy 300 here.
+        let zeros_with_legacy: RawUsage = serde_json::from_str(
+            r#"{"input_tokens":0,"output_tokens":0,
+                "cache_creation_input_tokens":300,
+                "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},
+                "cache_read_input_tokens":0}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            into_usage(&zeros_with_legacy).cache_creation,
+            CacheCreation {
+                ephemeral_5m: 300,
+                ephemeral_1h: 0,
+            },
+        );
     }
 
     #[test]
@@ -1564,7 +1702,7 @@ mod tests {
             usage: Some(Usage {
                 input: 1,
                 output: 1,
-                cache_creation: 0,
+                cache_creation: CacheCreation::default(),
                 cache_read: 0,
             }),
             content: None,
@@ -1591,7 +1729,7 @@ mod tests {
             usage: Some(Usage {
                 input: 1,
                 output: 1,
-                cache_creation: 0,
+                cache_creation: CacheCreation::default(),
                 cache_read: 0,
             }),
             content: None,
@@ -1845,7 +1983,10 @@ mod tests {
             usage: Some(Usage {
                 input,
                 output,
-                cache_creation,
+                cache_creation: CacheCreation {
+                    ephemeral_5m: cache_creation,
+                    ephemeral_1h: 0,
+                },
                 cache_read: 0,
             }),
             content: Some(content),
@@ -2257,7 +2398,10 @@ mod tests {
             usage: Some(Usage {
                 input,
                 output,
-                cache_creation,
+                cache_creation: CacheCreation {
+                    ephemeral_5m: cache_creation,
+                    ephemeral_1h: 0,
+                },
                 cache_read: 0,
             }),
             content: Some(content),
@@ -2672,7 +2816,7 @@ mod tests {
             usage: Some(Usage {
                 input: 5,
                 output: 15,
-                cache_creation: 0,
+                cache_creation: CacheCreation::default(),
                 cache_read: 0,
             }),
             content: Some(serde_json::json!([{ "type": "text", "text": "?" }])),

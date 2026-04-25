@@ -168,6 +168,42 @@ fn show_zero_usage_turn_renders_zero_cost() {
 }
 
 #[test]
+fn list_prices_1h_cache_creation_at_1h_rate() {
+    // The eeee9999 fixture has one assistant turn with
+    // ephemeral_1h_input_tokens: 130_259 (and zero tokens elsewhere).
+    // Against the test fixture's rates (1h: 1e-5, 5m: 1.875e-5):
+    //   - 1h rate applied (correct):   130_259 * 1e-5    = $1.3026
+    //   - 5m rate applied (regression): 130_259 * 1.875e-5 = $2.4424
+    let cache = isolated_cache();
+    let stdout = cclens_command(cache.path(), &pricing_fixture_url(COST_FIXTURE_URL_NAME))
+        .args(["--projects-dir"])
+        .arg(cost_projects_fixture_dir())
+        .arg("list")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(stdout).unwrap();
+    let session_uuid = "eeee9999-9999-9999-9999-999999999999";
+    let row = out
+        .lines()
+        .find(|l| l.contains(session_uuid))
+        .unwrap_or_else(|| panic!("1h cache-creation row missing:\n{out}"));
+
+    assert!(
+        row.contains("$1.3026"),
+        "1h cache_creation tokens must be priced at the 1h rate \
+         ($1.3026); got: {row}",
+    );
+    assert!(
+        !row.contains("$2.4424"),
+        "1h tokens were priced at the 5m rate — rate-split regression. \
+         got: {row}",
+    );
+}
+
+#[test]
 fn list_degrades_gracefully_on_fetch_failure() {
     // Pointing CCLENS_PRICING_URL at a nonexistent file simulates a
     // first-run fetch failure. Behavior contract:

@@ -24,7 +24,7 @@ use std::time::SystemTime;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Usage;
+use crate::{CacheCreation, Usage};
 
 // ---- raw schema ----
 
@@ -44,6 +44,23 @@ struct RawPricingEntry {
     output_cost_per_token: Option<f64>,
     #[serde(default)]
     cache_creation_input_token_cost: Option<f64>,
+    /// 1-hour ephemeral cache creation rate. Anthropic charges roughly
+    /// 1.6× the 5m rate for the 1h bucket; cclens applies it to the
+    /// `ephemeral_1h_input_tokens` slice on modern transcripts. Older
+    /// catalog snapshots that don't carry this field fall back to the
+    /// 5m base rate in `normalize`, preserving today's behavior.
+    #[serde(default)]
+    cache_creation_input_token_cost_above_1hr: Option<f64>,
+    /// 1-hour ephemeral cache creation rate for tokens above the 200k
+    /// threshold. Upstream `LiteLLM` publishes this field today only
+    /// for two Bedrock-routed Sonnet 3.5 entries
+    /// (`anthropic.claude-3-5-sonnet-2024{0620,1022}-v1/v2:0`); for
+    /// the Claude 4 family the field is currently absent and the
+    /// `tier_from_raw` fallback inherits the 1h base rate. Including
+    /// the field now keeps cclens correct if any Bedrock-routed
+    /// Sonnet 3.5 transcript flows through the lookup chain.
+    #[serde(default)]
+    cache_creation_input_token_cost_above_1hr_above_200k_tokens: Option<f64>,
     #[serde(default)]
     cache_read_input_token_cost: Option<f64>,
     #[serde(default)]
@@ -76,11 +93,20 @@ pub(crate) struct TieredRate {
 }
 
 /// Normalized pricing for a single Claude model.
+///
+/// Cache creation is split into two tier-aware rates: 5m (the default
+/// ephemeral lifetime) and 1h (the longer ephemeral lifetime, billed
+/// at roughly 1.6× the 5m rate for opus-4-7). Both legs go through
+/// `tiered_cost` with the same 200k-token threshold, so the structural
+/// shape stays symmetric. The 1h-above-200k field is published by
+/// `LiteLLM` today only for two Bedrock-routed Sonnet 3.5 entries; for
+/// other models the `tier_from_raw` fallback inherits the 1h base rate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ClaudePricing {
     pub(crate) input: TieredRate,
     pub(crate) output: TieredRate,
-    pub(crate) cache_creation: TieredRate,
+    pub(crate) cache_creation_5m: TieredRate,
+    pub(crate) cache_creation_1h: TieredRate,
     pub(crate) cache_read: TieredRate,
 }
 
@@ -221,7 +247,29 @@ fn is_claude_entry(key_lower: &str) -> bool {
         || key_lower.contains("claude-")
 }
 
+// `cache_creation_5m` and `cache_creation_1h` differ by one character
+// only — the entire point of these names is the parallel structure
+// (each binding maps to its own catalog field and pricing leg).
+#[allow(clippy::similar_names)]
 fn normalize(raw: &RawPricingEntry) -> ClaudePricing {
+    let cache_creation_5m = tier_from_raw(
+        raw.cache_creation_input_token_cost,
+        raw.cache_creation_input_token_cost_above_200k_tokens,
+    );
+    // Two-level fallback for the 1h rate:
+    //   1. Above-200k missing → inherit from 1h base (handled inside
+    //      `tier_from_raw`).
+    //   2. 1h base missing → fall back to the 5m base rate; this
+    //      preserves today's behavior on older catalog snapshots that
+    //      predate the 1h rate. Modern catalogs (post-2026 Anthropic
+    //      pricing change) carry the 1h fields and they win.
+    let cache_creation_1h = tier_from_raw(
+        Some(
+            raw.cache_creation_input_token_cost_above_1hr
+                .unwrap_or(cache_creation_5m.first_200k_rate),
+        ),
+        raw.cache_creation_input_token_cost_above_1hr_above_200k_tokens,
+    );
     ClaudePricing {
         input: tier_from_raw(
             raw.input_cost_per_token,
@@ -231,10 +279,8 @@ fn normalize(raw: &RawPricingEntry) -> ClaudePricing {
             raw.output_cost_per_token,
             raw.output_cost_per_token_above_200k_tokens,
         ),
-        cache_creation: tier_from_raw(
-            raw.cache_creation_input_token_cost,
-            raw.cache_creation_input_token_cost_above_200k_tokens,
-        ),
+        cache_creation_5m,
+        cache_creation_1h,
         cache_read: tier_from_raw(
             raw.cache_read_input_token_cost,
             raw.cache_read_input_token_cost_above_200k_tokens,
@@ -291,11 +337,11 @@ impl PricingCatalog {
         &self,
         input: u64,
         output: u64,
-        cache_creation: u64,
+        cache_creation: CacheCreation,
         cache_read: u64,
         model: Option<&str>,
     ) -> Option<f64> {
-        if input == 0 && output == 0 && cache_creation == 0 && cache_read == 0 {
+        if input == 0 && output == 0 && cache_creation.total() == 0 && cache_read == 0 {
             return Some(0.0);
         }
         let model = model?;
@@ -303,7 +349,8 @@ impl PricingCatalog {
         Some(
             tiered_cost(input, &pricing.input)
                 + tiered_cost(output, &pricing.output)
-                + tiered_cost(cache_creation, &pricing.cache_creation)
+                + tiered_cost(cache_creation.ephemeral_5m, &pricing.cache_creation_5m)
+                + tiered_cost(cache_creation.ephemeral_1h, &pricing.cache_creation_1h)
                 + tiered_cost(cache_read, &pricing.cache_read),
         )
     }
@@ -600,7 +647,11 @@ mod tests {
         ClaudePricing {
             input: sample_tier(3e-6, 6e-6),
             output: sample_tier(15e-6, 22.5e-6),
-            cache_creation: sample_tier(3.75e-6, 7.5e-6),
+            cache_creation_5m: sample_tier(3.75e-6, 7.5e-6),
+            // Distinct rates so tests that exercise the 1h leg can
+            // tell which side priced their tokens; 1h base differs
+            // from 5m base, and 1h above-200k differs from both.
+            cache_creation_1h: sample_tier(6e-6, 12e-6),
             cache_read: sample_tier(0.3e-6, 0.6e-6),
         }
     }
@@ -617,17 +668,26 @@ mod tests {
     fn zero_usage_short_circuits_without_model_lookup() {
         let empty = PricingCatalog::empty();
         assert_eq!(
-            empty.cost_for_components(0, 0, 0, 0, Some("any")),
+            empty.cost_for_components(0, 0, CacheCreation::default(), 0, Some("any")),
             Some(0.0),
         );
-        assert_eq!(empty.cost_for_components(0, 0, 0, 0, None), Some(0.0));
+        assert_eq!(
+            empty.cost_for_components(0, 0, CacheCreation::default(), 0, None),
+            Some(0.0),
+        );
     }
 
     #[test]
     fn unknown_model_with_nonzero_usage_returns_none() {
         let empty = PricingCatalog::empty();
-        assert_eq!(empty.cost_for_components(1, 0, 0, 0, Some("any")), None);
-        assert_eq!(empty.cost_for_components(1, 0, 0, 0, None), None);
+        assert_eq!(
+            empty.cost_for_components(1, 0, CacheCreation::default(), 0, Some("any")),
+            None,
+        );
+        assert_eq!(
+            empty.cost_for_components(1, 0, CacheCreation::default(), 0, None),
+            None,
+        );
     }
 
     #[test]
@@ -653,19 +713,22 @@ mod tests {
         let short = ClaudePricing {
             input: sample_tier(1.0, 1.0),
             output: sample_tier(1.0, 1.0),
-            cache_creation: sample_tier(1.0, 1.0),
+            cache_creation_5m: sample_tier(1.0, 1.0),
+            cache_creation_1h: sample_tier(1.0, 1.0),
             cache_read: sample_tier(1.0, 1.0),
         };
         let mid = ClaudePricing {
             input: sample_tier(2.0, 2.0),
             output: sample_tier(2.0, 2.0),
-            cache_creation: sample_tier(2.0, 2.0),
+            cache_creation_5m: sample_tier(2.0, 2.0),
+            cache_creation_1h: sample_tier(2.0, 2.0),
             cache_read: sample_tier(2.0, 2.0),
         };
         let long = ClaudePricing {
             input: sample_tier(3.0, 3.0),
             output: sample_tier(3.0, 3.0),
-            cache_creation: sample_tier(3.0, 3.0),
+            cache_creation_5m: sample_tier(3.0, 3.0),
+            cache_creation_1h: sample_tier(3.0, 3.0),
             cache_read: sample_tier(3.0, 3.0),
         };
         let c = catalog_with(&[
@@ -713,15 +776,18 @@ mod tests {
         let usage = Usage {
             input: 1000,
             output: 100,
-            cache_creation: 500,
+            cache_creation: CacheCreation {
+                ephemeral_5m: 500,
+                ephemeral_1h: 0,
+            },
             cache_read: 10_000,
         };
         // Using sample_pricing first-tier rates:
-        // input:          1000 * 3e-6    = 0.003
-        // output:          100 * 15e-6   = 0.0015
-        // cache_creation:  500 * 3.75e-6 = 0.001875
-        // cache_read:    10000 * 0.3e-6  = 0.003
-        // total                          = 0.009375
+        // input:             1000 * 3e-6    = 0.003
+        // output:             100 * 15e-6   = 0.0015
+        // cache_creation_5m:  500 * 3.75e-6 = 0.001875
+        // cache_read:       10000 * 0.3e-6  = 0.003
+        // total                             = 0.009375
         let cost = c
             .cost_for_turn(&usage, Some("claude-opus-4-7"))
             .expect("pricing present");
@@ -734,10 +800,68 @@ mod tests {
         // only cache reads must not appear free.
         let c = catalog_with(&[("claude-opus-4-7", sample_pricing())]);
         let cost = c
-            .cost_for_components(0, 0, 0, 1000, Some("claude-opus-4-7"))
+            .cost_for_components(
+                0,
+                0,
+                CacheCreation::default(),
+                1000,
+                Some("claude-opus-4-7"),
+            )
             .expect("pricing present");
         // 1000 * 0.3e-6 = 0.0003
         assert!((cost - 0.0003).abs() < 1e-12);
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn cost_for_components_splits_5m_and_1h() {
+        // Pricing with distinct 5m and 1h rates:
+        // 5m base: 3.75e-6, 1h: 6e-6 (from sample_pricing).
+        let c = catalog_with(&[("claude-opus-4-7", sample_pricing())]);
+        let only_5m = c
+            .cost_for_components(
+                0,
+                0,
+                CacheCreation {
+                    ephemeral_5m: 1000,
+                    ephemeral_1h: 0,
+                },
+                0,
+                Some("claude-opus-4-7"),
+            )
+            .expect("pricing present");
+        // 1000 * 3.75e-6 = 0.00375
+        assert!((only_5m - 0.003_75).abs() < 1e-12, "got {only_5m}");
+
+        let only_1h = c
+            .cost_for_components(
+                0,
+                0,
+                CacheCreation {
+                    ephemeral_5m: 0,
+                    ephemeral_1h: 1000,
+                },
+                0,
+                Some("claude-opus-4-7"),
+            )
+            .expect("pricing present");
+        // 1000 * 6e-6 = 0.006
+        assert!((only_1h - 0.006).abs() < 1e-12, "got {only_1h}");
+
+        let both = c
+            .cost_for_components(
+                0,
+                0,
+                CacheCreation {
+                    ephemeral_5m: 500,
+                    ephemeral_1h: 500,
+                },
+                0,
+                Some("claude-opus-4-7"),
+            )
+            .expect("pricing present");
+        // 500 * 3.75e-6 + 500 * 6e-6 = 0.001875 + 0.003 = 0.004875
+        assert!((both - 0.004_875).abs() < 1e-12, "got {both}");
     }
 
     #[test]
@@ -746,6 +870,8 @@ mod tests {
             input_cost_per_token: Some(5.0),
             output_cost_per_token: None,
             cache_creation_input_token_cost: None,
+            cache_creation_input_token_cost_above_1hr: None,
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens: None,
             cache_read_input_token_cost: None,
             input_cost_per_token_above_200k_tokens: None,
             output_cost_per_token_above_200k_tokens: None,
@@ -760,11 +886,81 @@ mod tests {
     }
 
     #[test]
+    fn normalize_falls_back_to_5m_for_missing_1h() {
+        // Catalog snapshots predating the 1h pricing rollout omit
+        // cache_creation_input_token_cost_above_1hr; the 1h leg must
+        // fall back to the 5m base rate so older snapshots price
+        // identically to today (both first_200k and above_200k inherit
+        // the 5m base via the two-level fallback).
+        let raw = RawPricingEntry {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(2e-6),
+            cache_creation_input_token_cost: Some(7e-6),
+            cache_creation_input_token_cost_above_1hr: None,
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens: None,
+            cache_read_input_token_cost: Some(0.5e-6),
+            input_cost_per_token_above_200k_tokens: None,
+            output_cost_per_token_above_200k_tokens: None,
+            cache_creation_input_token_cost_above_200k_tokens: None,
+            cache_read_input_token_cost_above_200k_tokens: None,
+        };
+        let pricing = normalize(&raw);
+        assert!((pricing.cache_creation_1h.first_200k_rate - 7e-6).abs() < 1e-15);
+        assert!((pricing.cache_creation_1h.above_200k_rate - 7e-6).abs() < 1e-15);
+    }
+
+    #[test]
+    fn normalize_uses_explicit_1h_rate_when_present() {
+        // Modern catalog: 1h base present, 1h above-200k absent →
+        // above-200k inherits the 1h base.
+        let raw = RawPricingEntry {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(2e-6),
+            cache_creation_input_token_cost: Some(7e-6),
+            cache_creation_input_token_cost_above_1hr: Some(11e-6),
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens: None,
+            cache_read_input_token_cost: Some(0.5e-6),
+            input_cost_per_token_above_200k_tokens: None,
+            output_cost_per_token_above_200k_tokens: None,
+            cache_creation_input_token_cost_above_200k_tokens: None,
+            cache_read_input_token_cost_above_200k_tokens: None,
+        };
+        let pricing = normalize(&raw);
+        assert!((pricing.cache_creation_1h.first_200k_rate - 11e-6).abs() < 1e-15);
+        assert!((pricing.cache_creation_1h.above_200k_rate - 11e-6).abs() < 1e-15);
+    }
+
+    #[test]
+    fn normalize_picks_up_1h_above_200k_when_present() {
+        // Bedrock-routed Sonnet 3.5 entries publish the
+        // cache_creation_input_token_cost_above_1hr_above_200k_tokens
+        // field; cclens must apply it to 1h tokens above the 200k
+        // threshold rather than reusing the 1h base rate.
+        let raw = RawPricingEntry {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(2e-6),
+            cache_creation_input_token_cost: Some(7e-6),
+            cache_creation_input_token_cost_above_1hr: Some(11e-6),
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens: Some(13e-6),
+            cache_read_input_token_cost: Some(0.5e-6),
+            input_cost_per_token_above_200k_tokens: None,
+            output_cost_per_token_above_200k_tokens: None,
+            cache_creation_input_token_cost_above_200k_tokens: None,
+            cache_read_input_token_cost_above_200k_tokens: None,
+        };
+        let pricing = normalize(&raw);
+        assert!((pricing.cache_creation_1h.first_200k_rate - 11e-6).abs() < 1e-15);
+        assert!((pricing.cache_creation_1h.above_200k_rate - 13e-6).abs() < 1e-15);
+    }
+
+    #[test]
     fn missing_base_rate_is_zero() {
         let raw = RawPricingEntry {
             input_cost_per_token: None,
             output_cost_per_token: None,
             cache_creation_input_token_cost: None,
+            cache_creation_input_token_cost_above_1hr: None,
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens: None,
             cache_read_input_token_cost: None,
             input_cost_per_token_above_200k_tokens: None,
             output_cost_per_token_above_200k_tokens: None,

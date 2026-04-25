@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-04-24T08:00:00Z","cwd":"/Users/test/cost-fixture","message":{"content":"prompt with 1h cache write"}}
+{"type":"assistant","timestamp":"2026-04-24T08:00:05Z","cwd":"/Users/test/cost-fixture","message":{"model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":130259},"cache_read_input_tokens":0},"content":[{"type":"text","text":"reply with 1h cache write"}]}}
