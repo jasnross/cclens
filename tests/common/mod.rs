@@ -41,14 +41,14 @@ pub fn pricing_fixture_url(name: &str) -> String {
     format!("file://{}", pricing_fixture(name).display())
 }
 
-pub fn snapshot_fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/snapshot-projects")
-        .join(name)
+pub fn snapshot_projects_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/snapshot-projects")
 }
 
-pub fn snapshot_fixture_url(name: &str) -> String {
-    format!("file://{}", snapshot_fixture(name).display())
+pub fn snapshot_pricing_url() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/snapshot-pricing/pricing-catalog.json");
+    format!("file://{}", path.display())
 }
 
 /// Build a `cclens` command with hermetic env vars: pricing URL points

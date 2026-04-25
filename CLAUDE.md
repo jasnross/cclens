@@ -135,7 +135,7 @@ Binary CLI submodule (`src/cli.rs`):
 - `Cli` / `Command` / `PricingAction` clap parser types.
 - `FilterArgs` — flattened `--min-tokens` / `--min-cost` flags with a
   `.thresholds()` constructor that produces a library `Thresholds`.
-- `default_projects_dir`, `emit_empty_result_hint`.
+- `emit_empty_result_hint`.
 
 Each library module file opens with a `//!` doc comment listing its
 public API surface. The gityard repo is the reference for the

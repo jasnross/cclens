@@ -8,7 +8,6 @@
 //! - `Cli` / `Command` / `PricingAction` — clap parser types.
 //! - `FilterArgs` — flattened threshold flags; `.thresholds()` produces
 //!   a library `Thresholds`.
-//! - `default_projects_dir() -> PathBuf`.
 //! - `emit_empty_result_hint(&FilterArgs)` — stderr hint used by
 //!   `run_list` and `run_show` when a filter dropped every row.
 

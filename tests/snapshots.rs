@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{cclens_command, snapshot_fixture, snapshot_fixture_url};
+use common::{cclens_command, snapshot_pricing_url, snapshot_projects_dir};
 use insta::assert_snapshot;
 
 fn isolated_cache() -> tempfile::TempDir {
@@ -21,10 +21,10 @@ fn isolated_cache() -> tempfile::TempDir {
 #[test]
 fn list_snapshot() {
     let cache = isolated_cache();
-    let stdout_bytes = cclens_command(cache.path(), &snapshot_fixture_url("pricing-catalog.json"))
+    let stdout_bytes = cclens_command(cache.path(), &snapshot_pricing_url())
         .env("TZ", "UTC")
         .args(["--projects-dir"])
-        .arg(snapshot_fixture(""))
+        .arg(snapshot_projects_dir())
         .arg("list")
         .assert()
         .success()
@@ -40,10 +40,10 @@ fn show_snapshot() {
     // Session A — the short slash-command session — exercises a normal
     // user→assistant exchange rendering.
     let cache = isolated_cache();
-    let stdout_bytes = cclens_command(cache.path(), &snapshot_fixture_url("pricing-catalog.json"))
+    let stdout_bytes = cclens_command(cache.path(), &snapshot_pricing_url())
         .env("TZ", "UTC")
         .args(["--projects-dir"])
-        .arg(snapshot_fixture(""))
+        .arg(snapshot_projects_dir())
         .arg("show")
         .arg("aaaa0001-0001-0001-0001-000000000001")
         .assert()

@@ -8,7 +8,10 @@
 //! - `Exchange<'a>` — a substantive user turn plus its assistant
 //!   cluster.
 //! - `group_into_exchanges(&[Turn]) -> Vec<Exchange<'_>>`.
-//! - `exchange_filter_totals(&Exchange<'_>, &PricingCatalog) -> (u64, Option<f64>)`.
+//!
+//! Crate-internal (visible to other library modules):
+//! - `exchange_filter_totals(&Exchange<'_>, &PricingCatalog) -> (u64, Option<f64>)`
+//!   — used by `rendering` to apply per-exchange filter totals.
 //! - `user_display_string(&Value) -> Option<String>` — the canonical
 //!   "what the user said" extractor; called by `extract_title` here and
 //!   by `rendering::user_content_preview`.
