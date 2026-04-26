@@ -8,6 +8,11 @@
 //!   `cclens pricing refresh` can exit nonzero on failure.
 //! - `cache_info()` — infallible stat-like report for
 //!   `cclens pricing info`.
+//! - `PricingCatalog::cost_for_components` /
+//!   `PricingCatalog::cost_for_turn` — generic cost folds.
+//! - `PricingCatalog::cost_for_cache_creation_1h` /
+//!   `PricingCatalog::cost_for_cache_creation_5m` — per-tier
+//!   cache-creation cost helpers used by the `inputs` subcommand.
 //!
 //! The catalog comes from `LiteLLM`'s
 //! `model_prices_and_context_window.json`. Pricing is computed with
@@ -370,6 +375,42 @@ impl PricingCatalog {
             usage.output,
             usage.cache_creation,
             usage.cache_read,
+            model,
+        )
+    }
+
+    /// Cost of `tokens` priced at the 1-hour cache-creation tier for `model`.
+    /// Returns `Some(0.0)` when `tokens == 0`; `None` when `model` is
+    /// `Some(unknown)` and `tokens > 0`. Used by the `inputs` subcommand
+    /// to attribute system-prompt-region content (`CLAUDE.md`, rules, agents).
+    #[must_use]
+    pub fn cost_for_cache_creation_1h(&self, tokens: u64, model: Option<&str>) -> Option<f64> {
+        self.cost_for_components(
+            0,
+            0,
+            CacheCreation {
+                ephemeral_1h: tokens,
+                ephemeral_5m: 0,
+            },
+            0,
+            model,
+        )
+    }
+
+    /// Cost of `tokens` priced at the 5-minute cache-creation tier for
+    /// `model`. Same null/zero contracts as the 1h variant. Used by the
+    /// `inputs` subcommand to attribute on-demand content (skills,
+    /// commands).
+    #[must_use]
+    pub fn cost_for_cache_creation_5m(&self, tokens: u64, model: Option<&str>) -> Option<f64> {
+        self.cost_for_components(
+            0,
+            0,
+            CacheCreation {
+                ephemeral_5m: tokens,
+                ephemeral_1h: 0,
+            },
+            0,
             model,
         )
     }
@@ -876,6 +917,60 @@ mod tests {
             .expect("pricing present");
         // 500 * 3.75e-6 + 500 * 6e-6 = 0.001875 + 0.003 = 0.004875
         assert!((both - 0.004_875).abs() < 1e-12, "got {both}");
+    }
+
+    #[test]
+    fn cost_for_cache_creation_1h_zero_short_circuits_unknown_model() {
+        let empty = PricingCatalog::empty();
+        assert_eq!(empty.cost_for_cache_creation_1h(0, Some("any")), Some(0.0));
+        assert_eq!(empty.cost_for_cache_creation_1h(0, None), Some(0.0));
+    }
+
+    #[test]
+    fn cost_for_cache_creation_5m_zero_short_circuits_unknown_model() {
+        let empty = PricingCatalog::empty();
+        assert_eq!(empty.cost_for_cache_creation_5m(0, Some("any")), Some(0.0));
+        assert_eq!(empty.cost_for_cache_creation_5m(0, None), Some(0.0));
+    }
+
+    #[test]
+    fn cost_for_cache_creation_1h_unknown_model_returns_none() {
+        let empty = PricingCatalog::empty();
+        assert_eq!(empty.cost_for_cache_creation_1h(1, Some("any")), None);
+        assert_eq!(empty.cost_for_cache_creation_1h(1, None), None);
+    }
+
+    #[test]
+    fn cost_for_cache_creation_5m_unknown_model_returns_none() {
+        let empty = PricingCatalog::empty();
+        assert_eq!(empty.cost_for_cache_creation_5m(1, Some("any")), None);
+        assert_eq!(empty.cost_for_cache_creation_5m(1, None), None);
+    }
+
+    #[test]
+    fn cost_for_cache_creation_1h_uses_1h_rate_not_5m() {
+        // Regression guard against an ephemeral_1h / ephemeral_5m field
+        // swap inside the helper. sample_pricing() sets distinct rates
+        // (1h base 6e-6, 5m base 3.75e-6); the 1h helper must price at
+        // the 1h rate.
+        let c = catalog_with(&[("claude-opus-4-7", sample_pricing())]);
+        let cost = c
+            .cost_for_cache_creation_1h(1000, Some("claude-opus-4-7"))
+            .expect("pricing present");
+        // 1000 * 6e-6 = 0.006 (1h rate), not 1000 * 3.75e-6 = 0.00375 (5m rate).
+        assert!((cost - 0.006).abs() < 1e-12, "got {cost}");
+    }
+
+    #[test]
+    fn cost_for_cache_creation_5m_uses_5m_rate_not_1h() {
+        // Symmetric regression guard: the 5m helper must price at the
+        // 5m rate, not the 1h rate.
+        let c = catalog_with(&[("claude-opus-4-7", sample_pricing())]);
+        let cost = c
+            .cost_for_cache_creation_5m(1000, Some("claude-opus-4-7"))
+            .expect("pricing present");
+        // 1000 * 3.75e-6 = 0.00375 (5m rate), not 1000 * 6e-6 = 0.006 (1h rate).
+        assert!((cost - 0.003_75).abs() < 1e-12, "got {cost}");
     }
 
     #[test]

@@ -5,6 +5,10 @@
 //!   — turn list → session, with title extraction, project-short-name
 //!   derivation, billable summation, strict cost folding, and the
 //!   zero-billable + zero-cost filter.
+//! - `dedup_assistant_turns(Vec<Turn>, &mut HashSet<(String, String), S>) -> Vec<Turn>`
+//!   — drop assistant turns whose `(message_id, request_id)` pair has
+//!   already been seen earlier in the project's file walk. Generic over
+//!   the `HashSet` hasher so callers retain control of the hash strategy.
 //! - `Exchange<'a>` — a substantive user turn plus its assistant
 //!   cluster.
 //! - `group_into_exchanges(&[Turn]) -> Vec<Exchange<'_>>`.
@@ -16,6 +20,8 @@
 //!   "what the user said" extractor; called by `extract_title` here and
 //!   by `rendering::user_content_preview`.
 
+use std::collections::HashSet;
+use std::hash::BuildHasher;
 use std::path::Path;
 
 use serde_json::Value;
@@ -104,6 +110,38 @@ fn derive_project_short_name(project_dir: &Path, turns: &[Turn]) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+// ---- cross-file dedup ----
+
+/// Drop assistant turns whose `(message_id, request_id)` pair has
+/// already been seen earlier in this project's file walk.
+///
+/// Mirrors ccusage's `createUniqueHash`: a turn missing either part of
+/// the pair passes through (matches their `null`-on-partial-key rule).
+/// Non-assistant turns (user, attachment, system, other) are unaffected
+/// — they don't carry billable usage and are required for title
+/// extraction and exchange grouping. Sidechain markers (`isSidechain`)
+/// aren't visible at this layer (the parser doesn't surface the flag),
+/// so every assistant turn is keyed on `(message_id, request_id)`
+/// regardless of sidechain status.
+pub fn dedup_assistant_turns<S: BuildHasher>(
+    turns: Vec<Turn>,
+    seen: &mut HashSet<(String, String), S>,
+) -> Vec<Turn> {
+    turns
+        .into_iter()
+        .filter(|turn| match &turn.role {
+            Role::Assistant => match (turn.message_id.as_ref(), turn.request_id.as_ref()) {
+                (Some(mid), Some(rid)) => seen.insert((mid.clone(), rid.clone())),
+                // Missing key — pass through unchanged (matches
+                // ccusage's createUniqueHash returning null on
+                // partial keys).
+                _ => true,
+            },
+            Role::User | Role::Attachment | Role::System | Role::Other(_) => true,
+        })
+        .collect()
 }
 
 // ---- title extraction ----
@@ -343,6 +381,7 @@ pub(crate) fn exchange_filter_totals(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     use super::*;
@@ -1051,5 +1090,75 @@ mod tests {
         // both clusters have zero cache_creation here.
         assert_eq!(tokens, (10 + 20) + (5 + 15));
         assert_eq!(cost, None);
+    }
+
+    // --- dedup ---
+
+    #[test]
+    fn dedup_drops_duplicate_assistant_turn_within_run() {
+        // Build two assistants with the same (mid, rid); a third with
+        // a different pair; a fourth with a missing key (must pass);
+        // a user turn (must pass regardless).
+        let mut first_dup = assistant_turn_with_usage(1, 1, 0);
+        first_dup.message_id = Some("m1".into());
+        first_dup.request_id = Some("r1".into());
+        let mut second_dup = assistant_turn_with_usage(2, 2, 0);
+        second_dup.message_id = Some("m1".into());
+        second_dup.request_id = Some("r1".into());
+        let mut other = assistant_turn_with_usage(3, 3, 0);
+        other.message_id = Some("m2".into());
+        other.request_id = Some("r2".into());
+        let mut partial = assistant_turn_with_usage(4, 4, 0);
+        // Partial key — must pass through.
+        partial.message_id = Some("m3".into());
+        partial.request_id = None;
+        let user = user_string_turn("hi");
+
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let kept =
+            dedup_assistant_turns(vec![first_dup, second_dup, other, partial, user], &mut seen);
+
+        // first_dup (kept), second_dup (dropped), other (kept),
+        // partial (kept, missing key), user (kept)
+        assert_eq!(kept.len(), 4);
+        // Verify the key cache observed the two complete pairs.
+        assert!(seen.contains(&("m1".to_string(), "r1".to_string())));
+        assert!(seen.contains(&("m2".to_string(), "r2".to_string())));
+        // Surviving assistant turns retain their hash keys.
+        assert_eq!(kept[0].message_id.as_deref(), Some("m1"));
+        assert_eq!(kept[0].request_id.as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn dedup_drops_duplicate_assistant_across_separate_calls() {
+        // The orchestration layer reuses one HashSet across multiple
+        // parse_jsonl results — confirm the second call picks up the
+        // first call's state.
+        let mut first_call_turn = assistant_turn_with_usage(1, 1, 0);
+        first_call_turn.message_id = Some("m1".into());
+        first_call_turn.request_id = Some("r1".into());
+        let mut second_call_turn = assistant_turn_with_usage(2, 2, 0);
+        second_call_turn.message_id = Some("m1".into());
+        second_call_turn.request_id = Some("r1".into());
+
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let first = dedup_assistant_turns(vec![first_call_turn], &mut seen);
+        let second = dedup_assistant_turns(vec![second_call_turn], &mut seen);
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty(), "duplicate from second call must drop");
+    }
+
+    #[test]
+    fn dedup_passes_through_sidechain_assistant_with_unique_key() {
+        // Sidechain turns aren't special-cased — they're deduped on
+        // their own keys like any other assistant turn. This guards
+        // against a regression that filtered them by role flag.
+        let mut sidechain = assistant_turn_with_usage(50, 0, 0);
+        sidechain.message_id = Some("msc".into());
+        sidechain.request_id = Some("rsc".into());
+
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let kept = dedup_assistant_turns(vec![sidechain], &mut seen);
+        assert_eq!(kept.len(), 1);
     }
 }
