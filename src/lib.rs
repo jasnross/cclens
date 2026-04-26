@@ -4,6 +4,7 @@
 //! `//!` doc comment; this file only declares the modules.
 
 pub mod aggregation;
+pub mod attribution;
 pub mod discovery;
 pub mod domain;
 pub mod filter;

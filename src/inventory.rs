@@ -34,6 +34,13 @@ use serde::Deserialize;
 /// `<plugin>@<marketplace>` parts parsed out of the
 /// `installed_plugins.json` key so the renderer can show the plugin
 /// each file came from.
+///
+/// `Clone` is `cfg(test)`-only on purpose: production code never needs
+/// to clone these — the walker emits each `ContextFile` once and
+/// `attribution::compute_rows` consumes them by value. Tests that
+/// need to re-run a fixture loop get `.clone()` for free without
+/// production sites silently allocating.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Debug)]
 pub enum ContextFileKind {
     GlobalClaudeMd,
@@ -110,6 +117,12 @@ impl ContextFileKind {
 /// In-scope predicate for a `ContextFile`. The walker produces this
 /// alongside each file; `attribution` uses it to filter the inventory
 /// per session.
+///
+/// `Clone` is `cfg(test)`-only — see `ContextFileKind` for the
+/// production-allocation-visibility rationale. Walkers inside this
+/// module use the local `clone_scope` helper to make per-row
+/// duplications visible.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Debug)]
 pub enum Scope {
     /// In scope for every session.
@@ -135,6 +148,10 @@ impl Scope {
 /// `tier` is intentionally not a field — derive it from
 /// `kind.tier()` at the use site so it can't drift out of sync with
 /// the kind.
+///
+/// `Clone` is `cfg(test)`-only — production code consumes
+/// `ContextFile` exactly once via `compute_rows`.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Debug)]
 pub struct ContextFile {
     pub path: PathBuf,
