@@ -29,6 +29,7 @@ use clap::{Args, Parser, Subcommand};
     name = "cclens",
     about = "Browse Claude Code conversations (tokens + cost)"
 )]
+#[command(version)]
 pub(super) struct Cli {
     /// Directory to scan for project conversations.
     #[arg(long, default_value_os_t = default_projects_dir())]

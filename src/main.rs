@@ -14,13 +14,16 @@ use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
 use cclens::rendering::{render_inputs, render_session, render_table};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::CompleteEnv;
 use cli::{
     Cli, Command, FilterArgs, InputsFilterArgs, PricingAction, emit_empty_result_hint,
     emit_inputs_empty_hint,
 };
 
 fn main() -> anyhow::Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
+
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::List {
         filters: FilterArgs::default(),
