@@ -7,6 +7,7 @@ pub mod aggregation;
 pub mod discovery;
 pub mod domain;
 pub mod filter;
+pub mod inventory;
 pub mod parsing;
 pub mod pricing;
 pub mod rendering;
