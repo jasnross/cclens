@@ -23,6 +23,7 @@ assert_cmd = "2"
 filetime = "0.2"
 insta = { version = "1", features = ["yaml"] }
 predicates = "3"
+regex = "1"
 
 [lints.clippy]
 # Lint groups at priority -1 so individual overrides below take precedence.

@@ -4,9 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # cclens
 
-A tiny Rust CLI that lists Claude Code conversations: when they happened, what
-project they were in, what they were about, and how many tokens they consumed.
-It reads `~/.claude/projects/` and prints a plain aligned table to stdout.
+A tiny Rust CLI that surfaces two views of Claude Code usage:
+
+- **`cclens list` / `cclens show`** — sessions browser. Lists conversations
+  (when they happened, what project, what about, token + cost totals)
+  from `~/.claude/projects/`.
+- **`cclens inputs`** — per-file context-cost attribution. Ranks the
+  user's CLAUDE.md / rules / skills / agents (global, project-local,
+  and plugin-shipped) by attributed cache-creation cost, with a per-tier
+  coverage indicator. Reads `~/.claude/{CLAUDE.md,rules,skills,agents}`,
+  `~/.claude/plugins/cache/` (driven from `installed_plugins.json`), and
+  per-session ancestor + project-local context files in addition to
+  `~/.claude/projects/`.
+
+Output is a plain aligned table to stdout in both views.
 
 ## Project Status
 
@@ -104,19 +115,31 @@ are named `cclens`; the binary consumes the library via
 `use cclens::...`.
 
 Library modules (declared `pub mod` in `src/lib.rs`, one file each
-under `src/<name>.rs`, in pipeline order):
+under `src/<name>.rs`; declarations are alphabetical, the pipeline
+order below is for orientation):
 
 ```
 domain        ← Session, Turn, Role, Usage, CacheCreation
 parsing       ← RawLine / RawMessage / RawUsage + parse_jsonl + raw_to_turn
 discovery     ← projects_dir walk → (project_dir, [jsonl_paths])
+inventory     ← walks ~/.claude/{CLAUDE.md,rules,skills,agents},
+                plugin cache, and per-session ancestor + project-local
+                context; tokenizes via tiktoken_rs cl100k_base;
+                returns Vec<ContextFile> with kind/tier/scope
 aggregation   ← turn list → Session; Exchange grouping;
                 title extraction; project short-name derivation;
-                zero-billable filter
+                zero-billable filter; cross-file dedup_assistant_turns
+attribution   ← turn list → SessionMeta (per-tier event counts,
+                observed_*_tokens, majority model);
+                inventory + session_metas + pricing → ranked
+                AttributionRow rows with strict None cost propagation;
+                per-tier CoverageStats (observed vs attributed)
 pricing       ← LiteLLM-catalog fetch/cache/lookup, tiered cost math,
-                pricing-subcommand handlers
-rendering     ← comfy-table render_table (list view) and render_session
-                (show view), plus per-row formatters
+                pricing-subcommand handlers; cost_for_cache_creation_{1h,5m}
+                helpers exposed for the inputs subcommand
+rendering     ← comfy-table render_table (list view), render_session
+                (show view), and render_inputs (inputs view) with
+                per-tier coverage line; per-row formatters
 filter        ← Thresholds value type — the cross-boundary primitive
                 that lets rendering accept --min-tokens / --min-cost
                 without depending on clap

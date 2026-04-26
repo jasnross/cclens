@@ -4,13 +4,21 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use cclens::aggregation::{aggregate, dedup_assistant_turns, group_into_exchanges};
+use cclens::attribution::{
+    SessionMeta, compute_coverage, compute_rows, extend_inventory_for_session,
+    session_meta_from_turns,
+};
 use cclens::discovery::discover;
 use cclens::domain::Turn;
+use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
-use cclens::rendering::{render_session, render_table};
+use cclens::rendering::{render_inputs, render_session, render_table};
 use clap::Parser;
-use cli::{Cli, Command, FilterArgs, PricingAction, emit_empty_result_hint};
+use cli::{
+    Cli, Command, FilterArgs, InputsFilterArgs, PricingAction, emit_empty_result_hint,
+    emit_inputs_empty_hint,
+};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -23,6 +31,10 @@ fn main() -> anyhow::Result<()> {
             filters,
         } => run_show(&cli.projects_dir, &session_id, filters),
         Command::Pricing { action } => run_pricing(action),
+        Command::Inputs {
+            inputs_filters,
+            filters,
+        } => run_inputs(&cli.projects_dir, &inputs_filters, filters),
     }
 }
 
@@ -65,6 +77,72 @@ fn run_list(projects_dir: &Path, filters: FilterArgs) -> anyhow::Result<()> {
     println!("{}", render_table(&sessions));
     if sessions.is_empty() {
         emit_empty_result_hint(&filters);
+    }
+    Ok(())
+}
+
+fn run_inputs(
+    projects_dir: &Path,
+    inputs_filters: &InputsFilterArgs,
+    filters: FilterArgs,
+) -> anyhow::Result<()> {
+    let catalog = pricing::load_catalog();
+    let inventory_config = InventoryConfig::default();
+    let mut inventory = discover_inventory(&inventory_config);
+    let mut seen_inventory_paths: HashSet<PathBuf> = HashSet::new();
+    for file in &inventory {
+        seen_inventory_paths.insert(file.path.clone());
+    }
+
+    let project_entries = discover(projects_dir)?;
+    let attribution_filter = inputs_filters.attribution_filter();
+    let mut session_metas: Vec<SessionMeta> = Vec::new();
+    for (project_dir, jsonl_paths) in project_entries {
+        // Same per-project cross-file dedup pattern as run_list/run_show.
+        let mut seen_turn_keys: HashSet<(String, String)> = HashSet::new();
+        for jsonl_path in jsonl_paths {
+            let Ok(turns) = parse_jsonl(&jsonl_path) else {
+                continue;
+            };
+            let turns = dedup_assistant_turns(turns, &mut seen_turn_keys);
+            let session_id = jsonl_path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let Some(meta) = session_meta_from_turns(session_id, &project_dir, &turns) else {
+                continue;
+            };
+            if !attribution_filter.accepts(&meta) {
+                continue;
+            }
+            // Extend the shared inventory with this session's
+            // ancestor + project-local context files. Path-keyed
+            // dedup means a shared CLAUDE.md across sibling cwds
+            // appears in the inventory exactly once.
+            if let Some(cwd) = &meta.cwd {
+                extend_inventory_for_session(
+                    &mut inventory,
+                    &mut seen_inventory_paths,
+                    cwd,
+                    &inventory_config,
+                );
+            }
+            session_metas.push(meta);
+        }
+    }
+
+    let rows = compute_rows(inventory, &session_metas, &catalog);
+    let coverage = compute_coverage(&session_metas, &rows);
+    let thresholds = filters.thresholds();
+    // Apply --min-tokens / --min-cost as a presentation-only row filter:
+    // coverage stats reflect every session in scope, not just rows kept.
+    let visible_rows: Vec<_> = rows
+        .into_iter()
+        .filter(|row| thresholds.matches(row.estimated_tokens_billed, row.attributed_cost))
+        .collect();
+    println!("{}", render_inputs(&visible_rows, &coverage));
+    if visible_rows.is_empty() {
+        emit_inputs_empty_hint(inputs_filters, &filters);
     }
     Ok(())
 }

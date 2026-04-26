@@ -1,10 +1,14 @@
-//! Comfy-table rendering for the `list` and `show` subcommands.
+//! Comfy-table rendering for the `list`, `show`, and `inputs`
+//! subcommands.
 //!
 //! Public API:
 //! - `render_table(&[Session]) -> String` — the `list` view.
 //! - `render_session(&[Exchange<'_>], &PricingCatalog, Thresholds) -> (String, usize)`
 //!   — the `show` view; returns rendered table plus visible-row count
 //!   for the empty-result hint decision.
+//! - `render_inputs(&[AttributionRow], &CoverageStats) -> String` —
+//!   the `inputs` view; returns the table plus a per-tier coverage
+//!   line below it.
 //!
 //! All formatter helpers (`format_cost_opt`, `truncate_title`,
 //! `format_local`, `format_local_or_empty`) and the cumulative-fold
@@ -16,8 +20,10 @@ use comfy_table::{CellAlignment, Table};
 use serde_json::Value;
 
 use crate::aggregation::{Exchange, exchange_filter_totals, user_display_string};
+use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
 use crate::domain::{CacheCreation, Session, Turn, Usage};
 use crate::filter::Thresholds;
+use crate::inventory::{CacheTier, ContextFileKind};
 use crate::pricing::PricingCatalog;
 
 const TITLE_MAX_CHARS: usize = 80;
@@ -37,6 +43,17 @@ const SHOW_TOKENS_COL_INDEX: usize = 2;
 const SHOW_COST_COL_INDEX: usize = 3;
 const SHOW_CUMULATIVE_COL_INDEX: usize = 4;
 const SHOW_CUM_COST_COL_INDEX: usize = 5;
+
+// `inputs` view column indices. Header order:
+//   file | kind | tier | tokens | events | billed | attributed_cost
+// Note that the `tier` column shifts the numeric columns one slot
+// right vs. the original (no-tier) header layout.
+const INPUTS_TOKENS_COL_INDEX: usize = 3;
+const INPUTS_EVENTS_COL_INDEX: usize = 4;
+const INPUTS_BILLED_COL_INDEX: usize = 5;
+const INPUTS_ATTRIBUTED_COST_COL_INDEX: usize = 6;
+
+const INPUTS_PATH_MAX_CHARS: usize = 60;
 
 /// Format an optional cost as `$X.XXXX` or `—` for the unknown-model
 /// case. Centralized so list and show share the exact same vocabulary.
@@ -334,6 +351,113 @@ pub fn render_session(
         col.set_cell_alignment(CellAlignment::Right);
     }
     (format!("{table}"), rows_shown)
+}
+
+// ---- inputs view ----
+
+/// Render the `inputs` view: one table row per `AttributionRow` plus a
+/// per-tier coverage line below.
+///
+/// `attributed_cost` (rather than `cost`) names the column to
+/// distinguish it from the per-session / per-exchange `cost` columns
+/// in `list` and `show` — those are billed totals, this is a
+/// per-file estimate.
+#[must_use]
+pub fn render_inputs(rows: &[AttributionRow], coverage: &CoverageStats) -> String {
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+    table.set_header(vec![
+        "file",
+        "kind",
+        "tier",
+        "tokens",
+        "events",
+        "billed",
+        "attributed_cost",
+    ]);
+    for row in rows {
+        table.add_row(vec![
+            pretty_path(&row.file.path),
+            kind_label(&row.file.kind),
+            tier_label(row.file.kind.tier()),
+            row.file.tokens.to_string(),
+            row.events.to_string(),
+            row.estimated_tokens_billed.to_string(),
+            format_cost_opt(row.attributed_cost),
+        ]);
+    }
+    for idx in [
+        INPUTS_TOKENS_COL_INDEX,
+        INPUTS_EVENTS_COL_INDEX,
+        INPUTS_BILLED_COL_INDEX,
+        INPUTS_ATTRIBUTED_COST_COL_INDEX,
+    ] {
+        if let Some(col) = table.column_mut(idx) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+    }
+    let table_str = format!("{table}");
+    format!("{table_str}\n{}", coverage_line(coverage))
+}
+
+/// Short label for a context-file kind. Enumerates every variant
+/// (no wildcard) so adding a new variant forces a label decision at
+/// compile time via `wildcard_enum_match_arm`.
+fn kind_label(kind: &ContextFileKind) -> String {
+    match kind {
+        ContextFileKind::GlobalClaudeMd => "global".to_string(),
+        ContextFileKind::UserRule => "rule".to_string(),
+        ContextFileKind::UserSkill => "skill".to_string(),
+        ContextFileKind::UserAgent => "agent".to_string(),
+        ContextFileKind::PluginSkill { plugin, .. } => format!("plugin:{plugin}:skill"),
+        ContextFileKind::PluginRule { plugin, .. } => format!("plugin:{plugin}:rule"),
+        ContextFileKind::PluginAgent { plugin, .. } => format!("plugin:{plugin}:agent"),
+        ContextFileKind::ProjectClaudeMd => "project".to_string(),
+        ContextFileKind::ProjectLocalSkill => "project:skill".to_string(),
+        ContextFileKind::ProjectLocalCommand => "project:command".to_string(),
+        ContextFileKind::ProjectLocalRule => "project:rule".to_string(),
+        ContextFileKind::ProjectLocalAgent => "project:agent".to_string(),
+    }
+}
+
+fn tier_label(tier: CacheTier) -> String {
+    match tier {
+        CacheTier::Long1h => "1h".to_string(),
+        CacheTier::Short5m => "5m".to_string(),
+    }
+}
+
+/// Convert an absolute path to its `~/...` form when it lives under
+/// the user's home directory, then truncate scalar-aware to
+/// `INPUTS_PATH_MAX_CHARS` to keep the column readable.
+fn pretty_path(path: &std::path::Path) -> String {
+    let display: String = if let Some(home) = dirs::home_dir()
+        && let Ok(rel) = path.strip_prefix(&home)
+    {
+        format!("~/{}", rel.display())
+    } else {
+        path.display().to_string()
+    };
+    truncate_title(&display, INPUTS_PATH_MAX_CHARS)
+}
+
+fn coverage_line(coverage: &CoverageStats) -> String {
+    let one_h = coverage_half("1h", &coverage.long_1h);
+    let five_m = coverage_half("5m", &coverage.short_5m);
+    format!("coverage: {one_h} | {five_m}")
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn coverage_half(label: &str, tier: &TierCoverage) -> String {
+    match tier.ratio {
+        None => format!("{label}: n/a"),
+        Some(r) => format!(
+            "{label}: {pct:.1}% ({attributed} / {observed} {label}-tokens)",
+            pct = r * 100.0,
+            attributed = tier.attributed_tokens,
+            observed = tier.observed_tokens,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -886,6 +1010,246 @@ mod tests {
         assert!(
             out.contains("reading +2 tool uses"),
             "expected tool-use suffix; got:\n{out}",
+        );
+    }
+
+    // --- render_inputs ---
+
+    use std::path::PathBuf as StdPathBuf;
+
+    use crate::attribution::TierCoverage;
+    use crate::inventory::{ContextFile, ContextFileKind, Scope};
+
+    fn inputs_row(
+        path: &str,
+        kind: ContextFileKind,
+        tokens: u64,
+        events: u64,
+        billed: u64,
+        cost: Option<f64>,
+    ) -> AttributionRow {
+        AttributionRow {
+            file: ContextFile {
+                path: StdPathBuf::from(path),
+                kind,
+                tokens,
+                scope: Scope::Global,
+            },
+            events,
+            estimated_tokens_billed: billed,
+            attributed_cost: cost,
+        }
+    }
+
+    fn cov_with(
+        long_obs: u64,
+        long_attr: u64,
+        long_ratio: Option<f64>,
+        short_obs: u64,
+        short_attr: u64,
+        short_ratio: Option<f64>,
+    ) -> CoverageStats {
+        CoverageStats {
+            long_1h: TierCoverage {
+                observed_tokens: long_obs,
+                attributed_tokens: long_attr,
+                ratio: long_ratio,
+            },
+            short_5m: TierCoverage {
+                observed_tokens: short_obs,
+                attributed_tokens: short_attr,
+                ratio: short_ratio,
+            },
+        }
+    }
+
+    #[test]
+    fn render_inputs_renders_header_and_rows() {
+        let rows = vec![inputs_row(
+            "/some/CLAUDE.md",
+            ContextFileKind::GlobalClaudeMd,
+            100,
+            5,
+            500,
+            Some(0.003),
+        )];
+        let cov = cov_with(500, 500, Some(1.0), 0, 0, None);
+        let out = render_inputs(&rows, &cov);
+        for header in [
+            "file",
+            "kind",
+            "tier",
+            "tokens",
+            "events",
+            "billed",
+            "attributed_cost",
+        ] {
+            assert!(out.contains(header), "header `{header}` missing in:\n{out}");
+        }
+        assert!(
+            out.contains("global"),
+            "expected `global` kind label; got:\n{out}",
+        );
+        assert!(out.contains("1h"));
+        assert!(out.contains("$0.0030"));
+    }
+
+    #[test]
+    fn render_inputs_right_aligns_numeric_columns() {
+        // Two rows with very different scalar widths; the
+        // events/billed/cost columns must right-align so each row's
+        // prefix-up-to-events ends at the same character count.
+        let rows = vec![
+            inputs_row(
+                "/a/CLAUDE.md",
+                ContextFileKind::GlobalClaudeMd,
+                9,
+                9,
+                81,
+                Some(0.001),
+            ),
+            inputs_row(
+                "/b/CLAUDE.md",
+                ContextFileKind::GlobalClaudeMd,
+                123_456,
+                123_456,
+                15_241_383_936,
+                Some(123.4567),
+            ),
+        ];
+        let cov = cov_with(0, 0, None, 0, 0, None);
+        let out = render_inputs(&rows, &cov);
+        let data_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("/a/CLAUDE.md") || l.contains("/b/CLAUDE.md"))
+            .collect();
+        assert_eq!(data_lines.len(), 2);
+        // Strip from the right: cost cell, billed cell, events cell —
+        // what remains should end at the events column's right edge.
+        let strip = |l: &str| -> usize {
+            let trimmed = l.trim_end();
+            // Cost is the last cell; strip it off.
+            let after_cost = trimmed.rsplit_once(' ').map(|(left, _)| left).unwrap();
+            let after_billed = after_cost
+                .trim_end()
+                .rsplit_once(' ')
+                .map(|(left, _)| left)
+                .unwrap();
+            after_billed.trim_end().chars().count()
+        };
+        let small_width = strip(data_lines.iter().find(|l| l.contains("/a/")).unwrap());
+        let large_width = strip(data_lines.iter().find(|l| l.contains("/b/")).unwrap());
+        assert_eq!(
+            small_width, large_width,
+            "right-aligned columns should produce equal scalar widths; \
+             small={small_width}, large={large_width}\n\nfull output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_inputs_renders_em_dash_for_unknown_cost() {
+        let rows = vec![inputs_row(
+            "/some/CLAUDE.md",
+            ContextFileKind::GlobalClaudeMd,
+            100,
+            5,
+            500,
+            None,
+        )];
+        let cov = cov_with(0, 0, None, 0, 0, None);
+        let out = render_inputs(&rows, &cov);
+        assert!(out.contains('—'), "expected em-dash; got:\n{out}");
+    }
+
+    #[test]
+    fn render_inputs_coverage_line_includes_both_tiers() {
+        let cov = cov_with(5_000, 4_000, Some(0.8), 2_000, 1_500, Some(0.75));
+        let out = render_inputs(&[], &cov);
+        let coverage_line = out
+            .lines()
+            .find(|l| l.starts_with("coverage:"))
+            .expect("coverage line present");
+        assert!(coverage_line.contains("1h: 80.0%"), "got: {coverage_line}");
+        assert!(
+            coverage_line.contains("(4000 / 5000 1h-tokens)"),
+            "got: {coverage_line}"
+        );
+        assert!(coverage_line.contains('|'), "got: {coverage_line}");
+        assert!(coverage_line.contains("5m: 75.0%"), "got: {coverage_line}");
+        assert!(
+            coverage_line.contains("(1500 / 2000 5m-tokens)"),
+            "got: {coverage_line}"
+        );
+    }
+
+    #[test]
+    fn render_inputs_coverage_line_renders_n_a_per_tier() {
+        // Asymmetric: 1h has data, 5m doesn't.
+        let cov = cov_with(100, 80, Some(0.8), 0, 0, None);
+        let out = render_inputs(&[], &cov);
+        let line = out.lines().find(|l| l.starts_with("coverage:")).unwrap();
+        assert!(line.contains("1h: 80.0%"), "got: {line}");
+        assert!(line.contains("5m: n/a"), "got: {line}");
+
+        // Reversed shape.
+        let cov = cov_with(0, 0, None, 100, 80, Some(0.8));
+        let out = render_inputs(&[], &cov);
+        let line = out.lines().find(|l| l.starts_with("coverage:")).unwrap();
+        assert!(line.contains("1h: n/a"), "got: {line}");
+        assert!(line.contains("5m: 80.0%"), "got: {line}");
+    }
+
+    #[test]
+    fn kind_label_enumerates_every_variant() {
+        // Smoke: every variant maps to a non-empty string. The
+        // wildcard_enum_match_arm lint already prevents adding a new
+        // variant without updating the function — this test pins the
+        // *non-empty* property too.
+        let kinds = [
+            ContextFileKind::GlobalClaudeMd,
+            ContextFileKind::UserRule,
+            ContextFileKind::UserSkill,
+            ContextFileKind::UserAgent,
+            ContextFileKind::PluginSkill {
+                plugin: "p".into(),
+                marketplace: "m".into(),
+            },
+            ContextFileKind::PluginRule {
+                plugin: "p".into(),
+                marketplace: "m".into(),
+            },
+            ContextFileKind::PluginAgent {
+                plugin: "p".into(),
+                marketplace: "m".into(),
+            },
+            ContextFileKind::ProjectClaudeMd,
+            ContextFileKind::ProjectLocalSkill,
+            ContextFileKind::ProjectLocalCommand,
+            ContextFileKind::ProjectLocalRule,
+            ContextFileKind::ProjectLocalAgent,
+        ];
+        for k in &kinds {
+            let label = kind_label(k);
+            assert!(!label.is_empty(), "label for {k:?} should not be empty");
+        }
+    }
+
+    #[test]
+    fn pretty_path_replaces_home_with_tilde() {
+        let Some(home) = dirs::home_dir() else {
+            return; // Hermetic skip on platforms without a home dir.
+        };
+        let under_home = home.join("foo/bar");
+        let displayed = pretty_path(&under_home);
+        assert!(
+            displayed.starts_with("~/"),
+            "expected ~/ prefix, got: {displayed}",
+        );
+        let elsewhere = StdPathBuf::from("/var/tmp/elsewhere.md");
+        let displayed = pretty_path(&elsewhere);
+        assert!(
+            displayed.starts_with('/'),
+            "non-home path should render absolute, got: {displayed}",
         );
     }
 }

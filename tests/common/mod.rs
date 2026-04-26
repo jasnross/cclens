@@ -62,6 +62,82 @@ pub fn cclens_command(cache_dir: &Path, pricing_url: &str) -> Command {
     cmd
 }
 
+/// Build a `cclens` command for the `inputs` subcommand with a
+/// hermetic `CCLENS_CLAUDE_HOME` override. Adds the third env var on
+/// top of `cclens_command`'s pricing/cache isolation so tests don't
+/// leak into the user's real `~/.claude/` directory.
+pub fn cclens_inputs_command(cache_dir: &Path, pricing_url: &str, claude_home: &Path) -> Command {
+    let mut cmd = cclens_command(cache_dir, pricing_url);
+    cmd.env("CCLENS_CLAUDE_HOME", claude_home);
+    cmd
+}
+
+pub fn inputs_projects_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/inputs-projects")
+}
+
+/// Build a synthetic `~/.claude/` tree under `cache_dir` and return the
+/// path. Contents:
+/// - `CLAUDE.md` (global)
+/// - `rules/test-rule.md`
+/// - `skills/test-skill/SKILL.md`
+/// - `agents/test-agent.md`
+/// - `plugins/installed_plugins.json` referencing one plugin
+/// - `plugins/cache/test-marketplace/test-plugin/unknown/skills/test/SKILL.md`
+///   (uses the literal `unknown` version segment to exercise that case)
+pub fn build_inputs_claude_home(cache_dir: &Path) -> PathBuf {
+    let claude_home = cache_dir.join("claude-home");
+    fs::create_dir_all(&claude_home).expect("create claude-home");
+
+    fs::write(
+        claude_home.join("CLAUDE.md"),
+        "# Global rules\n\nThis is the user's global CLAUDE.md \
+         file with some content for the inputs integration tests \
+         to attribute against. The exact token count comes from \
+         the tokenizer.\n",
+    )
+    .expect("write CLAUDE.md");
+
+    fs::create_dir_all(claude_home.join("rules")).expect("create rules/");
+    fs::write(
+        claude_home.join("rules/test-rule.md"),
+        "# Test Rule\n\nA short global rule body.\n",
+    )
+    .expect("write rule");
+
+    fs::create_dir_all(claude_home.join("skills/test-skill")).expect("create skills/test-skill");
+    fs::write(
+        claude_home.join("skills/test-skill/SKILL.md"),
+        "# Test Skill\n\nUse this when running the integration tests.\n",
+    )
+    .expect("write skill");
+
+    fs::create_dir_all(claude_home.join("agents")).expect("create agents/");
+    fs::write(
+        claude_home.join("agents/test-agent.md"),
+        "# Test Agent\n\nDispatched when the integration tests need an agent file.\n",
+    )
+    .expect("write agent");
+
+    let plugin_path = claude_home.join("plugins/cache/test-marketplace/test-plugin/unknown");
+    fs::create_dir_all(plugin_path.join("skills/test")).expect("create plugin skill dir");
+    fs::write(
+        plugin_path.join("skills/test/SKILL.md"),
+        "# Plugin Skill\n\nFrom a plugin in the cache.\n",
+    )
+    .expect("write plugin skill");
+
+    let plugins_dir = claude_home.join("plugins");
+    let json = format!(
+        r#"{{"plugins":{{"test-plugin@test-marketplace":[{{"installPath":{path:?},"version":"unknown"}}]}}}}"#,
+        path = plugin_path.to_string_lossy(),
+    );
+    fs::write(plugins_dir.join("installed_plugins.json"), json)
+        .expect("write installed_plugins.json");
+
+    claude_home
+}
+
 /// Recursively copy `src` into a fresh tempdir and apply the given
 /// mtime overrides (keyed by file name). Used by the dedup integration
 /// tests to pin file ordering deterministically — the production

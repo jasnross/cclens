@@ -164,6 +164,7 @@ dependencies = [
  "filetime",
  "insta",
  "predicates",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

@@ -11,7 +11,10 @@
 
 mod common;
 
-use common::{cclens_command, snapshot_pricing_url, snapshot_projects_dir};
+use common::{
+    build_inputs_claude_home, cclens_command, cclens_inputs_command, inputs_projects_fixture_dir,
+    pricing_fixture_url, snapshot_pricing_url, snapshot_projects_dir,
+};
 use insta::assert_snapshot;
 
 fn isolated_cache() -> tempfile::TempDir {
@@ -46,6 +49,34 @@ fn show_snapshot() {
         .arg(snapshot_projects_dir())
         .arg("show")
         .arg("aaaa0001-0001-0001-0001-000000000001")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).expect("stdout utf8");
+    assert_snapshot!(stdout);
+}
+
+#[test]
+fn inputs_snapshot() {
+    // Snapshot strategy: set HOME to a per-test tempdir, build the
+    // synthetic ~/.claude/ tree inside it, and rely on
+    // `render_inputs::pretty_path` to substitute that prefix with
+    // `~/...`. The result is byte-stable across machines because
+    // every rendered path becomes `~/claude-home/...` regardless
+    // of the actual tempdir location.
+    let cache = isolated_cache();
+    let home = isolated_cache();
+    let claude_home = build_inputs_claude_home(home.path());
+    let pricing = pricing_fixture_url("litellm-mini.json");
+
+    let stdout_bytes = cclens_inputs_command(cache.path(), &pricing, &claude_home)
+        .env("HOME", home.path())
+        .env("TZ", "UTC")
+        .args(["--projects-dir"])
+        .arg(inputs_projects_fixture_dir())
+        .arg("inputs")
         .assert()
         .success()
         .get_output()

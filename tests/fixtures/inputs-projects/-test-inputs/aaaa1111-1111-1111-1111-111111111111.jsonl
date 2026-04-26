@@ -1,0 +1,4 @@
+{"type":"user","timestamp":"2026-04-15T10:00:00Z","cwd":"/proj-a","message":{"content":"hello"}}
+{"type":"assistant","timestamp":"2026-04-15T10:00:05Z","cwd":"/proj-a","message":{"id":"msg_a1","model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":100},"cache_read_input_tokens":0},"content":[{"type":"text","text":"reply 1"}]},"requestId":"req_a1"}
+{"type":"user","timestamp":"2026-04-15T10:01:00Z","cwd":"/proj-a","message":{"content":"continue"}}
+{"type":"assistant","timestamp":"2026-04-15T10:01:05Z","cwd":"/proj-a","message":{"id":"msg_a2","model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":100},"cache_read_input_tokens":0},"content":[{"type":"text","text":"reply 2"}]},"requestId":"req_a2"}

@@ -8,12 +8,20 @@
 //! - `Cli` / `Command` / `PricingAction` — clap parser types.
 //! - `FilterArgs` — flattened threshold flags; `.thresholds()` produces
 //!   a library `Thresholds`.
+//! - `InputsFilterArgs` — flattened session/project/since/until flags
+//!   for the `inputs` subcommand; `.attribution_filter()` produces a
+//!   library `AttributionFilter`.
 //! - `emit_empty_result_hint(&FilterArgs)` — stderr hint used by
 //!   `run_list` and `run_show` when a filter dropped every row.
+//! - `emit_inputs_empty_hint(&InputsFilterArgs, &FilterArgs)` —
+//!   sibling hint that describes both the inputs-side and threshold
+//!   filters when `cclens inputs` produces no rows.
 
 use std::path::PathBuf;
 
+use cclens::attribution::AttributionFilter;
 use cclens::filter::Thresholds;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
@@ -57,6 +65,24 @@ pub(super) enum Command {
     Pricing {
         #[command(subcommand)]
         action: PricingAction,
+    },
+    /// Rank user-controlled context files by attributed cache-creation cost.
+    ///
+    /// Walks `~/.claude/{CLAUDE.md,rules,skills,agents}`, the plugin
+    /// cache, and per-session ancestor + project-local context, then
+    /// attributes each file's tokens to the matching-tier
+    /// `cache_creation_*` events observed in the JSONL stream.
+    /// Long-tier files (`CLAUDE.md`, rules, agents) bill at the
+    /// 1h cache-creation rate; on-demand files (skills, commands) bill
+    /// at the 5m rate. The `attributed_cost` column is the per-file
+    /// estimate; the rendered footer shows per-tier coverage (how
+    /// much of the observed cache-creation tokens are explained by
+    /// user-attributable files).
+    Inputs {
+        #[command(flatten)]
+        inputs_filters: InputsFilterArgs,
+        #[command(flatten)]
+        filters: FilterArgs,
     },
 }
 
@@ -124,6 +150,84 @@ pub(super) fn emit_empty_result_hint(filters: &FilterArgs) {
         return;
     }
     eprintln!("note: no rows matched {}", filters.describe_active());
+}
+
+/// Session-level filters for `cclens inputs`. Mirrors `FilterArgs`'s
+/// CLI-only / library-projection split: clap-derived flags here,
+/// `.attribution_filter()` produces the library-side `AttributionFilter`.
+#[derive(Args, Debug, Clone, Default)]
+pub(super) struct InputsFilterArgs {
+    /// Restrict attribution to one session by full UUID.
+    #[arg(long)]
+    session: Option<String>,
+    /// Restrict attribution to one project (matches the short name
+    /// shown in the `list` view's `project` column).
+    #[arg(long)]
+    project: Option<String>,
+    /// Include only sessions whose `started_at` is at or after this
+    /// ISO-8601 timestamp (inclusive).
+    #[arg(long)]
+    since: Option<DateTime<Utc>>,
+    /// Include only sessions whose `started_at` is at or before this
+    /// ISO-8601 timestamp (inclusive).
+    #[arg(long)]
+    until: Option<DateTime<Utc>>,
+}
+
+impl InputsFilterArgs {
+    /// Project the clap-derived flags into the library-side
+    /// `AttributionFilter`. Same library/CLI seam pattern as
+    /// `FilterArgs::thresholds`.
+    pub(super) fn attribution_filter(&self) -> AttributionFilter {
+        AttributionFilter {
+            session_id: self.session.clone(),
+            project_name: self.project.clone(),
+            since: self.since,
+            until: self.until,
+        }
+    }
+
+    fn any_active(&self) -> bool {
+        self.session.is_some()
+            || self.project.is_some()
+            || self.since.is_some()
+            || self.until.is_some()
+    }
+
+    fn describe_active(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(s) = &self.session {
+            parts.push(format!("--session {s}"));
+        }
+        if let Some(p) = &self.project {
+            parts.push(format!("--project {p}"));
+        }
+        if let Some(s) = &self.since {
+            parts.push(format!("--since {}", s.to_rfc3339()));
+        }
+        if let Some(u) = &self.until {
+            parts.push(format!("--until {}", u.to_rfc3339()));
+        }
+        parts.join(" ")
+    }
+}
+
+/// Sibling of `emit_empty_result_hint` for `cclens inputs`: surfaces
+/// both the inputs-side filter set and the row-level threshold flags
+/// in one stderr line. Suppresses the hint when no filter is active.
+pub(super) fn emit_inputs_empty_hint(inputs_filters: &InputsFilterArgs, filters: &FilterArgs) {
+    let any = inputs_filters.any_active() || filters.any_active();
+    if !any {
+        return;
+    }
+    let mut combined = inputs_filters.describe_active();
+    if filters.any_active() {
+        if !combined.is_empty() {
+            combined.push(' ');
+        }
+        combined.push_str(&filters.describe_active());
+    }
+    eprintln!("note: no rows matched {combined}");
 }
 
 #[derive(Subcommand, Clone, Copy)]

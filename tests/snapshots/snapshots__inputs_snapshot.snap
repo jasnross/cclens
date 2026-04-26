@@ -1,0 +1,11 @@
+---
+source: tests/snapshots.rs
+expression: stdout
+---
+ file                                                          kind                      tier  tokens  events  billed  attributed_cost 
+ ~/claude-home/CLAUDE.md                                       global                    1h        36       3     108          $0.0011 
+ ~/claude-home/agents/test-agent.md                            agent                     1h        15       3      45          $0.0005 
+ ~/claude-home/rules/test-rule.md                              rule                      1h        10       3      30          $0.0003 
+ ~/claude-home/skills/test-skill/SKILL.md                      skill                     5m        12       1      12                — 
+ ~/claude-home/plugins/cache/test-marketplace/test-plugin/un…  plugin:test-plugin:skill  5m        11       1      11                — 
+coverage: 1h: 36.6% (183 / 500 1h-tokens) | 5m: 46.0% (23 / 50 5m-tokens)
