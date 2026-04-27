@@ -472,8 +472,8 @@ fn show_running_totals_span_hidden_exchanges() {
     // `{:.4}` (matches the same effect documented in
     // `tests/listing.rs::show_renders_per_exchange_table_…`).
     assert!(
-        user_row.contains("150"),
-        "ex2 user row cumulative should be 150 (folds in hidden ex1); got: {user_row}",
+        user_row.contains("0.15k"),
+        "ex2 user row cumulative should be 0.15k (folds in hidden ex1); got: {user_row}",
     );
     assert!(
         user_row.contains("$0.0046"),
@@ -483,8 +483,8 @@ fn show_running_totals_span_hidden_exchanges() {
     // Cumulative on asst row = 150 + 400 (ex2 asst output) = 550.
     // cum_cost = $0.0347 (ex1 + ex2 user-row + ex2 asst-row).
     assert!(
-        asst_row.contains("550"),
-        "ex2 asst row cumulative should be 550; got: {asst_row}",
+        asst_row.contains("0.55k"),
+        "ex2 asst row cumulative should be 0.55k; got: {asst_row}",
     );
     assert!(
         asst_row.contains("$0.0347"),

@@ -1,9 +1,10 @@
 ---
 source: tests/snapshots.rs
+assertion_line: 80
 expression: stdout
 ---
  datetime          role       tokens     cost  cumulative  cum_cost  content                                                                                               
- 2026-04-25 10:00  user          150  $0.0023         150   $0.0023  Review auth and session changes                                                                       
- 2026-04-25 10:00  assistant     300  $0.0225         450   $0.0248  Dispatching reviewers +2 tool uses                                                                    
- 2026-04-25 10:01  subagent       50  $0.0025         500   $0.0273  (tw-code-reviewer · "Review auth changes") Auth review complete - no issues found                     
- 2026-04-25 10:03  subagent       40  $0.0021         540   $0.0294  (tw-code-reviewer · "Review session-handler refactor") Session handler refactor approved with one nit
+ 2026-04-25 10:00  user        0.15k  $0.0023       0.15k   $0.0023  Review auth and session changes                                                                       
+ 2026-04-25 10:00  assistant   0.30k  $0.0225       0.45k   $0.0248  Dispatching reviewers +2 tool uses                                                                    
+ 2026-04-25 10:01  subagent    0.05k  $0.0025       0.50k   $0.0273  (tw-code-reviewer · "Review auth changes") Auth review complete - no issues found                     
+ 2026-04-25 10:03  subagent    0.04k  $0.0021       0.54k   $0.0294  (tw-code-reviewer · "Review session-handler refactor") Session handler refactor approved with one nit

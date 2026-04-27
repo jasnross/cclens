@@ -111,6 +111,12 @@ fn format_local_or_empty(ts: Option<DateTime<Utc>>) -> String {
     ts.map_or_else(String::new, format_local)
 }
 
+fn format_tokens(count: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let count_float = count as f64;
+    format!("{:.2}k", count_float / 1000.0)
+}
+
 #[must_use]
 pub fn render_table(sessions: &[Session]) -> String {
     let mut table = Table::new();
@@ -121,7 +127,7 @@ pub fn render_table(sessions: &[Session]) -> String {
             format_local(session.started_at),
             session.project_short_name.clone(),
             truncate_title(&session.title, TITLE_MAX_CHARS),
-            session.total_billable.to_string(),
+            format_tokens(session.total_billable),
             format_cost_opt(session.total_cost),
             session.id.clone(),
         ]);
@@ -343,9 +349,9 @@ fn render_parent_exchange(
         table.add_row(vec![
             format_local_or_empty(exchange.user.timestamp),
             "user".to_string(),
-            user_tokens_opt.map_or_else(|| "—".to_string(), |n| n.to_string()),
+            user_tokens_opt.map_or_else(|| "—".to_string(), format_tokens),
             format_cost_opt(user_cost_display),
-            cumulative.to_string(),
+            format_tokens(cumulative.to_owned()),
             format_cost_opt(*cum_cost),
             truncate_title(&user_content_preview(exchange.user), SHOW_CONTENT_MAX_CHARS),
         ]);
@@ -370,9 +376,9 @@ fn render_parent_exchange(
             table.add_row(vec![
                 format_local_or_empty(first_assistant.timestamp),
                 "assistant".to_string(),
-                output_tokens.to_string(),
+                format_tokens(output_tokens),
                 format_cost_opt(assistant_cost),
-                cumulative.to_string(),
+                format_tokens(cumulative.to_owned()),
                 format_cost_opt(*cum_cost),
                 truncate_title(&content, SHOW_CONTENT_MAX_CHARS),
             ]);
@@ -441,14 +447,14 @@ fn render_subagent_exchange(
         let tokens_cell = if exchange.assistants.is_empty() {
             "—".to_string()
         } else {
-            row_tokens.to_string()
+            format_tokens(row_tokens)
         };
         table.add_row(vec![
             format_local_or_empty(ts),
             "subagent".to_string(),
             tokens_cell,
             format_cost_opt(row_cost_display),
-            cumulative.to_string(),
+            format_tokens(cumulative.to_owned()),
             format_cost_opt(*cum_cost),
             truncate_title(&content, SHOW_CONTENT_MAX_CHARS),
         ]);
@@ -573,9 +579,9 @@ pub fn render_inputs(rows: &[AttributionRow], coverage: &CoverageStats) -> Strin
             pretty_path(&row.file.path),
             kind_label(&row.file.kind),
             row.tier_label().to_string(),
-            row.file.tokens.to_string(),
+            format_tokens(row.file.tokens),
             row.total_loads().to_string(),
-            row.estimated_tokens_billed.to_string(),
+            format_tokens(row.estimated_tokens_billed),
             format_cost_opt(row.attributed_cost),
         ]);
     }
@@ -838,8 +844,8 @@ mod tests {
         assert!(out.contains("beta"));
         assert!(out.contains("first title"));
         assert!(out.contains("second title"));
-        assert!(out.contains("100"));
-        assert!(out.contains("250"));
+        assert!(out.contains("0.10k"));
+        assert!(out.contains("0.25k"));
         assert!(out.contains("sid"));
     }
 
@@ -895,8 +901,8 @@ mod tests {
         };
         let end_of_9 = strip_trailing(data_lines.iter().find(|l| l.contains("p1")).unwrap());
         let end_of_123456 = strip_trailing(data_lines.iter().find(|l| l.contains("p2")).unwrap());
-        assert!(end_of_9.ends_with('9'), "got: {end_of_9}");
-        assert!(end_of_123456.ends_with("123456"), "got: {end_of_123456}");
+        assert!(end_of_9.ends_with("0.01k"), "got: {end_of_9}");
+        assert!(end_of_123456.ends_with("123.46k"), "got: {end_of_123456}");
         // Right-alignment: shorter value has leading whitespace padding,
         // so the prefix-up-to-tokens has the same scalar count for both.
         assert_eq!(end_of_9.chars().count(), end_of_123456.chars().count());
@@ -1048,7 +1054,7 @@ mod tests {
         // Orphan row's tokens column shows the em-dash and cumulative is
         // preserved from the prior row.
         assert!(orphan_line.contains('—'));
-        assert!(orphan_line.contains("12345"));
+        assert!(orphan_line.contains(&format_tokens(12345)));
 
         // Strip the trailing content column AND the cum_cost column so
         // the cumulative column sits at the new right edge. Both rows
@@ -1069,8 +1075,8 @@ mod tests {
         };
         let a_cols = strip_to_cumulative(assistant_line, "reply");
         let o_cols = strip_to_cumulative(orphan_line, "orphan");
-        assert!(a_cols.ends_with("12345"), "got: {a_cols}");
-        assert!(o_cols.ends_with("12345"), "got: {o_cols}");
+        assert!(a_cols.ends_with(&format_tokens(12345)), "got: {a_cols}");
+        assert!(o_cols.ends_with(&format_tokens(12345)), "got: {o_cols}");
         // Right-aligned: the trailing cumulative columns end at the same
         // character position, so the preceding lines (through tokens + spaces +
         // cumulative) have the same scalar count. Compare by chars, not bytes,
@@ -1114,7 +1120,7 @@ mod tests {
             .rfind(|l| l.contains("r2"))
             .expect("final assistant row missing");
         assert!(
-            last_line.contains(" 380"),
+            last_line.contains(" 0.38k"),
             "expected final cumulative 380 on last assistant row; got: {last_line}",
         );
     }
@@ -1174,8 +1180,11 @@ mod tests {
         // Cumulative column values: 9 for small row, 9 + 123456 = 123465 for
         // big row. Widths of tokens + cost + cumulative parts must
         // match (all three are right-aligned to the same boundaries).
-        assert!(small_cols.ends_with('9'), "got: {small_cols}");
-        assert!(big_cols.ends_with("123465"), "got: {big_cols}");
+        assert!(small_cols.ends_with(&format_tokens(9)), "got: {small_cols}");
+        assert!(
+            big_cols.ends_with(&format_tokens(123_465)),
+            "got: {big_cols}"
+        );
         assert_eq!(small_cols.chars().count(), big_cols.chars().count());
     }
 
@@ -1364,8 +1373,8 @@ mod tests {
             .rfind(|l| l.contains("done"))
             .expect("subagent row missing");
         assert!(
-            last_data_line.contains(" 290 "),
-            "cumulative-at-bottom should equal parent + subagent total (290); got: {last_data_line}",
+            last_data_line.contains(" 0.29k "),
+            "cumulative-at-bottom should equal parent + subagent total (0.29k); got: {last_data_line}",
         );
     }
 
@@ -1552,7 +1561,7 @@ mod tests {
             "expected `global` kind label; got:\n{out}",
         );
         assert!(out.contains("1h"));
-        assert!(out.contains("$0.0030"));
+        assert!(out.contains("$0.0030"), "got:\n{out}");
     }
 
     #[test]

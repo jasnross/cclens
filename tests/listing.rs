@@ -95,7 +95,7 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
     assert!(alpha.contains(alpha_uuid));
     let (alpha_pre_cost, alpha_cost) = strip_uuid_and_cost(alpha, alpha_uuid);
     assert!(
-        alpha_pre_cost.ends_with(" 650"),
+        alpha_pre_cost.ends_with(" 0.65k"),
         "alpha tokens column: {alpha_pre_cost}",
     );
     assert_eq!(alpha_cost, "$0.0379", "alpha cost cell");
@@ -109,7 +109,7 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
     assert!(beta_prose.contains(beta_prose_uuid));
     let (beta_prose_pre, beta_prose_cost) = strip_uuid_and_cost(beta_prose, beta_prose_uuid);
     assert!(
-        beta_prose_pre.ends_with(" 100"),
+        beta_prose_pre.ends_with(" 0.10k"),
         "beta-prose tokens: {beta_prose_pre}",
     );
     assert_eq!(beta_prose_cost, "$0.0069", "beta-prose cost cell");
@@ -123,7 +123,7 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
     assert!(beta_late.contains(beta_late_uuid));
     let (beta_late_pre, beta_late_cost) = strip_uuid_and_cost(beta_late, beta_late_uuid);
     assert!(
-        beta_late_pre.ends_with(" 10"),
+        beta_late_pre.ends_with(" 0.01k"),
         "beta-late tokens: {beta_late_pre}",
     );
     assert_eq!(beta_late_cost, "$0.0004", "beta-late cost cell");
@@ -239,21 +239,27 @@ fn show_renders_per_exchange_table_with_tool_loop_collapse_and_orphan_user() {
     // Exchange 3 (third question, orphan): tokens=`—` cost=`—`
     //   user_cost_delta = Some(0.0) so cum_cost stays at 0.033225.
     let expected = [
-        ("/test-cmd demo", " 315 ", "$0.0056", "315", "$0.0056"),
+        ("/test-cmd demo", " 0.32k ", "$0.0056", "0.32k", "$0.0056"),
         (
             "reading the file +2 tool uses",
-            " 280 ",
+            " 0.28k ",
             "$0.0210",
-            "595",
+            "0.59k",
             "$0.0265",
         ),
-        ("follow-up question", " 120 ", "$0.0022", "715", "$0.0287"),
-        (" answer ", " 60 ", "$0.0045", "775", "$0.0332"),
+        (
+            "follow-up question",
+            " 0.12k ",
+            "$0.0022",
+            "0.71k",
+            "$0.0287",
+        ),
+        (" answer ", " 0.06k ", "$0.0045", "0.78k", "$0.0332"),
         (
             "third question with no response",
             "—",
             "—",
-            "775",
+            "0.78k",
             "$0.0332",
         ),
     ];
@@ -376,16 +382,16 @@ fn list_dedups_resumed_session_assistant_turns() {
     let original_pre_cost = strip_uuid_and_cost(original_row, original_uuid);
     let resumed_pre_cost = strip_uuid_and_cost(resumed_row, resumed_uuid);
     assert!(
-        original_pre_cost.ends_with(" 300"),
-        "original tokens should be 300; got: {original_pre_cost}",
+        original_pre_cost.ends_with(" 0.30k"),
+        "original tokens should be 300 (renders as 0.30k); got: {original_pre_cost}",
     );
     assert!(
-        resumed_pre_cost.ends_with(" 1200"),
+        resumed_pre_cost.ends_with(" 1.20k"),
         "resumed tokens should be 1200 (msg_A replayed turn deduped); \
          got: {resumed_pre_cost}",
     );
     assert!(
-        !resumed_pre_cost.ends_with(" 1300"),
+        !resumed_pre_cost.ends_with(" 1.30k"),
         "resumed must NOT include msg_A — that is the dedup regression; \
          got: {resumed_pre_cost}",
     );
@@ -447,12 +453,12 @@ fn show_dedups_resumed_session() {
         .find(|l| l.contains("resumed prompt"))
         .unwrap_or_else(|| panic!("user row missing:\n{stdout}"));
     assert!(
-        user_row.contains(" 1200 "),
-        "user row tokens should be 1200 (msg_C 400 + sidechain msg_D 800); \
+        user_row.contains(" 1.20k "),
+        "user row tokens should be 1200 (msg_C 400 + sidechain msg_D 800; renders as 1.20k); \
          got: {user_row}",
     );
     assert!(
-        !user_row.contains(" 1300 "),
+        !user_row.contains(" 1.30k "),
         "user row must NOT include msg_A replay tokens; got: {user_row}",
     );
 }
@@ -498,9 +504,9 @@ fn list_includes_subagent_contribution_in_totals() {
     let cost_cell = &after_uuid[dollar_idx..];
     let pre_cost = after_uuid[..dollar_idx].trim_end();
     assert!(
-        pre_cost.ends_with(" 540"),
-        "delta tokens column should include subagent contribution (540 = parent 450 + subagent 90); \
-         got: {pre_cost}",
+        pre_cost.ends_with(" 0.54k"),
+        "delta tokens column should include subagent contribution (540 = parent 450 + subagent 90; \
+         renders as 0.54k); got: {pre_cost}",
     );
     assert_eq!(cost_cell, "$0.0294", "delta cost cell");
 }
@@ -562,8 +568,8 @@ fn list_skips_unreadable_subagent_jsonl_without_aborting() {
     let cost_cell = &after_uuid[dollar_idx..];
     let pre_cost = after_uuid[..dollar_idx].trim_end();
     assert!(
-        pre_cost.ends_with(" 300"),
-        "tokens should be parent-only 300 (subagent skipped); got: {pre_cost}",
+        pre_cost.ends_with(" 0.30k"),
+        "tokens should be parent-only 300 (subagent skipped; renders as 0.30k); got: {pre_cost}",
     );
     assert_eq!(cost_cell, "$0.0165", "cost cell");
 }
@@ -622,11 +628,11 @@ fn show_interleaves_subagent_rows_by_timestamp() {
         "subagent rows should be in timestamp order",
     );
 
-    // Cumulative-at-bottom equals the list total of 540.
+    // Cumulative-at-bottom equals the list total of 540 (renders as 0.54k).
     let last_sub_line = lines[sub2_line];
     assert!(
-        last_sub_line.contains(" 540 "),
-        "cumulative-at-bottom should equal list total 540; got: {last_sub_line}",
+        last_sub_line.contains(" 0.54k "),
+        "cumulative-at-bottom should equal list total 540 (renders as 0.54k); got: {last_sub_line}",
     );
 }
 
@@ -713,7 +719,7 @@ fn show_works_on_zero_billable_session() {
         "orphan row cum_cost should be $0.0000; got: {row}",
     );
     // Strip content marker, then trailing `$0.0000` (cum_cost), then
-    // the trailing `0` (cumulative) check is what we want.
+    // verify the cumulative cell shows zero (renders as `0.00k`).
     let trimmed = row.trim_end();
     let idx = trimmed
         .rfind("hello but nothing replies")
@@ -724,7 +730,7 @@ fn show_works_on_zero_billable_session() {
         .expect("cum_cost should be $0.0000")
         .trim_end();
     assert!(
-        after_cum_cost.ends_with('0'),
-        "orphan row cumulative should be 0; got: {row}",
+        after_cum_cost.ends_with("0.00k"),
+        "orphan row cumulative should be 0 (renders as 0.00k); got: {row}",
     );
 }
