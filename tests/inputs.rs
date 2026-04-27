@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use common::{
-    build_inputs_claude_home, cclens_command, cclens_inputs_command, copy_dir_recursive,
+    build_inputs_claude_home, cclens_inputs_command, copy_dir_recursive,
     inputs_projects_fixture_dir, pricing_fixture_url,
 };
 use regex::Regex;
@@ -415,46 +415,97 @@ fn inputs_subagent_credits_matching_agent_and_extra_load_for_always_loaded_files
         "subagent's 50 ephemeral_5m tokens must enter the 5m denominator",
     );
 
-    // cclens list view folds the subagent's contribution into the
-    // parent session's row totals: the subagent contributes 50
-    // ephemeral_5m cache_creation tokens (billable), so the proj-a row
-    // gains exactly that. Parent + subagent share a project; only
-    // proj-a's row should shift.
-    let baseline_list = run_list_against(cache.path(), &projects_a);
-    let with_subagents_list = run_list_against(cache.path(), &projects_b);
-    assert_ne!(
-        baseline_list, with_subagents_list,
-        "cclens list output must reflect the subagent's billable contribution",
-    );
-    let proj_a_tokens = |stdout: &str| -> u64 {
+    // The list view's parallel assertion — that subagent billable
+    // tokens fold into the parent session's row total — is covered by
+    // `tests/listing.rs::list_includes_subagent_contribution_in_totals`,
+    // so we don't replicate it here.
+}
+
+#[test]
+fn inputs_subagent_without_cwd_inherits_parent_cwd_for_attribution() {
+    // Pins the `build_subagent_meta` parent-cwd fallback contract
+    // (main.rs:290-295). A subagent JSONL with no `cwd` on any turn
+    // would otherwise produce a `SessionMeta` with `cwd: None`, which
+    // `attribution::build_row` skips entirely (attribution.rs:552-553)
+    // — meaning the subagent would contribute zero loads to every
+    // file. The fallback substitutes the parent's cwd / short-name so
+    // the subagent stays attributable.
+    //
+    // Mirrors the shape of
+    // `inputs_subagent_credits_matching_agent_and_extra_load_for_always_loaded_files`
+    // but with the subagent JSONL stripped of `cwd`. Same assertions:
+    // matching agent file gets +1 load, global CLAUDE.md gets +1 load.
+    // A regression that flipped the fallback condition would drop
+    // both deltas to 0.
+    let cache = isolated_tempdir();
+    let claude_home_owner = isolated_tempdir();
+    let claude_home = build_inputs_claude_home(claude_home_owner.path());
+
+    let projects_owner_a = isolated_tempdir();
+    let projects_a = projects_owner_a.path().join("inputs-projects");
+    copy_dir_recursive(&inputs_projects_fixture_dir(), &projects_a);
+    let baseline = run_inputs_against(cache.path(), &claude_home, &projects_a);
+
+    let projects_owner_b = isolated_tempdir();
+    let projects_b = projects_owner_b.path().join("inputs-projects");
+    copy_dir_recursive(&inputs_projects_fixture_dir(), &projects_b);
+    let session_stem = "aaaa1111-1111-1111-1111-111111111111";
+    let subagents_dir = projects_b
+        .join("-test-inputs")
+        .join(session_stem)
+        .join("subagents");
+    fs::create_dir_all(&subagents_dir).expect("create subagents dir");
+    // Note the absence of `cwd` on both turns — this is what triggers
+    // the fallback. Parent JSONL has `cwd: /proj-a`, so the fallback
+    // should substitute that.
+    fs::write(
+        subagents_dir.join("agent-1.jsonl"),
+        r#"{"type":"user","timestamp":"2026-04-15T10:02:00Z","message":{"content":"sub"}}
+{"type":"assistant","timestamp":"2026-04-15T10:02:05Z","message":{"id":"msg_sub_nocwd","model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":50,"ephemeral_1h_input_tokens":0},"cache_read_input_tokens":0},"content":[{"type":"text","text":"sub-reply"}]},"requestId":"req_sub_nocwd"}
+"#,
+    )
+    .expect("write cwd-less subagent jsonl");
+    fs::write(
+        subagents_dir.join("agent-1.meta.json"),
+        r#"{"agentType":"test-agent","description":"test agent body"}"#,
+    )
+    .expect("write subagent meta");
+    let with_subagents = run_inputs_against(cache.path(), &claude_home, &projects_b);
+
+    let loads_for_kind = |stdout: &str, kind: &str| -> u64 {
         let row = stdout
             .lines()
-            .find(|l| l.contains("proj-a"))
-            .unwrap_or_else(|| panic!("proj-a row missing in:\n{stdout}"));
-        // Columns: datetime(2 cells: date + time) project title tokens cost id.
-        // Index 4 is the tokens cell.
+            .find(|l| l.contains(&format!(" {kind} ")))
+            .unwrap_or_else(|| panic!("row for kind `{kind}` missing in:\n{stdout}"));
         row.split_whitespace()
             .nth(4)
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(|| panic!("could not parse tokens cell from row: {row}"))
+            .unwrap_or_else(|| panic!("could not parse loads cell from row: {row}"))
     };
+
+    let baseline_global_loads = loads_for_kind(&baseline, "global");
+    let with_global_loads = loads_for_kind(&with_subagents, "global");
     assert_eq!(
-        proj_a_tokens(&with_subagents_list),
-        proj_a_tokens(&baseline_list) + 50,
-        "proj-a row tokens should grow by the subagent's 50 ephemeral_5m tokens\n\nbaseline:\n{baseline_list}\n\nwith subagents:\n{with_subagents_list}",
+        with_global_loads,
+        baseline_global_loads + 1,
+        "cwd-less subagent should still credit global CLAUDE.md via the parent-cwd fallback\n\nbaseline:\n{baseline}\n\nwith subagents:\n{with_subagents}",
+    );
+
+    let baseline_agent_loads = loads_for_kind(&baseline, "agent");
+    let with_agent_loads = loads_for_kind(&with_subagents, "agent");
+    assert_eq!(
+        baseline_agent_loads, 0,
+        "no subagent → no agent load attributed",
+    );
+    assert_eq!(
+        with_agent_loads, 1,
+        "cwd-less subagent should still credit the matching agent file via the parent-cwd fallback\n\n{with_subagents}",
     );
 }
 
 fn run_inputs_against(cache: &Path, claude_home: &Path, projects_dir: &Path) -> String {
     let mut cmd = cclens_inputs_command(cache, &pricing_fixture_url(PRICING_FIXTURE), claude_home);
     cmd.args(["--projects-dir"]).arg(projects_dir).arg("inputs");
-    let raw = cmd.assert().success().get_output().stdout.clone();
-    String::from_utf8(raw).unwrap()
-}
-
-fn run_list_against(cache: &Path, projects_dir: &Path) -> String {
-    let mut cmd = cclens_command(cache, &pricing_fixture_url(PRICING_FIXTURE));
-    cmd.args(["--projects-dir"]).arg(projects_dir).arg("list");
     let raw = cmd.assert().success().get_output().stdout.clone();
     String::from_utf8(raw).unwrap()
 }
