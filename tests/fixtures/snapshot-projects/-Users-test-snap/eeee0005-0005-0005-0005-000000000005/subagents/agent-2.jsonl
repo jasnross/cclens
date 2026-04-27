@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-04-25T10:03:00Z","cwd":"/Users/test/snap","message":{"content":"Review the session-handler refactor"}}
+{"type":"assistant","timestamp":"2026-04-25T10:03:30Z","cwd":"/Users/test/snap","message":{"model":"claude-opus-4-7","usage":{"input_tokens":15,"output_tokens":25,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"Session handler refactor approved with one nit"}]}}

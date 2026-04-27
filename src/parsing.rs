@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::domain::{CacheCreation, Role, Turn, Usage};
+use crate::domain::{CacheCreation, Role, Turn, TurnOrigin, Usage};
 
 #[derive(Deserialize)]
 struct RawLine {
@@ -160,6 +160,9 @@ fn raw_to_turn(raw: RawLine) -> Option<Turn> {
         usage,
         content,
         cwd: raw.cwd,
+        // Parser produces parent-origin turns; `build_subagent_turns`
+        // overrides this for subagent transcripts after parsing.
+        origin: TurnOrigin::default(),
     })
 }
 

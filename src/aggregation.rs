@@ -1,10 +1,13 @@
 //! Fold parsed `Turn`s into typed `Session`s and `Exchange`s.
 //!
 //! Public API:
-//! - `aggregate(&Path, String, Vec<Turn>, &PricingCatalog) -> Option<Session>`
+//! - `aggregate(&Path, String, Vec<Turn>, &[Vec<Turn>], &PricingCatalog) -> Option<Session>`
 //!   — turn list → session, with title extraction, project-short-name
 //!   derivation, billable summation, strict cost folding, and the
-//!   zero-billable + zero-cost filter.
+//!   zero-billable + zero-cost filter. Subagent transcript turns are
+//!   passed via `subagent_turn_lists` and fold into `Session.total_*`;
+//!   `Session.turns` stays parent-only so title and short-name
+//!   derivation only see the parent's own turns.
 //! - `dedup_assistant_turns(Vec<Turn>, &mut HashSet<(String, String), S>) -> Vec<Turn>`
 //!   — drop assistant turns whose `(message_id, request_id)` pair has
 //!   already been seen earlier in the project's file walk. Generic over
@@ -36,10 +39,15 @@ pub fn aggregate(
     project_dir: &Path,
     session_id: String,
     turns: Vec<Turn>,
+    subagent_turn_lists: &[Vec<Turn>],
     catalog: &PricingCatalog,
 ) -> Option<Session> {
-    let total_billable: u64 = turns.iter().filter_map(billable_from_turn).sum();
-    let total_cost = total_session_cost(&turns, catalog);
+    let total_billable: u64 = turns
+        .iter()
+        .chain(subagent_turn_lists.iter().flatten())
+        .filter_map(billable_from_turn)
+        .sum();
+    let total_cost = total_session_cost(&turns, subagent_turn_lists, catalog);
     // Drop the session only when it's zero-billable AND its cost is
     // *known* to be exactly zero. A session with only `cache_read`
     // tokens has `total_billable == 0` but a non-zero `total_cost` —
@@ -77,11 +85,17 @@ fn billable_from_turn(turn: &Turn) -> Option<u64> {
 
 /// Sum per-assistant-turn costs with strict `None` propagation. User /
 /// attachment / system / other-role turns contribute nothing and never
-/// collapse the result to `None`. A single assistant turn that the
-/// catalog can't price collapses the whole session to `None`.
-fn total_session_cost(turns: &[Turn], catalog: &PricingCatalog) -> Option<f64> {
+/// collapse the result to `None`. A single assistant turn — parent OR
+/// subagent — that the catalog can't price collapses the whole session
+/// to `None`. Subagent turns are folded in via `subagent_turn_lists` so
+/// each subagent's contribution prices under its own per-turn model.
+fn total_session_cost(
+    turns: &[Turn],
+    subagent_turn_lists: &[Vec<Turn>],
+    catalog: &PricingCatalog,
+) -> Option<f64> {
     let mut sum = 0.0;
-    for turn in turns {
+    for turn in turns.iter().chain(subagent_turn_lists.iter().flatten()) {
         match &turn.role {
             Role::Assistant => {}
             Role::User | Role::Attachment | Role::System | Role::Other(_) => continue,
@@ -385,7 +399,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::domain::CacheCreation;
+    use crate::domain::{CacheCreation, TurnOrigin};
 
     // --- test helpers ---
 
@@ -399,6 +413,7 @@ mod tests {
             usage: None,
             content: Some(Value::String(content.to_string())),
             cwd: None,
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -412,6 +427,7 @@ mod tests {
             usage: None,
             content: Some(content),
             cwd: None,
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -433,6 +449,7 @@ mod tests {
             }),
             content: None,
             cwd: None,
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -459,6 +476,7 @@ mod tests {
             }),
             content: Some(content),
             cwd: None,
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -472,6 +490,7 @@ mod tests {
             usage: None,
             content: Some(Value::String("whatever".to_string())),
             cwd: None,
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -485,6 +504,7 @@ mod tests {
             usage: None,
             content: Some(Value::String(content.to_string())),
             cwd: None,
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -512,6 +532,7 @@ mod tests {
             }),
             content: Some(content),
             cwd: None,
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -621,6 +642,7 @@ mod tests {
             Path::new("/tmp/fake-project"),
             "abc".to_string(),
             turns,
+            &[],
             &PricingCatalog::empty(),
         );
         assert!(result.is_none());
@@ -637,6 +659,7 @@ mod tests {
             Path::new("/tmp/fake-project"),
             "abc".to_string(),
             turns,
+            &[],
             &PricingCatalog::empty(),
         )
         .expect("zero-billable filter should not fire");
@@ -676,12 +699,14 @@ mod tests {
                 }),
                 content: None,
                 cwd: None,
+                origin: TurnOrigin::default(),
             },
         ];
         let session = aggregate(
             Path::new("/tmp/fake-project"),
             "abc".to_string(),
             turns,
+            &[],
             &PricingCatalog::empty(),
         )
         .expect("unknown-model zero-billable session must NOT be filtered out");
@@ -707,11 +732,13 @@ mod tests {
             }),
             content: None,
             cwd: Some(PathBuf::from("/Users/jasonr/Projects/redis-tui")),
+            origin: TurnOrigin::default(),
         };
         let session = aggregate(
             Path::new("/tmp/encoded-dir-name"),
             "abc".to_string(),
             vec![turn_with_cwd],
+            &[],
             &PricingCatalog::empty(),
         )
         .unwrap();
@@ -734,15 +761,197 @@ mod tests {
             }),
             content: None,
             cwd: None,
+            origin: TurnOrigin::default(),
         };
         let session = aggregate(
             Path::new("/tmp/-Users-jasonr-encoded"),
             "abc".to_string(),
             vec![turn_no_cwd],
+            &[],
             &PricingCatalog::empty(),
         )
         .unwrap();
         assert_eq!(session.project_short_name, "-Users-jasonr-encoded");
+    }
+
+    // --- subagent fold-in ---
+
+    #[test]
+    fn aggregate_includes_subagent_billable_in_total() {
+        // Parent contributes 300 billable; one subagent contributes 100.
+        let parent = vec![
+            user_string_turn("hi"),
+            assistant_turn_with_usage(100, 200, 0),
+        ];
+        let subagent = vec![
+            user_string_turn("internal prompt"),
+            assistant_turn_with_usage(40, 60, 0),
+        ];
+        let session = aggregate(
+            Path::new("/tmp/p"),
+            "sid".to_string(),
+            parent,
+            &[subagent],
+            &PricingCatalog::empty(),
+        )
+        .expect("session present");
+        assert_eq!(session.total_billable, 300 + 100);
+    }
+
+    #[test]
+    fn aggregate_includes_subagent_cost_in_total() {
+        // Both parent and subagent on a known-priced model — total_cost
+        // is the sum across all assistant turns.
+        let parent = vec![user_string_turn("hi"), assistant_turn_with_usage(10, 20, 0)];
+        let subagent = vec![
+            user_string_turn("internal"),
+            assistant_turn_with_usage(5, 15, 0),
+        ];
+        let catalog = sample_catalog();
+        let session = aggregate(
+            Path::new("/tmp/p"),
+            "sid".to_string(),
+            parent,
+            &[subagent],
+            &catalog,
+        )
+        .expect("session present");
+        // Hand-computed: parent (10*15e-6 + 20*75e-6) + subagent
+        // (5*15e-6 + 15*75e-6)
+        //   = (0.00015 + 0.0015) + (0.000075 + 0.001125)
+        //   = 0.00165 + 0.0012
+        //   = 0.00285
+        let actual = session.total_cost.expect("priced");
+        assert!(
+            (actual - 0.00285).abs() < 1e-9,
+            "expected ~0.00285, got {actual}",
+        );
+    }
+
+    #[test]
+    fn aggregate_subagent_unpriced_model_collapses_session_cost() {
+        // Parent on a priced model, subagent's assistant turn on an
+        // unknown model → total_cost collapses to None per the strict-
+        // propagation rule extended to subagents.
+        let parent = vec![user_string_turn("hi"), assistant_turn_with_usage(10, 20, 0)];
+        let unpriced_assistant = Turn {
+            timestamp: Some("2026-04-01T10:01:00Z".parse().unwrap()),
+            role: Role::Assistant,
+            model: Some("claude-fake-9-9".to_string()),
+            message_id: None,
+            request_id: None,
+            usage: Some(Usage {
+                input: 5,
+                output: 5,
+                cache_creation: CacheCreation::default(),
+                cache_read: 0,
+            }),
+            content: None,
+            cwd: None,
+            origin: TurnOrigin::default(),
+        };
+        let subagent = vec![user_string_turn("hi"), unpriced_assistant];
+        let session = aggregate(
+            Path::new("/tmp/p"),
+            "sid".to_string(),
+            parent,
+            &[subagent],
+            &sample_catalog(),
+        )
+        .expect("session present");
+        assert_eq!(session.total_cost, None);
+    }
+
+    #[test]
+    fn aggregate_with_no_subagents_matches_parent_only_behavior() {
+        // Regression guard: `aggregate(.., &[], ..)` must produce a
+        // Session whose totals equal the prior parent-only contract
+        // for an arbitrary parent turn list.
+        let turns = vec![user_string_turn("q"), assistant_turn_with_usage(50, 75, 25)];
+        let catalog = sample_catalog();
+        let session = aggregate(Path::new("/tmp/p"), "sid".to_string(), turns, &[], &catalog)
+            .expect("session present");
+        // Tokens = 50 + 75 + 25 = 150.
+        assert_eq!(session.total_billable, 150);
+        // Cost = 50*15e-6 + 75*75e-6 + 25*18.75e-6
+        //      = 0.00075 + 0.005625 + 0.000469 (approx 0.00046875)
+        //      = 0.00684375
+        let actual = session.total_cost.expect("priced");
+        assert!(
+            (actual - 0.006_843_75).abs() < 1e-9,
+            "expected ~0.00684375, got {actual}",
+        );
+        // Session.turns receives the parent turns only — no leakage.
+        assert_eq!(session.turns.len(), 2);
+    }
+
+    #[test]
+    fn group_into_exchanges_assigns_origin_per_exchange() {
+        // Group a parent transcript and a subagent transcript
+        // separately; assert that each exchange's user.origin matches
+        // its source. This is the invariant the show renderer's
+        // origin-dispatch relies on.
+        let parent_user = user_string_turn("hi");
+        let parent_asst = assistant_turn_with_usage(10, 5, 0);
+        let parent_turns = vec![parent_user, parent_asst];
+
+        let mut sub_user = user_string_turn("internal");
+        sub_user.origin = TurnOrigin::Subagent {
+            agent_type: "tw-code-reviewer".to_string(),
+            description: Some("Review auth changes".to_string()),
+        };
+        let mut sub_asst = assistant_turn_with_usage(20, 30, 0);
+        sub_asst.origin = TurnOrigin::Subagent {
+            agent_type: "tw-code-reviewer".to_string(),
+            description: Some("Review auth changes".to_string()),
+        };
+        let sub_turns = vec![sub_user, sub_asst];
+
+        let parent_exchanges = group_into_exchanges(&parent_turns);
+        let sub_exchanges = group_into_exchanges(&sub_turns);
+        assert_eq!(parent_exchanges.len(), 1);
+        assert_eq!(sub_exchanges.len(), 1);
+        match &parent_exchanges[0].user.origin {
+            TurnOrigin::Parent => {}
+            TurnOrigin::Subagent { .. } => panic!("parent exchange must carry Parent origin"),
+        }
+        match &sub_exchanges[0].user.origin {
+            TurnOrigin::Subagent {
+                agent_type,
+                description,
+            } => {
+                assert_eq!(agent_type, "tw-code-reviewer");
+                assert_eq!(description.as_deref(), Some("Review auth changes"));
+            }
+            TurnOrigin::Parent => panic!("subagent exchange must carry Subagent origin"),
+        }
+    }
+
+    #[test]
+    fn aggregate_session_turns_excludes_subagent_turns() {
+        // Parent-only-`turns` invariant: subagent turns are folded into
+        // total_billable / total_cost but never pushed into
+        // Session.turns (which downstream consumers — title, short-name,
+        // exchange grouping — read).
+        let parent = vec![user_string_turn("hi"), assistant_turn_with_usage(100, 0, 0)];
+        let subagent = vec![
+            user_string_turn("internal"),
+            assistant_turn_with_usage(50, 0, 0),
+            assistant_turn_with_usage(25, 0, 0),
+        ];
+        let session = aggregate(
+            Path::new("/tmp/p"),
+            "sid".to_string(),
+            parent,
+            &[subagent],
+            &PricingCatalog::empty(),
+        )
+        .expect("session present");
+        // Parent had 2 turns; subagent's 3 turns must NOT appear in
+        // Session.turns.
+        assert_eq!(session.turns.len(), 2);
+        // Totals do see the subagent contribution.
+        assert_eq!(session.total_billable, 100 + 50 + 25);
     }
 
     // --- is_substantive_user_turn ---
@@ -1079,6 +1288,7 @@ mod tests {
             }),
             content: Some(serde_json::json!([{ "type": "text", "text": "?" }])),
             cwd: None,
+            origin: TurnOrigin::default(),
         };
         let exchange = Exchange {
             user: &u,

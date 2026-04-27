@@ -1,0 +1,6 @@
+{"type":"permission-mode","mode":"default"}
+{"type":"file-history-snapshot","filesSnapshot":{}}
+{"type":"user","timestamp":"2026-04-25T10:00:00Z","cwd":"/Users/test/snap","message":{"content":"Review auth and session changes"}}
+{"type":"assistant","timestamp":"2026-04-25T10:00:30Z","cwd":"/Users/test/snap","message":{"model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"Dispatching reviewers"},{"type":"tool_use","name":"Task","id":"tu_1","input":{"subagent_type":"tw-code-reviewer","description":"Review auth changes","prompt":"Look at the auth code"}}]}}
+{"type":"user","timestamp":"2026-04-25T10:02:00Z","cwd":"/Users/test/snap","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"review complete"}]}}
+{"type":"assistant","timestamp":"2026-04-25T10:02:30Z","cwd":"/Users/test/snap","message":{"model":"claude-opus-4-7","usage":{"input_tokens":50,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"Now the second review"},{"type":"tool_use","name":"Task","id":"tu_2","input":{"subagent_type":"tw-code-reviewer","description":"Review session-handler refactor","prompt":"Look at the session handler"}}]}}

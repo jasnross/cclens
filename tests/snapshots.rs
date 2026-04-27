@@ -59,6 +59,28 @@ fn show_snapshot() {
 }
 
 #[test]
+fn show_snapshot_with_subagents() {
+    // Pin the byte-for-byte rendering of `cclens show` against the
+    // delta session in the snapshot fixture, which carries two
+    // tw-code-reviewer subagent invocations with distinct descriptions.
+    // Locks the interleave + subagent-row content prefix shape.
+    let cache = isolated_cache();
+    let stdout_bytes = cclens_command(cache.path(), &snapshot_pricing_url())
+        .env("TZ", "UTC")
+        .args(["--projects-dir"])
+        .arg(snapshot_projects_dir())
+        .arg("show")
+        .arg("eeee0005-0005-0005-0005-000000000005")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).expect("stdout utf8");
+    assert_snapshot!(stdout);
+}
+
+#[test]
 fn inputs_snapshot() {
     // Snapshot strategy: set HOME to a per-test tempdir, build the
     // synthetic ~/.claude/ tree inside it, and rely on

@@ -415,13 +415,33 @@ fn inputs_subagent_credits_matching_agent_and_extra_load_for_always_loaded_files
         "subagent's 50 ephemeral_5m tokens must enter the 5m denominator",
     );
 
-    // cclens list view stays byte-identical — subagents aren't
-    // standalone sessions for the listing browser.
+    // cclens list view folds the subagent's contribution into the
+    // parent session's row totals: the subagent contributes 50
+    // ephemeral_5m cache_creation tokens (billable), so the proj-a row
+    // gains exactly that. Parent + subagent share a project; only
+    // proj-a's row should shift.
     let baseline_list = run_list_against(cache.path(), &projects_a);
     let with_subagents_list = run_list_against(cache.path(), &projects_b);
-    assert_eq!(
+    assert_ne!(
         baseline_list, with_subagents_list,
-        "cclens list output must stay byte-identical when only subagents are added",
+        "cclens list output must reflect the subagent's billable contribution",
+    );
+    let proj_a_tokens = |stdout: &str| -> u64 {
+        let row = stdout
+            .lines()
+            .find(|l| l.contains("proj-a"))
+            .unwrap_or_else(|| panic!("proj-a row missing in:\n{stdout}"));
+        // Columns: datetime(2 cells: date + time) project title tokens cost id.
+        // Index 4 is the tokens cell.
+        row.split_whitespace()
+            .nth(4)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("could not parse tokens cell from row: {row}"))
+    };
+    assert_eq!(
+        proj_a_tokens(&with_subagents_list),
+        proj_a_tokens(&baseline_list) + 50,
+        "proj-a row tokens should grow by the subagent's 50 ephemeral_5m tokens\n\nbaseline:\n{baseline_list}\n\nwith subagents:\n{with_subagents_list}",
     );
 }
 

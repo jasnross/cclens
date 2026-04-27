@@ -727,7 +727,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::domain::{CacheCreation, Usage};
+    use crate::domain::{CacheCreation, TurnOrigin, Usage};
     use crate::inventory::{ContextFileKind, Scope};
 
     // --- test helpers ---
@@ -760,6 +760,7 @@ mod tests {
             }),
             content: None,
             cwd: None,
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -773,6 +774,7 @@ mod tests {
             usage: None,
             content: None,
             cwd: None,
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -786,6 +788,7 @@ mod tests {
             usage: None,
             content: None,
             cwd: cwd.map(Path::to_path_buf),
+            origin: TurnOrigin::default(),
         }
     }
 
@@ -1105,6 +1108,7 @@ mod tests {
             usage: None,
             content: None,
             cwd: None,
+            origin: TurnOrigin::default(),
         }];
         assert!(
             session_meta_from_turns(

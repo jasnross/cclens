@@ -119,14 +119,17 @@ under `src/<name>.rs`; declarations are alphabetical, the pipeline
 order below is for orientation):
 
 ```
-domain        ← Session, Turn, Role, Usage, CacheCreation
+domain        ← Session, Turn, Role, TurnOrigin, Usage, CacheCreation;
+                Turn.origin discriminates parent transcripts from
+                subagent transcripts (Subagent { agent_type, description })
 parsing       ← RawLine / RawMessage / RawUsage + parse_jsonl + raw_to_turn
 discovery     ← projects_dir walk → ProjectSessions { project_dir,
                 sessions: [SessionPaths { jsonl, subagents:
                 [SubagentPaths { jsonl, meta }] }] }; per-session
                 three-level walk into <stem>/subagents/ for
                 agent-*.jsonl + .meta.json sidecars; read_subagent_meta
-                helper for the sidecar
+                helper for the sidecar (returns SubagentMeta with both
+                agent_type and optional description)
 inventory     ← walks ~/.claude/{CLAUDE.md,rules,skills,agents},
                 plugin cache, and per-session ancestor + project-local
                 context; tokenizes via tiktoken_rs cl100k_base;
@@ -135,7 +138,9 @@ inventory     ← walks ~/.claude/{CLAUDE.md,rules,skills,agents},
                 None for always-loaded kinds (CLAUDE.md, rules)
 aggregation   ← turn list → Session; Exchange grouping;
                 title extraction; project short-name derivation;
-                zero-billable filter; cross-file dedup_assistant_turns
+                zero-billable filter; cross-file dedup_assistant_turns;
+                aggregate accepts subagent_turn_lists slice that folds
+                into Session.total_* (Session.turns stays parent-only)
 attribution   ← turn list → SessionMeta { kind: Parent | Subagent
                 { agent_type }, primary_tier, on_demand_loads:
                 Vec<OnDemandLoad>, observed_*_tokens, majority model };
@@ -147,7 +152,9 @@ pricing       ← LiteLLM-catalog fetch/cache/lookup, tiered cost math,
                 pricing-subcommand handlers; cost_for_cache_creation_{1h,5m}
                 helpers exposed for the inputs subcommand
 rendering     ← comfy-table render_table (list view), render_session
-                (show view), and render_inputs (inputs view) with
+                (show view dispatches on Turn.origin: parent → two
+                rows, subagent → single `subagent` row inline by
+                timestamp), and render_inputs (inputs view) with
                 per-tier coverage line; per-row formatters
 filter        ← Thresholds value type — the cross-boundary primitive
                 that lets rendering accept --min-tokens / --min-cost
@@ -162,7 +169,9 @@ Binary entry point (`src/main.rs`):
 - Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs`, the
   per-project `dedup_assistant_turns` orchestration helper, the
   `build_subagent_meta` helper that drives per-subagent transcript
-  parsing for `run_inputs`, and `stem_matches`.
+  parsing for `run_inputs`, the `build_subagent_turns` helper that
+  drives per-subagent transcript parsing (with `TurnOrigin::Subagent`
+  tagging) for `run_list` and `run_show`, and `stem_matches`.
 
 Binary CLI submodule (`src/cli.rs`):
 

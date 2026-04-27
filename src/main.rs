@@ -11,7 +11,7 @@ use cclens::attribution::{
 use cclens::discovery::{
     ProjectSessions, SessionPaths, SubagentPaths, discover, read_subagent_meta,
 };
-use cclens::domain::Turn;
+use cclens::domain::{Turn, TurnOrigin};
 use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
@@ -58,11 +58,12 @@ fn run_list(projects_dir: &Path, filters: FilterArgs) -> anyhow::Result<()> {
         // exactly once across the project's `.jsonl` files. `discover`
         // already returned `sessions` in mtime-ascending order, so
         // the earliest file containing a given key wins. Subagent
-        // JSONLs aren't part of the listing view — `list` is the
-        // session browser and subagents are an internal partition of
-        // a parent session, not a session in their own right.
+        // JSONLs are folded into each parent session's totals via
+        // `build_subagent_turns`; they are not subject to cross-file
+        // dedup (each subagent transcript is single-file and
+        // non-resumable, matching `build_subagent_meta`'s contract).
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        for SessionPaths { jsonl, .. } in session_paths {
+        for SessionPaths { jsonl, subagents } in session_paths {
             // A single unreadable file should not abort the whole listing.
             let Ok(turns) = parse_jsonl(&jsonl) else {
                 continue;
@@ -72,14 +73,21 @@ fn run_list(projects_dir: &Path, filters: FilterArgs) -> anyhow::Result<()> {
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let subagent_turn_lists: Vec<Vec<Turn>> =
+                subagents.iter().filter_map(build_subagent_turns).collect();
             // The new threshold filter sits *after* `aggregate`'s
             // existing zero-billable pre-pass, so it composes
             // additively rather than altering the "session is
             // meaningful" contract.
-            if let Some(session) = aggregate(&project_dir, session_id, turns, &catalog)
-                && filters
-                    .thresholds()
-                    .matches(session.total_billable, session.total_cost)
+            if let Some(session) = aggregate(
+                &project_dir,
+                session_id,
+                turns,
+                &subagent_turn_lists,
+                &catalog,
+            ) && filters
+                .thresholds()
+                .matches(session.total_billable, session.total_cost)
             {
                 sessions.push(session);
             }
@@ -208,6 +216,37 @@ fn run_inputs(
     Ok(())
 }
 
+/// Read a single subagent's transcript and return its parsed `Turn`s,
+/// each tagged with its `TurnOrigin::Subagent { agent_type, description }`.
+///
+/// The list/show pipeline needs the raw turn list (so a subagent's
+/// billable contribution and cost can fold into `Session.total_*`,
+/// and so the show renderer can render subagent rows inline); the
+/// inputs pipeline keeps using `build_subagent_meta` for its
+/// `SessionMeta` shape. The two helpers parallel each other in two
+/// ways. First, both gate on the `.meta.json` sidecar — an absent or
+/// unreadable sidecar returns `None` so the subagent is skipped.
+/// Second, both skip the cross-file dedup pass — subagent transcripts
+/// are non-resumable single-file, so the `(message_id, request_id)`
+/// key set never fires across them.
+///
+/// The per-turn `agent_type` / `description` clones are bounded by
+/// subagent transcript length (typically tens of turns) times short-
+/// string copies (tens of bytes per field). Acceptable; an interning
+/// scheme would be over-engineering for these sizes.
+fn build_subagent_turns(subagent: &SubagentPaths) -> Option<Vec<Turn>> {
+    let meta_path = subagent.meta.as_ref()?;
+    let meta = read_subagent_meta(meta_path)?;
+    let mut turns = parse_jsonl(&subagent.jsonl).ok()?;
+    for turn in &mut turns {
+        turn.origin = TurnOrigin::Subagent {
+            agent_type: meta.agent_type.clone(),
+            description: meta.description.clone(),
+        };
+    }
+    Some(turns)
+}
+
 /// Read a single subagent's transcript and return its `SessionMeta`.
 ///
 /// An absent or unreadable `.meta.json` sidecar causes the subagent
@@ -294,6 +333,17 @@ fn run_pricing(action: PricingAction) -> anyhow::Result<()> {
     }
 }
 
+/// Render one session's per-exchange table.
+///
+/// Walks the parent JSONL (with the same per-project cross-file dedup
+/// pass `run_list` runs) plus every subagent transcript discovered
+/// under `<stem>/subagents/`. Subagent transcripts are parsed via
+/// `build_subagent_turns`, which tags each turn with
+/// `TurnOrigin::Subagent`. The renderer dispatches on origin to render
+/// subagent exchanges as single rows (role `subagent`) inline with the
+/// parent's exchanges, sorted by user-turn timestamp. The body's
+/// `cumulative` column at the bottom equals what `cclens list` reports
+/// for the same session — list/show consistency by construction.
 fn run_show(projects_dir: &Path, session_id: &str, filters: FilterArgs) -> anyhow::Result<()> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
@@ -306,10 +356,6 @@ fn run_show(projects_dir: &Path, session_id: &str, filters: FilterArgs) -> anyho
     // but we keep the "multiple sessions match id …" error for
     // global ambiguity. Filenames within a single project directory
     // are unique, so per-project ambiguity isn't possible here.
-    // Subagent JSONLs (under `<stem>/subagents/`) are intentionally
-    // ignored — `show` is the per-session view, and subagents are
-    // partitions of the parent session, not sessions in their own
-    // right.
     let mut matched_project: Option<(PathBuf, Vec<SessionPaths>)> = None;
     for ProjectSessions {
         project_dir,
@@ -336,21 +382,41 @@ fn run_show(projects_dir: &Path, session_id: &str, filters: FilterArgs) -> anyho
     // can't affect the target's filtered turns.
     let catalog = pricing::load_catalog();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut target_turns: Option<Vec<Turn>> = None;
-    for SessionPaths { jsonl, .. } in session_paths {
+    let mut target: Option<(Vec<Turn>, Vec<SubagentPaths>)> = None;
+    for SessionPaths { jsonl, subagents } in session_paths {
         let Ok(turns) = parse_jsonl(&jsonl) else {
             continue;
         };
         let turns = dedup_assistant_turns(turns, &mut seen);
         if stem_matches(&jsonl, session_id) {
-            target_turns = Some(turns);
+            target = Some((turns, subagents));
             break;
         }
     }
-    let turns =
-        target_turns.ok_or_else(|| anyhow::anyhow!("no session matches id {session_id}"))?;
-    let exchanges = group_into_exchanges(&turns);
-    let (rendered, rows_shown) = render_session(&exchanges, &catalog, filters.thresholds());
+    let (parent_turns, subagent_paths) =
+        target.ok_or_else(|| anyhow::anyhow!("no session matches id {session_id}"))?;
+    // Bind the per-transcript `Vec<Turn>` lists to outer-scope locals
+    // so every `Exchange<'a>` borrows from the same lifetime; the
+    // merged exchange list then lives across all of them.
+    let subagent_turn_lists: Vec<Vec<Turn>> = subagent_paths
+        .iter()
+        .filter_map(build_subagent_turns)
+        .collect();
+    let mut all_exchanges = group_into_exchanges(&parent_turns);
+    for sub_turns in &subagent_turn_lists {
+        all_exchanges.extend(group_into_exchanges(sub_turns));
+    }
+    // Sort exchanges by user-turn timestamp. `unwrap_or(UNIX_EPOCH)`
+    // mirrors `discovery::sort_by_mtime_asc`'s defensive default — in
+    // observed Claude Code data substantive user turns always carry a
+    // timestamp, but the fallback keeps the sort total and keeps the
+    // renderer free of `.unwrap()` (banned by the `unwrap_used` lint).
+    all_exchanges.sort_by_key(|ex| {
+        ex.user
+            .timestamp
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+    });
+    let (rendered, rows_shown) = render_session(&all_exchanges, &catalog, filters.thresholds());
     println!("{rendered}");
     if rows_shown == 0 {
         emit_empty_result_hint(&filters);

@@ -458,6 +458,207 @@ fn show_dedups_resumed_session() {
 }
 
 #[test]
+fn list_includes_subagent_contribution_in_totals() {
+    // The `delta` fixture session in -Users-test-beta carries:
+    //   parent: 2 assistant turns, billable = 100+200 + 50+100 = 450
+    //   subagent 1 (tw-code-reviewer): 20+30 = 50
+    //   subagent 2 (tw-code-reviewer): 15+25 = 40
+    // Total = 540 billable. Cost (claude-opus-4-7 rates):
+    //   parent T1: 100*15e-6 + 200*75e-6 = 0.0165
+    //   parent T2: 50*15e-6 + 100*75e-6 = 0.00825
+    //   sub1:      20*15e-6 + 30*75e-6  = 0.00255
+    //   sub2:      15*15e-6 + 25*75e-6  = 0.0021
+    //   total                           = 0.02940 → "$0.0294"
+    let cache = isolated_cache();
+    let stdout_bytes = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .arg("list")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).unwrap();
+
+    let delta_uuid = "eeee5555-5555-5555-5555-555555555550";
+    let delta_row = stdout
+        .lines()
+        .find(|l| l.contains(delta_uuid))
+        .unwrap_or_else(|| panic!("delta row missing:\n{stdout}"));
+
+    let trimmed = delta_row.trim_end();
+    let after_uuid = trimmed
+        .strip_suffix(delta_uuid)
+        .unwrap_or_else(|| panic!("row missing trailing UUID: {delta_row}"))
+        .trim_end();
+    let dollar_idx = after_uuid
+        .rfind('$')
+        .unwrap_or_else(|| panic!("expected `$` cost cell: {delta_row}"));
+    let cost_cell = &after_uuid[dollar_idx..];
+    let pre_cost = after_uuid[..dollar_idx].trim_end();
+    assert!(
+        pre_cost.ends_with(" 540"),
+        "delta tokens column should include subagent contribution (540 = parent 450 + subagent 90); \
+         got: {pre_cost}",
+    );
+    assert_eq!(cost_cell, "$0.0294", "delta cost cell");
+}
+
+#[test]
+fn list_skips_unreadable_subagent_jsonl_without_aborting() {
+    // Fixture project with one parent session that has a subagent
+    // sidecar referencing an unreadable agent jsonl (a directory in
+    // its place). The session's row should still appear in `list`,
+    // showing the parent's contribution only, without erroring.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("-Users-test-broken");
+    std::fs::create_dir(&project).unwrap();
+    let session_stem = "ffff6666-6666-6666-6666-666666666666";
+    std::fs::write(
+        project.join(format!("{session_stem}.jsonl")),
+        // Parent: one user turn + one assistant turn (input 100 +
+        // output 200 = 300 billable on claude-opus-4-7).
+        "{\"type\":\"user\",\"timestamp\":\"2026-04-26T10:00:00Z\",\"cwd\":\"/Users/test/broken\",\"message\":{\"content\":\"hello\"}}\n\
+         {\"type\":\"assistant\",\"timestamp\":\"2026-04-26T10:00:05Z\",\"cwd\":\"/Users/test/broken\",\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":100,\"output_tokens\":200,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n",
+    )
+    .unwrap();
+    let subagents = project.join(session_stem).join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    // Sidecar present and parseable; the agent-1.jsonl path is a
+    // *directory* rather than a file, so `parse_jsonl` errors → the
+    // build_subagent_turns helper returns None → that subagent is
+    // skipped.
+    std::fs::write(
+        subagents.join("agent-1.meta.json"),
+        r#"{"agentType":"tw-code-reviewer","description":"broken case"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir(subagents.join("agent-1.jsonl")).unwrap();
+
+    let cache = isolated_cache();
+    let stdout_bytes = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(tmp.path())
+        .arg("list")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).unwrap();
+    let row = stdout
+        .lines()
+        .find(|l| l.contains(session_stem))
+        .unwrap_or_else(|| panic!("session row missing:\n{stdout}"));
+    // Parent-only billable = 300 (subagent skipped due to unreadable
+    // jsonl). Cost = 100*15e-6 + 200*75e-6 = 0.0165 → "$0.0165".
+    let after_uuid = row
+        .trim_end()
+        .strip_suffix(session_stem)
+        .unwrap()
+        .trim_end();
+    let dollar_idx = after_uuid.rfind('$').unwrap();
+    let cost_cell = &after_uuid[dollar_idx..];
+    let pre_cost = after_uuid[..dollar_idx].trim_end();
+    assert!(
+        pre_cost.ends_with(" 300"),
+        "tokens should be parent-only 300 (subagent skipped); got: {pre_cost}",
+    );
+    assert_eq!(cost_cell, "$0.0165", "cost cell");
+}
+
+#[test]
+fn show_interleaves_subagent_rows_by_timestamp() {
+    // Run `cclens show` on the delta fixture (parent with two
+    // tw-code-reviewer subagent invocations interleaved). Verify
+    // that subagent rows appear inline with parent rows, sorted by
+    // timestamp, and that the cumulative-at-bottom equals the same
+    // session's `cclens list` total (540).
+    let cache = isolated_cache();
+    let stdout_bytes = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .arg("show")
+        .arg("eeee5555-5555-5555-5555-555555555550")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    let user_line = lines
+        .iter()
+        .position(|l| l.contains("Review auth and session changes"))
+        .expect("parent user row missing");
+    let assistant_line = lines
+        .iter()
+        .position(|l| l.contains("Dispatching reviewers"))
+        .expect("parent assistant row missing");
+    let sub1_line = lines
+        .iter()
+        .position(|l| l.contains("Review auth changes"))
+        .expect("first subagent row missing");
+    let sub2_line = lines
+        .iter()
+        .position(|l| l.contains("Review session-handler refactor"))
+        .expect("second subagent row missing");
+
+    // The parent's exchange spans both Task tool_uses (the second
+    // user turn is tool_result-only, so it's absorbed); subagent
+    // exchanges interleave by their own user-turn timestamp.
+    assert!(
+        user_line < assistant_line,
+        "parent user row precedes assistant"
+    );
+    assert!(
+        assistant_line < sub1_line,
+        "first subagent row should follow parent assistant",
+    );
+    assert!(
+        sub1_line < sub2_line,
+        "subagent rows should be in timestamp order",
+    );
+
+    // Cumulative-at-bottom equals the list total of 540.
+    let last_sub_line = lines[sub2_line];
+    assert!(
+        last_sub_line.contains(" 540 "),
+        "cumulative-at-bottom should equal list total 540; got: {last_sub_line}",
+    );
+}
+
+#[test]
+fn show_disambiguates_same_type_subagent_invocations_by_description() {
+    let cache = isolated_cache();
+    let stdout_bytes = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .arg("show")
+        .arg("eeee5555-5555-5555-5555-555555555550")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).unwrap();
+
+    // Both subagent rows render with their own description visible
+    // in the content cell, so the user can tell two same-agent_type
+    // invocations apart.
+    assert!(
+        stdout.contains("(tw-code-reviewer · \"Review auth changes\")"),
+        "first subagent row must carry its description; got:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("(tw-code-reviewer · \"Review session-handler refactor\")"),
+        "second subagent row must carry its description; got:\n{stdout}",
+    );
+}
+
+#[test]
 fn show_works_on_zero_billable_session() {
     let cache = isolated_cache();
     let stdout_bytes = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))

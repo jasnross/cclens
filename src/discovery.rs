@@ -13,7 +13,9 @@
 //! - `read_subagent_meta(&Path) -> Option<SubagentMeta>` — read a
 //!   subagent's `.meta.json` sidecar; returns `None` when absent or
 //!   malformed (graceful degradation, the caller decides whether to
-//!   skip the subagent).
+//!   skip the subagent). The returned `SubagentMeta` carries both
+//!   `agent_type` and an optional `description` (the per-invocation
+//!   summary surfaced in the show view).
 //!
 //! Per-entry, per-subdir, and per-subagent-walk read errors are silently
 //! skipped; only a failure to read the top-level `projects_dir` propagates.
@@ -55,21 +57,27 @@ pub struct SubagentPaths {
 /// Parsed contents of a subagent `.meta.json` sidecar.
 ///
 /// The on-disk schema observed in real Claude Code data is
-/// `{"agentType": "<name>", "description": "<text>"}`; cclens only
-/// needs the `agentType` for inventory linkage so the public type is
-/// trimmed accordingly.
+/// `{"agentType": "<name>", "description": "<text>"}`. cclens exposes
+/// both fields: `agent_type` is consumed by the inputs pipeline for
+/// agent-row crediting, and `description` is consumed by the show
+/// renderer for per-invocation labels. Older sidecars without a
+/// `description` field deserialize cleanly (the field is `Option`).
 #[derive(Debug)]
 pub struct SubagentMeta {
     pub agent_type: String,
+    pub description: Option<String>,
 }
 
 /// On-disk shape of a subagent `.meta.json` sidecar. Unknown fields
-/// (`description` and any future additions) deserialize without error
-/// thanks to serde's default behavior.
+/// (and any future additions) deserialize without error thanks to
+/// serde's default behavior; `description` is `Option` so older
+/// sidecars without it still parse.
 #[derive(Deserialize)]
 struct RawSubagentMeta {
     #[serde(rename = "agentType")]
     agent_type: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// # Errors
@@ -218,6 +226,7 @@ pub fn read_subagent_meta(path: &Path) -> Option<SubagentMeta> {
     let raw: RawSubagentMeta = serde_json::from_str(&body).ok()?;
     Some(SubagentMeta {
         agent_type: raw.agent_type,
+        description: raw.description,
     })
 }
 
@@ -379,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn read_subagent_meta_extracts_agent_type() {
+    fn read_subagent_meta_extracts_agent_type_and_description() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("agent-1.meta.json");
         stdfs::write(
@@ -389,6 +398,19 @@ mod tests {
         .unwrap();
         let meta = read_subagent_meta(&path).expect("should parse");
         assert_eq!(meta.agent_type, "tw-code-reviewer");
+        assert_eq!(meta.description.as_deref(), Some("Review code"));
+    }
+
+    #[test]
+    fn read_subagent_meta_description_absent_yields_none() {
+        // Older sidecars may carry only `agentType`; description must
+        // gracefully degrade to None.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent-1.meta.json");
+        stdfs::write(&path, r#"{"agentType":"tw-code-reviewer"}"#).unwrap();
+        let meta = read_subagent_meta(&path).expect("should parse");
+        assert_eq!(meta.agent_type, "tw-code-reviewer");
+        assert!(meta.description.is_none());
     }
 
     #[test]
