@@ -1,10 +1,18 @@
-//! Attributes inventory tokens to per-tier cache-creation events
-//! observed in the JSONL stream and produces ranked rows + coverage.
+//! Attributes inventory tokens to per-load cache-creation evidence
+//! extracted from the JSONL stream and produces ranked rows + coverage.
 //!
 //! Public API:
 //! - `SessionMeta` — per-session summary derived from a `Vec<Turn>`.
-//!   Carries event counts and observed-token sums per tier, plus the
-//!   metadata `compute_rows` and the `inputs` filters need.
+//!   Carries the session's `primary_tier`, observed-token sums per
+//!   tier, and `on_demand_loads` (skill/command invocations extracted
+//!   from `Turn.content`), plus the metadata `compute_rows` and the
+//!   `inputs` filters need.
+//! - `SessionKind` — `Parent` vs. `Subagent { agent_type }`
+//!   discriminator. `Subagent` payload's `agent_type` is matched
+//!   against `ContextFile::identifier()` so an agent file is credited
+//!   only by the subagent transcripts that actually loaded it.
+//! - `OnDemandLoad` / `OnDemandKind` — per-(skill, command) load
+//!   record extracted from user-turn content.
 //! - `session_meta_from_turns(...)` — fold a turn list into a
 //!   `SessionMeta`. Returns `None` if no turns carried a timestamp.
 //! - `AttributionFilter` — `--session` / `--project` / `--since` /
@@ -15,26 +23,53 @@
 //!   on resulting file paths so a shared ancestor `CLAUDE.md` doesn't
 //!   double-count.
 //! - `compute_rows(...)` — fold inventory + session metadata + pricing
-//!   into ranked `AttributionRow`s. Tier routing comes from
-//!   `ContextFileKind::tier()`; per-event pricing comes from
-//!   `PricingCatalog::cost_for_cache_creation_{1h,5m}`.
+//!   into ranked `AttributionRow`s. Each file's row reports
+//!   `loads_1h` / `loads_5m` — the actual count of cache-creation
+//!   events that loaded its body, not a session-wide multiplier. Per-
+//!   tier pricing comes from `PricingCatalog::cost_for_cache_creation_{1h,5m}`.
 //! - `compute_coverage(...)` — per-tier `(observed, attributed,
-//!   ratio)` triple covering every session in the row set.
+//!   ratio)` triple summed across every parent + subagent session.
 //!
 //! Strict `None` propagation (mirroring `aggregation::total_session_cost`):
-//! a single in-scope session whose model the catalog can't price
-//! collapses the affected row's cost to `None`. The `events` and
-//! `estimated_tokens_billed` figures still reflect the full event
+//! a single contributing session whose model the catalog can't price
+//! collapses the affected row's cost to `None`. The `loads_*` and
+//! `estimated_tokens_billed` figures still reflect the full load
 //! count — only the cost column collapses.
+//!
+//! Known limitations of the per-load model:
+//! - **Skill auto-trigger detection.** The harness can auto-load a
+//!   skill (when trigger conditions match) without a `Skill` `tool_use`
+//!   or slash command. The skill body still appears in the JSONL
+//!   stream, but distinguishing auto-load from manual is non-trivial
+//!   — auto-loaded skills currently miss attribution. Revisit if it
+//!   bites.
+//! - **Plugin / user skill-name collisions.** If a user skill and a
+//!   plugin skill share a directory name, both are credited. Accepted
+//!   edge case.
+//! - **`agentType` ↔ file-stem normalization.** Subagent crediting
+//!   matches the sidecar's `agentType` against the agent file's stem
+//!   verbatim. Older Claude Code versions occasionally emitted
+//!   `agentType` strings using `:` separators (e.g.
+//!   `tw:code-reviewer`) where the inventory file stem uses `-`
+//!   (`tw-code-reviewer.md`). Such mismatches silently miss
+//!   attribution; the matcher does not normalize.
+//! - **Cache invalidation modeling.** 1h TTL expiry, prefix changes
+//!   mid-session, and manual `/clear` could re-load CLAUDE.md / rules
+//!   within a single session. We assume one load per session per
+//!   always-loaded file. Acceptable approximation given the data we
+//!   have.
 
 use std::collections::HashSet;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 
 use crate::domain::{Role, Turn};
-use crate::inventory::{CacheTier, ContextFile, InventoryConfig, walk_for_session};
+use crate::inventory::{
+    CacheTier, ContextFile, ContextFileKind, InventoryConfig, walk_for_session,
+};
 use crate::pricing::PricingCatalog;
 
 // ---- core types ----
@@ -44,10 +79,9 @@ use crate::pricing::PricingCatalog;
 /// Field semantics:
 /// - `id` — the JSONL stem (passed in by the caller).
 /// - `kind` — discriminates a parent session from a subagent
-///   transcript. `compute_rows`' agent-row gating uses the
+///   transcript. `compute_rows`' agent-row dispatch uses the
 ///   `Subagent { agent_type }` payload to credit only the matching
-///   inventory file (Phase 2 wiring; in Phase 1 subagent-kind metas
-///   are gated out so behavior matches the pre-refactor pipeline).
+///   agent inventory entry.
 /// - `cwd` — first non-`None` `Turn.cwd` across any role, mirroring
 ///   `aggregation::derive_project_short_name`'s rule. Subagent metas
 ///   constructed by `run_inputs` fall back to the parent session's
@@ -57,14 +91,21 @@ use crate::pricing::PricingCatalog;
 ///   `AttributionFilter::accepts` a single-argument predicate.
 /// - `started_at` — earliest `Turn.timestamp`.
 /// - `model` — most-frequent model across this session's assistant
-///   turns, ties broken by first-occurrence. Used as the per-event
+///   turns, ties broken by first-occurrence. Used as the per-load
 ///   pricing model.
-/// - `events_1h` / `events_5m` — count of assistant turns whose
-///   matching `cache_creation.ephemeral_*` is non-zero. Multiplier
-///   used by `compute_rows` for the matching-tier rows.
+/// - `primary_tier` — tier of this session's first `cache_creation`
+///   event (1h preferred when both fire on the same turn, since the
+///   1h delta is where always-loaded content lives). Falls back to
+///   `Long1h` when the session has no `cache_creation` activity at
+///   all. `compute_rows` uses this as the tier for always-loaded
+///   inventory rows (CLAUDE.md, rules) and matched agent rows.
 /// - `observed_1h_tokens` / `observed_5m_tokens` — sum of
 ///   `cache_creation.ephemeral_*` across all assistant turns. Used
 ///   by `compute_coverage` for the matching tier's denominator.
+/// - `on_demand_loads` — slash-command and skill-injection events
+///   extracted from `Turn.content`. Each entry is one observed load
+///   in this session; `compute_rows` counts them per identifier when
+///   crediting skill / command rows.
 #[derive(Debug)]
 pub struct SessionMeta {
     pub id: String,
@@ -73,37 +114,104 @@ pub struct SessionMeta {
     pub project_short_name: String,
     pub started_at: DateTime<Utc>,
     pub model: Option<String>,
-    pub events_1h: u64,
-    pub events_5m: u64,
+    pub primary_tier: CacheTier,
     pub observed_1h_tokens: u64,
     pub observed_5m_tokens: u64,
+    pub on_demand_loads: Vec<OnDemandLoad>,
+}
+
+impl SessionMeta {
+    /// `Some(primary_tier)` when this session emitted at least one
+    /// `cache_creation` event, else `None`. Used by
+    /// `evidence_for_file_in_session` to gate always-loaded and
+    /// agent-row attribution: a session that never actually loaded
+    /// anything (zero `cache_creation` activity in its turn list)
+    /// must NOT be credited with implicit CLAUDE.md / rule loads,
+    /// which would otherwise inflate the row + coverage numerator.
+    #[must_use]
+    pub fn observed_tier(&self) -> Option<CacheTier> {
+        if self.observed_1h_tokens == 0 && self.observed_5m_tokens == 0 {
+            None
+        } else {
+            Some(self.primary_tier)
+        }
+    }
 }
 
 /// Discriminates a parent session JSONL from a subagent transcript.
 ///
 /// The `Subagent` variant carries the `agentType` resolved from the
-/// sibling `.meta.json` sidecar — Phase 2 will use it to credit only
-/// the matching agent inventory entry rather than crediting every
-/// agent file in scope. In Phase 1 the variant is only used as a
-/// gate keeping subagent metas out of the hot loop so the renderer's
-/// output stays byte-identical to the pre-refactor baseline.
+/// sibling `.meta.json` sidecar; `compute_rows` matches it against
+/// `ContextFile::identifier()` to credit only the matching agent
+/// file rather than every agent in scope.
 #[derive(Debug, Clone)]
 pub enum SessionKind {
     Parent,
     Subagent { agent_type: String },
 }
 
+/// One mid-conversation on-demand load extracted from user-turn
+/// content: a slash-command invocation or a skill-body injection.
+///
+/// `identifier` is the harness name (matched against
+/// `ContextFile::identifier()`); `tier` is always `Short5m` per
+/// observed convention (skill / command bodies are loaded by the
+/// harness at the 5m tier, even when the next assistant turn shows
+/// 1h `cache_creation` activity — the 1h delta covers unrelated
+/// long-lived content getting renewed).
+#[derive(Debug, Clone)]
+pub struct OnDemandLoad {
+    pub kind: OnDemandKind,
+    pub identifier: String,
+    pub tier: CacheTier,
+}
+
+/// Distinguishes a skill-body load from a slash-command-body load.
+/// Both attribute at `CacheTier::Short5m`; the discriminator lets
+/// `compute_rows` route each load to the right inventory kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDemandKind {
+    Skill,
+    Command,
+}
+
 /// One ranked attribution row.
 ///
-/// `events` is the per-row multiplier — 1h-tier rows sum
-/// `meta.events_1h`, 5m-tier rows sum `meta.events_5m`.
-/// `attributed_cost` is priced at the row's tier rate.
+/// `loads_1h` and `loads_5m` are the per-tier load counts: the count
+/// of `cache_creation` events at each tier that loaded this file's
+/// body. A row that loads at both tiers (e.g. CLAUDE.md from a 1h-
+/// tier parent session plus a 5m-tier subagent) reports both > 0.
+/// `attributed_cost` is the sum of per-tier costs:
+/// `loads_1h × tokens × rate_1h + loads_5m × tokens × rate_5m`.
 #[derive(Debug)]
 pub struct AttributionRow {
     pub file: ContextFile,
-    pub events: u64,
+    pub loads_1h: u64,
+    pub loads_5m: u64,
     pub estimated_tokens_billed: u64,
     pub attributed_cost: Option<f64>,
+}
+
+impl AttributionRow {
+    /// Total load count across both tiers.
+    #[must_use]
+    pub fn total_loads(&self) -> u64 {
+        self.loads_1h + self.loads_5m
+    }
+
+    /// Tier label for the rendered `tier` column. `1h+5m` when this
+    /// file loaded at both tiers (parent + subagent on different
+    /// tiers); `—` when no session loaded the file at all (in scope
+    /// but never actually triggered).
+    #[must_use]
+    pub fn tier_label(&self) -> &'static str {
+        match (self.loads_1h, self.loads_5m) {
+            (0, 0) => "—",
+            (_, 0) => "1h",
+            (0, _) => "5m",
+            (_, _) => "1h+5m",
+        }
+    }
 }
 
 /// Per-tier coverage figures for the rendered footer.
@@ -171,10 +279,10 @@ impl AttributionFilter {
 /// Fold a turn list into a `SessionMeta`. Returns `None` if no turn
 /// carried a timestamp (matches `aggregation::aggregate`'s rule).
 //
-// `events_1h`/`events_5m` and `observed_1h_tokens`/`observed_5m_tokens`
-// are the domain-essential per-tier counter names — silencing
-// `similar_names` here is a deliberate readability tradeoff in favor
-// of the names the rest of the module reads back.
+// `observed_1h_tokens`/`observed_5m_tokens` are the domain-essential
+// per-tier counter names — silencing `similar_names` here is a
+// deliberate readability tradeoff in favor of the names the rest of
+// the module reads back.
 #[allow(clippy::similar_names)]
 #[must_use]
 pub fn session_meta_from_turns(
@@ -196,8 +304,7 @@ pub fn session_meta_from_turns(
         });
     let model = most_frequent_assistant_model(turns);
 
-    let mut events_1h: u64 = 0;
-    let mut events_5m: u64 = 0;
+    let mut primary_tier: Option<CacheTier> = None;
     let mut observed_1h_tokens: u64 = 0;
     let mut observed_5m_tokens: u64 = 0;
     for turn in turns {
@@ -208,15 +315,26 @@ pub fn session_meta_from_turns(
         let Some(usage) = turn.usage.as_ref() else {
             continue;
         };
-        if usage.cache_creation.ephemeral_1h > 0 {
-            events_1h += 1;
-        }
-        if usage.cache_creation.ephemeral_5m > 0 {
-            events_5m += 1;
-        }
         observed_1h_tokens += usage.cache_creation.ephemeral_1h;
         observed_5m_tokens += usage.cache_creation.ephemeral_5m;
+        // Primary tier: tier of the first assistant turn whose
+        // cache_creation actually fired. 1h takes precedence on a
+        // mixed turn — the 1h delta is the system-prompt-region
+        // tier where always-loaded content lives.
+        if primary_tier.is_none() {
+            if usage.cache_creation.ephemeral_1h > 0 {
+                primary_tier = Some(CacheTier::Long1h);
+            } else if usage.cache_creation.ephemeral_5m > 0 {
+                primary_tier = Some(CacheTier::Short5m);
+            }
+        }
     }
+    // No cache_creation activity at all → default to 1h. Doesn't
+    // matter for attribution (no loads will be credited) but keeps
+    // the field well-defined.
+    let primary_tier = primary_tier.unwrap_or(CacheTier::Long1h);
+
+    let on_demand_loads = extract_on_demand_loads(turns);
 
     Some(SessionMeta {
         id: session_id,
@@ -225,11 +343,104 @@ pub fn session_meta_from_turns(
         project_short_name,
         started_at,
         model,
-        events_1h,
-        events_5m,
+        primary_tier,
         observed_1h_tokens,
         observed_5m_tokens,
+        on_demand_loads,
     })
+}
+
+/// Walk every user turn's `Turn.content` for on-demand load evidence:
+/// slash-command invocations (`<command-name>/foo</command-name>` in
+/// string content) and skill-body injections (text blocks beginning
+/// with `Base directory for this skill: ` in array content).
+///
+/// Dispatch shape mirrors what's observed in real Claude Code data:
+/// slash commands always arrive as a string `Turn.content`, skill
+/// injections always arrive as an array of text blocks. Widening
+/// either parser to handle the other shape would risk false positives
+/// on real prose — leave them split unless the data actually changes.
+///
+/// All on-demand loads attribute at `CacheTier::Short5m` — the harness
+/// loads skill / command bodies at the 5m tier per observed convention.
+fn extract_on_demand_loads(turns: &[Turn]) -> Vec<OnDemandLoad> {
+    let mut out: Vec<OnDemandLoad> = Vec::new();
+    for turn in turns {
+        match &turn.role {
+            Role::User => {}
+            Role::Assistant | Role::Attachment | Role::System | Role::Other(_) => continue,
+        }
+        let Some(content) = turn.content.as_ref() else {
+            continue;
+        };
+        if let Some(s) = content.as_str()
+            && let Some(cmd) = extract_command_identifier(s)
+        {
+            out.push(OnDemandLoad {
+                kind: OnDemandKind::Command,
+                identifier: cmd,
+                tier: CacheTier::Short5m,
+            });
+        }
+        if let Some(arr) = content.as_array() {
+            for block in arr {
+                if block.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
+                let Some(text) = block.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(skill) = extract_skill_identifier(text) {
+                    out.push(OnDemandLoad {
+                        kind: OnDemandKind::Skill,
+                        identifier: skill,
+                        tier: CacheTier::Short5m,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pull the command identifier from a `<command-name>/foo</command-name>`
+/// string. Mirrors `aggregation::extract_slash_command_title`'s
+/// parsing but strips the leading `/` so the result matches a
+/// `ProjectLocalCommand` file stem (`commands/foo.md` → `foo`).
+///
+/// Single-match contract: returns at most one identifier per call,
+/// taken from the first `<command-name>` tag in the string. Two
+/// commands concatenated into one user turn (rare — happens only
+/// when transcripts are pasted) are under-counted by one. Acceptable
+/// approximation given the alternative (iterate via `match_indices`)
+/// adds parser complexity for a vanishingly rare case.
+fn extract_command_identifier(s: &str) -> Option<String> {
+    let name_open = s.find("<command-name>")?;
+    let name_content_start = name_open + "<command-name>".len();
+    let name_close_offset = s[name_content_start..].find("</command-name>")?;
+    let name = &s[name_content_start..name_content_start + name_close_offset];
+    let stripped = name.strip_prefix('/').unwrap_or(name);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+/// Pull the skill directory name from a `Base directory for this
+/// skill: <path>` text block. The skill-name `ContextFile::identifier`
+/// returns is the parent directory of `SKILL.md`; the path the harness
+/// emits points at that same directory (no trailing `/SKILL.md`), so
+/// `Path::file_name()` on the trimmed path is the matching identifier.
+fn extract_skill_identifier(text: &str) -> Option<String> {
+    const PREFIX: &str = "Base directory for this skill: ";
+    let after = text.strip_prefix(PREFIX)?;
+    // Path may be followed by whitespace / newlines / additional
+    // body text — take the first whitespace-delimited token.
+    let path_str = after.split_whitespace().next()?;
+    Path::new(path_str)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
 }
 
 /// Pick the most-frequent assistant model. Iteration order is
@@ -296,9 +507,11 @@ pub fn extend_inventory_for_session<S: BuildHasher>(
 /// ranked rows. See module docs for the strict-`None` cost rule.
 ///
 /// Sort order: descending by `attributed_cost.unwrap_or(0.0)`, then
-/// descending by `estimated_tokens_billed`, then ascending by
-/// `file.path`. Deterministic across runs even when costs collide
-/// or collapse to `None`.
+/// descending by `total_loads()`, then descending by
+/// `estimated_tokens_billed`, then ascending by `file.path`. Four-key
+/// sort ensures full determinism even when cost ties (e.g. multiple
+/// rows with the same per-tier cost but different load counts) or
+/// when costs collapse to `None`.
 #[must_use]
 pub fn compute_rows(
     inventory: Vec<ContextFile>,
@@ -315,55 +528,47 @@ pub fn compute_rows(
         b_cost
             .partial_cmp(&a_cost)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.total_loads().cmp(&a.total_loads()))
             .then_with(|| b.estimated_tokens_billed.cmp(&a.estimated_tokens_billed))
             .then_with(|| a.file.path.cmp(&b.file.path))
     });
     rows
 }
 
-#[allow(clippy::cast_precision_loss)]
+// `loads_1h` / `loads_5m` are the domain-essential per-tier counters
+// — silencing `similar_names` here is a deliberate readability
+// tradeoff (mirroring `session_meta_from_turns`'s same exemption).
+#[allow(clippy::cast_precision_loss, clippy::similar_names)]
 fn build_row(
     file: ContextFile,
     session_metas: &[SessionMeta],
     catalog: &PricingCatalog,
 ) -> AttributionRow {
-    let tier = file.kind.tier();
-    let mut total_events: u64 = 0;
+    let mut loads_1h: u64 = 0;
+    let mut loads_5m: u64 = 0;
     let mut total_cost: Option<f64> = Some(0.0);
 
     for meta in session_metas {
-        // Phase 1 gate: subagent transcripts are plumbed through the
-        // pipeline but Phase 2 owns the per-load attribution math that
-        // actually credits them. Skipping them here keeps `compute_rows`
-        // byte-identical to the pre-refactor baseline so the snapshot
-        // suite stays green during the refactor.
-        match &meta.kind {
-            SessionKind::Parent => {}
-            SessionKind::Subagent { .. } => continue,
-        }
         let Some(meta_cwd) = meta.cwd.as_deref() else {
             continue;
         };
         if !file.scope.matches(meta_cwd) {
             continue;
         }
-        let session_events = match tier {
-            CacheTier::Long1h => meta.events_1h,
-            CacheTier::Short5m => meta.events_5m,
-        };
-        total_events += session_events;
-        if session_events == 0 {
-            // No cost contribution from this session; the unknown-
-            // model rule only collapses the row when at least one
-            // event would have been billed.
+        let (n_loads, tier) = evidence_for_file_in_session(&file, meta);
+        if n_loads == 0 {
             continue;
         }
+        match tier {
+            CacheTier::Long1h => loads_1h += n_loads,
+            CacheTier::Short5m => loads_5m += n_loads,
+        }
         if total_cost.is_none() {
-            // Already collapsed; keep accumulating events but skip
+            // Already collapsed; keep accumulating loads but skip
             // the price lookup.
             continue;
         }
-        let per_event = match tier {
+        let per_load = match tier {
             CacheTier::Long1h => {
                 catalog.cost_for_cache_creation_1h(file.tokens, meta.model.as_deref())
             }
@@ -371,9 +576,9 @@ fn build_row(
                 catalog.cost_for_cache_creation_5m(file.tokens, meta.model.as_deref())
             }
         };
-        match per_event {
+        match per_load {
             Some(c) => {
-                total_cost = total_cost.map(|t| t + c * session_events as f64);
+                total_cost = total_cost.map(|t| t + c * n_loads as f64);
             }
             None => {
                 total_cost = None;
@@ -381,41 +586,121 @@ fn build_row(
         }
     }
 
-    let estimated_tokens_billed = file.tokens.saturating_mul(total_events);
+    let estimated_tokens_billed = file.tokens.saturating_mul(loads_1h + loads_5m);
     AttributionRow {
         file,
-        events: total_events,
+        loads_1h,
+        loads_5m,
         estimated_tokens_billed,
         attributed_cost: total_cost,
     }
 }
 
-/// Per-tier coverage: `observed` from session metas, `attributed`
-/// from rows whose tier matches.
+/// Decide how many loads the given session contributes for the given
+/// file, and at which tier.
+///
+/// Dispatch by `(file.kind, session.kind)`:
+/// - **Always-loaded kinds** (CLAUDE.md, rules) load exactly once per
+///   in-scope session at the session's `primary_tier`. Both parent
+///   and subagent sessions count.
+/// - **Agent kinds** are credited only when the session is a
+///   `Subagent { agent_type }` whose payload matches
+///   `file.identifier()`. Parent sessions never load agent files
+///   directly. The match contributes one load at the session's
+///   `primary_tier` (the harness loads the agent body alongside the
+///   subagent's system prompt).
+/// - **Skill / Command kinds** are credited per matching
+///   `OnDemandLoad` entry in the session's `on_demand_loads` vec —
+///   the count of injections / invocations directly observed in the
+///   JSONL stream. The tier comes from the matched load's `tier`
+///   field (always `Short5m` per the extractor's convention).
+///
+/// Scope matching is the caller's responsibility (handled by the
+/// outer loop in `build_row` before this dispatch fires).
+fn evidence_for_file_in_session(file: &ContextFile, session: &SessionMeta) -> (u64, CacheTier) {
+    match &file.kind {
+        ContextFileKind::GlobalClaudeMd
+        | ContextFileKind::ProjectClaudeMd
+        | ContextFileKind::UserRule
+        | ContextFileKind::PluginRule { .. }
+        | ContextFileKind::ProjectLocalRule => match session.observed_tier() {
+            Some(tier) => (1, tier),
+            // Session emitted zero `cache_creation` activity — nothing
+            // actually loaded, so don't pretend always-loaded files
+            // were billed. The tier value is a don't-care since
+            // `n_loads == 0` short-circuits the caller in `build_row`.
+            None => (0, CacheTier::Long1h),
+        },
+        ContextFileKind::UserAgent
+        | ContextFileKind::PluginAgent { .. }
+        | ContextFileKind::ProjectLocalAgent => match (&session.kind, session.observed_tier()) {
+            (SessionKind::Subagent { agent_type }, Some(tier))
+                if file.identifier().as_deref() == Some(agent_type.as_str()) =>
+            {
+                (1, tier)
+            }
+            _ => (0, CacheTier::Long1h),
+        },
+        ContextFileKind::UserSkill
+        | ContextFileKind::PluginSkill { .. }
+        | ContextFileKind::ProjectLocalSkill => {
+            count_on_demand_matches(file, session, OnDemandKind::Skill)
+        }
+        ContextFileKind::ProjectLocalCommand => {
+            count_on_demand_matches(file, session, OnDemandKind::Command)
+        }
+    }
+}
+
+/// Count `OnDemandLoad` entries that match `file.identifier()` and
+/// `expected_kind`. Returns `(count, tier)` where `tier` is the first
+/// match's `tier` (always `Short5m` in practice; abstracted here so
+/// the dispatch shape stays uniform). When there's no match returns
+/// `(0, Short5m)` — the tier is a don't-care because `n_loads == 0`
+/// short-circuits the caller.
+fn count_on_demand_matches(
+    file: &ContextFile,
+    session: &SessionMeta,
+    expected_kind: OnDemandKind,
+) -> (u64, CacheTier) {
+    let Some(identifier) = file.identifier() else {
+        return (0, CacheTier::Short5m);
+    };
+    let mut count: u64 = 0;
+    let mut first_tier: Option<CacheTier> = None;
+    for load in &session.on_demand_loads {
+        if load.kind != expected_kind {
+            continue;
+        }
+        if load.identifier != identifier {
+            continue;
+        }
+        count += 1;
+        if first_tier.is_none() {
+            first_tier = Some(load.tier);
+        }
+    }
+    (count, first_tier.unwrap_or(CacheTier::Short5m))
+}
+
+/// Per-tier coverage: `observed` summed from every session meta
+/// (parent + subagent), `attributed` summed from the row set's per-
+/// tier load counts × tokens.
 #[must_use]
 pub fn compute_coverage(session_metas: &[SessionMeta], rows: &[AttributionRow]) -> CoverageStats {
     let mut long_observed: u64 = 0;
     let mut short_observed: u64 = 0;
     for meta in session_metas {
-        // Phase 1 mirrors the gate in `compute_rows`: subagent
-        // transcripts are excluded from the coverage denominator so
-        // the rendered ratio stays byte-identical to the pre-refactor
-        // baseline. Phase 2 will sum across both kinds once attribution
-        // also credits them.
-        match &meta.kind {
-            SessionKind::Parent => {}
-            SessionKind::Subagent { .. } => continue,
-        }
         long_observed += meta.observed_1h_tokens;
         short_observed += meta.observed_5m_tokens;
     }
     let mut long_attributed: u64 = 0;
     let mut short_attributed: u64 = 0;
     for row in rows {
-        match row.file.kind.tier() {
-            CacheTier::Long1h => long_attributed += row.estimated_tokens_billed,
-            CacheTier::Short5m => short_attributed += row.estimated_tokens_billed,
-        }
+        long_attributed =
+            long_attributed.saturating_add(row.loads_1h.saturating_mul(row.file.tokens));
+        short_attributed =
+            short_attributed.saturating_add(row.loads_5m.saturating_mul(row.file.tokens));
     }
     CoverageStats {
         long_1h: tier_coverage(long_observed, long_attributed),
@@ -521,10 +806,10 @@ mod tests {
         project: &str,
         started_at_str: &str,
         model: Option<&str>,
-        events_1h: u64,
-        events_5m: u64,
+        primary_tier: CacheTier,
         observed_1h: u64,
         observed_5m: u64,
+        on_demand_loads: Vec<OnDemandLoad>,
     ) -> SessionMeta {
         SessionMeta {
             id: id.to_string(),
@@ -533,10 +818,28 @@ mod tests {
             project_short_name: project.to_string(),
             started_at: ts(started_at_str),
             model: model.map(str::to_string),
-            events_1h,
-            events_5m,
+            primary_tier,
             observed_1h_tokens: observed_1h,
             observed_5m_tokens: observed_5m,
+            on_demand_loads,
+        }
+    }
+
+    /// Convenience constructor for an `OnDemandLoad`. Tier is always
+    /// `Short5m` per the production extractor's convention.
+    fn skill_load(identifier: &str) -> OnDemandLoad {
+        OnDemandLoad {
+            kind: OnDemandKind::Skill,
+            identifier: identifier.to_string(),
+            tier: CacheTier::Short5m,
+        }
+    }
+
+    fn command_load(identifier: &str) -> OnDemandLoad {
+        OnDemandLoad {
+            kind: OnDemandKind::Command,
+            identifier: identifier.to_string(),
+            tier: CacheTier::Short5m,
         }
     }
 
@@ -558,7 +861,8 @@ mod tests {
     // --- session_meta_from_turns ---
 
     #[test]
-    fn session_meta_counts_per_tier_events_separately() {
+    fn session_meta_records_observed_tokens_per_tier() {
+        // Per-tier observed-token sums — coverage's denominator side.
         let turns = vec![
             assistant_turn("2026-04-01T10:00:00Z", Some("claude-opus-4-7"), 0, 100),
             assistant_turn("2026-04-01T10:01:00Z", Some("claude-opus-4-7"), 100, 0),
@@ -572,10 +876,155 @@ mod tests {
             &turns,
         )
         .unwrap();
-        assert_eq!(meta.events_1h, 2, "expected events_1h == 2");
-        assert_eq!(meta.events_5m, 2, "expected events_5m == 2");
         assert_eq!(meta.observed_1h_tokens, 150);
         assert_eq!(meta.observed_5m_tokens, 150);
+    }
+
+    #[test]
+    fn session_meta_primary_tier_from_first_cache_creation_event() {
+        // First assistant turn with cache_creation > 0 sets the
+        // primary tier. A turn that only carries 5m → primary = 5m.
+        let turns = vec![
+            assistant_turn_no_usage("2026-04-01T09:59:00Z", Some("claude-opus-4-7")),
+            assistant_turn("2026-04-01T10:00:00Z", Some("claude-opus-4-7"), 200, 0),
+            assistant_turn("2026-04-01T10:01:00Z", Some("claude-opus-4-7"), 0, 100),
+        ];
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
+        assert_eq!(meta.primary_tier, CacheTier::Short5m);
+    }
+
+    #[test]
+    fn session_meta_primary_tier_prefers_1h_on_mixed_first_event() {
+        // First cache_creation event fires both tiers — 1h wins
+        // because that's where always-loaded content lives.
+        let turns = vec![assistant_turn(
+            "2026-04-01T10:00:00Z",
+            Some("claude-opus-4-7"),
+            50,
+            100,
+        )];
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
+        assert_eq!(meta.primary_tier, CacheTier::Long1h);
+    }
+
+    #[test]
+    fn session_meta_primary_tier_falls_back_to_1h_on_no_cache_activity() {
+        // No cache_creation activity at all — primary tier is still
+        // well-defined (defaults to 1h). Doesn't matter for
+        // attribution because no loads will be credited anyway.
+        let turns = vec![assistant_turn(
+            "2026-04-01T10:00:00Z",
+            Some("claude-opus-4-7"),
+            0,
+            0,
+        )];
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
+        assert_eq!(meta.primary_tier, CacheTier::Long1h);
+    }
+
+    #[test]
+    fn session_meta_extracts_skill_load_from_injection() {
+        // User turn with array content carrying a "Base directory for
+        // this skill: <path>" text block → one OnDemandLoad::Skill
+        // identified by the path's last directory name.
+        let mut user = user_turn("2026-04-01T10:00:00Z", None);
+        user.content = Some(serde_json::json!([
+            { "type": "text", "text": "Base directory for this skill: /Users/x/.claude/skills/tw-implement-plan\n\nbody" },
+        ]));
+        let turns = vec![
+            user,
+            assistant_turn("2026-04-01T10:00:05Z", Some("claude-opus-4-7"), 100, 0),
+        ];
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
+        assert_eq!(meta.on_demand_loads.len(), 1);
+        let load = &meta.on_demand_loads[0];
+        assert_eq!(load.kind, OnDemandKind::Skill);
+        assert_eq!(load.identifier, "tw-implement-plan");
+        assert_eq!(load.tier, CacheTier::Short5m);
+    }
+
+    #[test]
+    fn session_meta_extracts_command_load_from_slash_tag() {
+        // String content matching <command-name>/foo</command-name>
+        // → one OnDemandLoad::Command identified by `foo` (leading
+        // slash stripped to match the inventory file stem).
+        let mut user = user_turn("2026-04-01T10:00:00Z", None);
+        user.content = Some(Value::String(
+            "<command-name>/tw-commit</command-name>\n<command-args>main</command-args>"
+                .to_string(),
+        ));
+        let turns = vec![
+            user,
+            assistant_turn("2026-04-01T10:00:05Z", Some("claude-opus-4-7"), 100, 0),
+        ];
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
+        assert_eq!(meta.on_demand_loads.len(), 1);
+        let load = &meta.on_demand_loads[0];
+        assert_eq!(load.kind, OnDemandKind::Command);
+        assert_eq!(load.identifier, "tw-commit");
+    }
+
+    #[test]
+    fn session_meta_extracts_repeated_skill_load_per_injection() {
+        // Same skill injected twice → two OnDemandLoad entries (per-
+        // load count, not per-identifier dedup).
+        let mut u1 = user_turn("2026-04-01T10:00:00Z", None);
+        u1.content = Some(serde_json::json!([
+            { "type": "text", "text": "Base directory for this skill: /x/.claude/skills/foo" },
+        ]));
+        let mut u2 = user_turn("2026-04-01T10:02:00Z", None);
+        u2.content = Some(serde_json::json!([
+            { "type": "text", "text": "Base directory for this skill: /x/.claude/skills/foo" },
+        ]));
+        let turns = vec![
+            u1,
+            assistant_turn("2026-04-01T10:00:05Z", Some("claude-opus-4-7"), 100, 0),
+            u2,
+            assistant_turn("2026-04-01T10:02:05Z", Some("claude-opus-4-7"), 100, 0),
+        ];
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
+        let foo_count = meta
+            .on_demand_loads
+            .iter()
+            .filter(|l| l.kind == OnDemandKind::Skill && l.identifier == "foo")
+            .count();
+        assert_eq!(foo_count, 2);
     }
 
     #[test]
@@ -687,10 +1136,14 @@ mod tests {
         assert_eq!(meta.project_short_name, "proj-name");
     }
 
-    // --- compute_rows ---
+    // --- compute_rows: per-load attribution ---
 
     #[test]
-    fn compute_rows_routes_1h_kind_to_events_1h() {
+    fn compute_rows_credits_claude_md_once_per_session() {
+        // CLAUDE.md is always-loaded, so each in-scope session
+        // contributes exactly one load at the session's primary tier
+        // — never multiplied by per-session assistant-turn count.
+        // Two parent sessions on 1h tier → loads_1h = 2.
         let inv = vec![ctx_file(
             "/g/CLAUDE.md",
             ContextFileKind::GlobalClaudeMd,
@@ -705,10 +1158,10 @@ mod tests {
                 "a",
                 "2026-04-01T10:00:00Z",
                 Some("claude-opus-4-7"),
-                3,
-                7,
+                CacheTier::Long1h,
                 300,
-                700,
+                0,
+                Vec::new(),
             ),
             meta_with(
                 SessionKind::Parent,
@@ -717,60 +1170,152 @@ mod tests {
                 "b",
                 "2026-04-01T11:00:00Z",
                 Some("claude-opus-4-7"),
-                5,
-                11,
+                CacheTier::Long1h,
                 500,
-                1100,
+                0,
+                Vec::new(),
             ),
         ];
         let rows = compute_rows(inv, &metas, &sample_catalog());
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].events, 8, "1h-tier file must sum events_1h");
-        assert_eq!(rows[0].estimated_tokens_billed, 800);
+        assert_eq!(rows[0].loads_1h, 2);
+        assert_eq!(rows[0].loads_5m, 0);
+        assert_eq!(rows[0].estimated_tokens_billed, 200);
     }
 
     #[test]
-    fn compute_rows_routes_5m_kind_to_events_5m() {
+    fn compute_rows_credits_skill_per_on_demand_load() {
+        // A skill is credited once per matching OnDemandLoad. Three
+        // injections in a single session → loads_5m = 3.
         let inv = vec![ctx_file(
             "/g/skills/foo/SKILL.md",
             ContextFileKind::UserSkill,
             100,
             Scope::Global,
         )];
+        let metas = vec![meta_with(
+            SessionKind::Parent,
+            "s1",
+            Some(Path::new("/a")),
+            "a",
+            "2026-04-01T10:00:00Z",
+            Some("claude-opus-4-7"),
+            CacheTier::Long1h,
+            0,
+            300,
+            vec![skill_load("foo"), skill_load("foo"), skill_load("foo")],
+        )];
+        let rows = compute_rows(inv, &metas, &sample_catalog());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].loads_5m, 3);
+        assert_eq!(rows[0].loads_1h, 0);
+        assert_eq!(rows[0].estimated_tokens_billed, 300);
+    }
+
+    #[test]
+    fn compute_rows_credits_command_per_invocation() {
+        // Same per-load shape, but for a project-local command — the
+        // identifier comes from the file stem (`commands/foo.md` →
+        // `foo`).
+        let inv = vec![ctx_file(
+            "/proj/.claude/commands/foo.md",
+            ContextFileKind::ProjectLocalCommand,
+            50,
+            Scope::CwdSubtree {
+                root: PathBuf::from("/proj"),
+            },
+        )];
+        let metas = vec![meta_with(
+            SessionKind::Parent,
+            "s1",
+            Some(Path::new("/proj")),
+            "proj",
+            "2026-04-01T10:00:00Z",
+            Some("claude-opus-4-7"),
+            CacheTier::Long1h,
+            0,
+            100,
+            vec![command_load("foo"), command_load("foo")],
+        )];
+        let rows = compute_rows(inv, &metas, &sample_catalog());
+        assert_eq!(rows[0].loads_5m, 2);
+    }
+
+    #[test]
+    fn compute_rows_credits_agent_only_for_matching_subagent() {
+        // The bug-report regression: `tw-plan-reviewer.md` was
+        // crediting parent-session events. With per-load math, an
+        // agent file is credited only by a Subagent meta whose
+        // agent_type matches the file's identifier.
+        let inv = vec![
+            ctx_file(
+                "/g/agents/tw-code-reviewer.md",
+                ContextFileKind::UserAgent,
+                15,
+                Scope::Global,
+            ),
+            ctx_file(
+                "/g/agents/tw-plan-reviewer.md",
+                ContextFileKind::UserAgent,
+                17,
+                Scope::Global,
+            ),
+        ];
         let metas = vec![
+            // Parent never loads agent files — must contribute zero
+            // loads regardless of its primary tier.
             meta_with(
                 SessionKind::Parent,
-                "s1",
-                Some(Path::new("/a")),
-                "a",
+                "parent",
+                Some(Path::new("/proj")),
+                "proj",
                 "2026-04-01T10:00:00Z",
                 Some("claude-opus-4-7"),
-                3,
-                7,
-                300,
-                700,
+                CacheTier::Long1h,
+                500,
+                0,
+                Vec::new(),
             ),
             meta_with(
-                SessionKind::Parent,
-                "s2",
-                Some(Path::new("/b")),
-                "b",
-                "2026-04-01T11:00:00Z",
+                SessionKind::Subagent {
+                    agent_type: "tw-code-reviewer".to_string(),
+                },
+                "agent-1",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:01:00Z",
                 Some("claude-opus-4-7"),
-                5,
-                11,
-                500,
-                1100,
+                CacheTier::Short5m,
+                0,
+                100,
+                Vec::new(),
             ),
         ];
         let rows = compute_rows(inv, &metas, &sample_catalog());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].events, 18, "5m-tier file must sum events_5m");
-        assert_eq!(rows[0].estimated_tokens_billed, 1800);
+        let reviewer = rows
+            .iter()
+            .find(|r| r.file.path.ends_with("tw-code-reviewer.md"))
+            .unwrap();
+        let plan_reviewer = rows
+            .iter()
+            .find(|r| r.file.path.ends_with("tw-plan-reviewer.md"))
+            .unwrap();
+        assert_eq!(
+            reviewer.loads_5m, 1,
+            "matching subagent must credit the agent file once"
+        );
+        assert_eq!(reviewer.loads_1h, 0);
+        assert_eq!(
+            plan_reviewer.total_loads(),
+            0,
+            "non-matching agent file must NOT be credited (the bug-report regression)",
+        );
     }
 
     #[test]
     fn compute_rows_attributes_subtree_file_only_to_in_scope_sessions() {
+        // Out-of-scope sessions still don't contribute, even with the
+        // per-load math.
         let inv = vec![ctx_file(
             "/proj/CLAUDE.md",
             ContextFileKind::ProjectClaudeMd,
@@ -782,38 +1327,38 @@ mod tests {
         let metas = vec![
             meta_with(
                 SessionKind::Parent,
-                "s1",
+                "in-scope",
                 Some(Path::new("/proj/sub")),
                 "sub",
                 "2026-04-01T10:00:00Z",
                 Some("claude-opus-4-7"),
-                3,
-                0,
+                CacheTier::Long1h,
                 300,
                 0,
+                Vec::new(),
             ),
             meta_with(
                 SessionKind::Parent,
-                "s2",
+                "out-of-scope",
                 Some(Path::new("/other")),
                 "other",
                 "2026-04-01T11:00:00Z",
                 Some("claude-opus-4-7"),
-                5,
-                0,
+                CacheTier::Long1h,
                 500,
                 0,
+                Vec::new(),
             ),
         ];
         let rows = compute_rows(inv, &metas, &sample_catalog());
         assert_eq!(
-            rows[0].events, 3,
-            "out-of-scope session must not contribute"
+            rows[0].loads_1h, 1,
+            "out-of-scope session must not contribute",
         );
     }
 
     #[test]
-    fn compute_rows_prices_5m_at_5m_rate_not_1h() {
+    fn compute_rows_prices_skill_at_5m_rate_not_1h() {
         let inv = vec![ctx_file(
             "/g/skills/x/SKILL.md",
             ContextFileKind::UserSkill,
@@ -827,13 +1372,13 @@ mod tests {
             "a",
             "2026-04-01T10:00:00Z",
             Some("claude-opus-4-7"),
-            0,
-            1,
+            CacheTier::Long1h,
             0,
             1000,
+            vec![skill_load("x")],
         )];
         let rows = compute_rows(inv, &metas, &sample_catalog());
-        // 1000 * 1 events * 3.75e-6 (5m rate) = 0.00375; NOT 6e-6 (1h rate).
+        // 1000 tokens × 1 load × 3.75e-6 (5m rate) = 0.00375.
         let cost = rows[0].attributed_cost.expect("priced");
         assert!(
             (cost - 0.003_75).abs() < 1e-12,
@@ -843,6 +1388,10 @@ mod tests {
 
     #[test]
     fn compute_rows_collapses_cost_to_none_on_unknown_model() {
+        // One contributing session has an unknown model → row's cost
+        // collapses to None. Loads still count fully (the bug-report
+        // session's CLAUDE.md should still report its real load count
+        // even when the cost can't be priced).
         let inv = vec![ctx_file(
             "/g/CLAUDE.md",
             ContextFileKind::GlobalClaudeMd,
@@ -852,32 +1401,35 @@ mod tests {
         let metas = vec![
             meta_with(
                 SessionKind::Parent,
-                "s1",
+                "known",
                 Some(Path::new("/a")),
                 "a",
                 "2026-04-01T10:00:00Z",
                 Some("claude-opus-4-7"),
-                3,
-                0,
+                CacheTier::Long1h,
                 300,
                 0,
+                Vec::new(),
             ),
-            // Unknown model with non-zero events → row's cost = None.
             meta_with(
                 SessionKind::Parent,
-                "s2",
+                "unknown",
                 Some(Path::new("/b")),
                 "b",
                 "2026-04-01T11:00:00Z",
                 Some("claude-fake-9-9"),
-                5,
-                0,
+                CacheTier::Long1h,
                 500,
                 0,
+                Vec::new(),
             ),
         ];
         let rows = compute_rows(inv, &metas, &sample_catalog());
-        assert_eq!(rows[0].events, 8, "events sum still reflects both sessions");
+        assert_eq!(
+            rows[0].total_loads(),
+            2,
+            "loads count both sessions even when one collapses cost",
+        );
         assert!(
             rows[0].attributed_cost.is_none(),
             "unknown-model session must collapse cost"
@@ -885,25 +1437,77 @@ mod tests {
     }
 
     #[test]
-    fn compute_rows_sorts_descending_by_cost_then_tokens_then_path() {
-        // Three rows with distinct (cost, tokens, path) so the sort
-        // outcome is unambiguous.
+    fn compute_rows_mixed_tier_row_attributes_at_both_tiers() {
+        // CLAUDE.md loaded by a 1h-tier parent session AND a 5m-tier
+        // subagent session — `loads_1h` AND `loads_5m` both > 0,
+        // tier_label() = `1h+5m`, cost = sum across tiers.
+        let inv = vec![ctx_file(
+            "/g/CLAUDE.md",
+            ContextFileKind::GlobalClaudeMd,
+            100,
+            Scope::Global,
+        )];
+        let metas = vec![
+            meta_with(
+                SessionKind::Parent,
+                "parent",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:00:00Z",
+                Some("claude-opus-4-7"),
+                CacheTier::Long1h,
+                500,
+                0,
+                Vec::new(),
+            ),
+            meta_with(
+                SessionKind::Subagent {
+                    agent_type: "tw-code-reviewer".to_string(),
+                },
+                "subagent",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:01:00Z",
+                Some("claude-opus-4-7"),
+                CacheTier::Short5m,
+                0,
+                200,
+                Vec::new(),
+            ),
+        ];
+        let rows = compute_rows(inv, &metas, &sample_catalog());
+        assert_eq!(rows[0].loads_1h, 1);
+        assert_eq!(rows[0].loads_5m, 1);
+        assert_eq!(rows[0].tier_label(), "1h+5m");
+        // Cost = 100 × 1 × rate_1h + 100 × 1 × rate_5m
+        //      = 100 × 6e-6        + 100 × 3.75e-6
+        //      = 0.0006 + 0.000375 = 0.000975.
+        let cost = rows[0].attributed_cost.expect("priced");
+        assert!(
+            (cost - 0.000_975).abs() < 1e-12,
+            "got {cost}, expected sum across tiers",
+        );
+    }
+
+    #[test]
+    fn compute_rows_sorts_descending_by_cost_then_loads_then_tokens_then_path() {
+        // Four-key sort. Two rows with equal cost ($0) but different
+        // load counts must order the larger-loads row first; two
+        // rows with equal cost AND equal loads go by tokens then
+        // path.
         let inv = vec![
-            // tokens=200 with 1 event: cost = 200 * 1 * 6e-6 = 0.0012
             ctx_file(
                 "/aaa/CLAUDE.md",
                 ContextFileKind::GlobalClaudeMd,
                 200,
                 Scope::Global,
             ),
-            // tokens=100 with 1 event: cost = 100 * 1 * 6e-6 = 0.0006
             ctx_file(
                 "/bbb/CLAUDE.md",
                 ContextFileKind::GlobalClaudeMd,
                 100,
                 Scope::Global,
             ),
-            // tokens=200 with 0 events (different scope): cost = 0
             ctx_file(
                 "/ccc/proj/CLAUDE.md",
                 ContextFileKind::ProjectClaudeMd,
@@ -920,15 +1524,11 @@ mod tests {
             "scope",
             "2026-04-01T10:00:00Z",
             Some("claude-opus-4-7"),
-            1,
-            0,
+            CacheTier::Long1h,
             200,
             0,
+            Vec::new(),
         )];
-        // Run multiple times to confirm deterministic ordering.
-        // `ContextFile`'s `Clone` derive is `cfg(test)`-gated so
-        // `inv.clone()` works inside tests but production sites can't
-        // accidentally allocate.
         for _ in 0..5 {
             let rows = compute_rows(inv.clone(), &metas, &sample_catalog());
             assert_eq!(rows[0].file.path, PathBuf::from("/aaa/CLAUDE.md"));
@@ -938,22 +1538,143 @@ mod tests {
     }
 
     #[test]
-    fn compute_rows_includes_zero_event_in_scope_files() {
+    fn compute_rows_skips_session_with_zero_cache_activity() {
+        // Regression guard: a session that never emitted a single
+        // `cache_creation` event (e.g., a transient session opened
+        // and closed without firing the LLM) must NOT be credited
+        // with implicit CLAUDE.md / rule loads. The pre-fix code
+        // returned `(1, primary_tier)` unconditionally — even for
+        // observed_*_tokens == (0, 0) — silently inflating both row
+        // load counts and coverage's attributed numerator.
+        let inv = vec![
+            ctx_file(
+                "/g/CLAUDE.md",
+                ContextFileKind::GlobalClaudeMd,
+                100,
+                Scope::Global,
+            ),
+            ctx_file(
+                "/g/rules/r1.md",
+                ContextFileKind::UserRule,
+                50,
+                Scope::Global,
+            ),
+        ];
+        // Two sessions in scope: one with real cache activity, one
+        // with zero. Only the active one should credit loads.
+        let metas = vec![
+            meta_with(
+                SessionKind::Parent,
+                "active",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:00:00Z",
+                Some("claude-opus-4-7"),
+                CacheTier::Long1h,
+                500, // observed_1h > 0 → observed_tier() = Some(Long1h)
+                0,
+                Vec::new(),
+            ),
+            meta_with(
+                SessionKind::Parent,
+                "idle",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T11:00:00Z",
+                Some("claude-opus-4-7"),
+                CacheTier::Long1h,
+                0, // observed_1h == 0
+                0, // observed_5m == 0 → observed_tier() = None
+                Vec::new(),
+            ),
+        ];
+        let rows = compute_rows(inv, &metas, &sample_catalog());
+        let claude_md = rows
+            .iter()
+            .find(|r| r.file.path.ends_with("CLAUDE.md"))
+            .unwrap();
+        let rule = rows
+            .iter()
+            .find(|r| r.file.path.ends_with("r1.md"))
+            .unwrap();
+        assert_eq!(
+            claude_md.total_loads(),
+            1,
+            "zero-activity session must not credit always-loaded files",
+        );
+        assert_eq!(
+            rule.total_loads(),
+            1,
+            "zero-activity session must not credit always-loaded files",
+        );
+    }
+
+    #[test]
+    fn session_meta_observed_tier_returns_none_for_zero_activity() {
+        let m = meta_with(
+            SessionKind::Parent,
+            "idle",
+            Some(Path::new("/proj")),
+            "proj",
+            "2026-04-01T10:00:00Z",
+            Some("claude-opus-4-7"),
+            CacheTier::Long1h,
+            0,
+            0,
+            Vec::new(),
+        );
+        assert!(m.observed_tier().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn session_meta_observed_tier_returns_some_when_either_tier_observed() {
+        // Either side non-zero → observed_tier returns Some(primary_tier).
+        let only_1h = meta_with(
+            SessionKind::Parent,
+            "s",
+            Some(Path::new("/p")),
+            "p",
+            "2026-04-01T10:00:00Z",
+            Some("claude-opus-4-7"),
+            CacheTier::Long1h,
+            100,
+            0,
+            Vec::new(),
+        );
+        assert_eq!(only_1h.observed_tier(), Some(CacheTier::Long1h));
+
+        let only_5m = meta_with(
+            SessionKind::Parent,
+            "s",
+            Some(Path::new("/p")),
+            "p",
+            "2026-04-01T10:00:00Z",
+            Some("claude-opus-4-7"),
+            CacheTier::Short5m,
+            0,
+            100,
+            Vec::new(),
+        );
+        assert_eq!(only_5m.observed_tier(), Some(CacheTier::Short5m));
+    }
+
+    #[test]
+    fn compute_rows_includes_zero_load_in_scope_files() {
         let inv = vec![ctx_file(
             "/g/CLAUDE.md",
             ContextFileKind::GlobalClaudeMd,
             100,
             Scope::Global,
         )];
-        // No sessions → zero events.
+        // No sessions → zero loads.
         let rows = compute_rows(inv, &[], &sample_catalog());
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].events, 0);
+        assert_eq!(rows[0].total_loads(), 0);
         assert_eq!(rows[0].estimated_tokens_billed, 0);
         assert_eq!(rows[0].attributed_cost, Some(0.0));
+        assert_eq!(rows[0].tier_label(), "—");
     }
-
-    // --- SessionKind plumbing ---
 
     #[test]
     fn session_meta_from_turns_propagates_subagent_kind() {
@@ -980,91 +1701,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn compute_rows_phase1_ignores_subagent_metas() {
-        // Phase 1 behavior-preservation guard: a subagent-kind meta
-        // contributes nothing to the row totals. Phase 2 will rewire
-        // the math to credit subagents per actual load.
-        let inv = vec![ctx_file(
-            "/g/CLAUDE.md",
-            ContextFileKind::GlobalClaudeMd,
-            100,
-            Scope::Global,
-        )];
-        let metas = vec![
-            meta_with(
-                SessionKind::Parent,
-                "parent",
-                Some(Path::new("/proj")),
-                "proj",
-                "2026-04-01T10:00:00Z",
-                Some("claude-opus-4-7"),
-                2,
-                0,
-                200,
-                0,
-            ),
-            meta_with(
-                SessionKind::Subagent {
-                    agent_type: "tw-code-reviewer".to_string(),
-                },
-                "agent-1",
-                Some(Path::new("/proj")),
-                "proj",
-                "2026-04-01T10:01:00Z",
-                Some("claude-opus-4-7"),
-                3,
-                0,
-                300,
-                0,
-            ),
-        ];
-        let rows = compute_rows(inv, &metas, &sample_catalog());
-        assert_eq!(
-            rows[0].events, 2,
-            "subagent meta must NOT contribute in Phase 1; events should equal parent's events_1h alone",
-        );
-    }
-
-    #[test]
-    fn compute_coverage_phase1_ignores_subagent_metas() {
-        // Behavior-preservation guard for the coverage denominator:
-        // subagent observed tokens stay out of the sum until Phase 2.
-        let metas = vec![
-            meta_with(
-                SessionKind::Parent,
-                "parent",
-                Some(Path::new("/proj")),
-                "proj",
-                "2026-04-01T10:00:00Z",
-                Some("claude-opus-4-7"),
-                0,
-                0,
-                500,
-                0,
-            ),
-            meta_with(
-                SessionKind::Subagent {
-                    agent_type: "tw-code-reviewer".to_string(),
-                },
-                "agent-1",
-                Some(Path::new("/proj")),
-                "proj",
-                "2026-04-01T10:01:00Z",
-                Some("claude-opus-4-7"),
-                0,
-                0,
-                999, // would inflate coverage if counted
-                0,
-            ),
-        ];
-        let cov = compute_coverage(&metas, &[]);
-        assert_eq!(
-            cov.long_1h.observed_tokens, 500,
-            "subagent observed tokens must NOT enter the denominator in Phase 1",
-        );
-    }
-
     // --- compute_coverage ---
 
     #[test]
@@ -1086,12 +1722,12 @@ mod tests {
             "a",
             "2026-04-01T10:00:00Z",
             Some("claude-opus-4-7"),
-            0,
-            0,
+            CacheTier::Long1h,
             5_000, // observed_1h
             2_000, // observed_5m
+            Vec::new(),
         )];
-        // Hand-crafted rows with known attributed sums per tier.
+        // Hand-crafted rows with known per-tier load counts.
         let rows = vec![
             AttributionRow {
                 file: ctx_file(
@@ -1100,7 +1736,8 @@ mod tests {
                     100,
                     Scope::Global,
                 ),
-                events: 40,
+                loads_1h: 40,
+                loads_5m: 0,
                 estimated_tokens_billed: 4_000,
                 attributed_cost: Some(0.0),
             },
@@ -1111,7 +1748,8 @@ mod tests {
                     50,
                     Scope::Global,
                 ),
-                events: 30,
+                loads_1h: 0,
+                loads_5m: 30,
                 estimated_tokens_billed: 1_500,
                 attributed_cost: Some(0.0),
             },
@@ -1126,19 +1764,54 @@ mod tests {
     }
 
     #[test]
+    fn compute_coverage_includes_subagent_observed_tokens() {
+        // Phase 2 contract: subagent observed tokens DO enter the
+        // denominator (Phase 1 was a temporary gate to keep the
+        // snapshot stable during the structural refactor).
+        let metas = vec![
+            meta_with(
+                SessionKind::Parent,
+                "parent",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:00:00Z",
+                Some("claude-opus-4-7"),
+                CacheTier::Long1h,
+                500,
+                0,
+                Vec::new(),
+            ),
+            meta_with(
+                SessionKind::Subagent {
+                    agent_type: "tw-code-reviewer".to_string(),
+                },
+                "subagent",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:01:00Z",
+                Some("claude-opus-4-7"),
+                CacheTier::Short5m,
+                0,
+                200,
+                Vec::new(),
+            ),
+        ];
+        let cov = compute_coverage(&metas, &[]);
+        assert_eq!(cov.long_1h.observed_tokens, 500);
+        assert_eq!(
+            cov.short_5m.observed_tokens, 200,
+            "subagent's 5m observed tokens must enter the denominator",
+        );
+    }
+
+    #[test]
     #[allow(clippy::similar_names)]
     fn compute_coverage_observed_sums_match_independent_per_tier_sum() {
         // Fixed-point invariant for the observed-token side: build a
         // Vec<Turn> with deterministic per-tier contributions, sum
         // them by hand, then run the same turns through
         // session_meta_from_turns + compute_coverage and assert the
-        // reported observed_*_tokens match. Catches regressions in
-        // session_meta_from_turns's per-tier sums and in the
-        // parsing → SessionMeta → CoverageStats flow.
-        //
-        // The attributed-token side of compute_coverage is exercised
-        // by compute_coverage_ratios_correctly_per_tier, which
-        // hand-crafts rows with known tier sums.
+        // reported observed_*_tokens match.
         //
         // Per-turn (5m, 1h) contributions:
         // (50, 100), (200, _), (_, 250), no-usage, (100, 75).
@@ -1149,7 +1822,6 @@ mod tests {
             assistant_turn_no_usage("2026-04-01T10:03:00Z", Some("claude-opus-4-7")),
             assistant_turn("2026-04-01T10:04:00Z", Some("claude-opus-4-7"), 100, 75),
         ];
-        // Independently summed (omitting the zero contributions).
         let expected_1h: u64 = 100 + 250 + 75;
         let expected_5m: u64 = 50 + 200 + 100;
         assert_eq!(expected_1h, 425);
@@ -1182,10 +1854,10 @@ mod tests {
             "a",
             "2026-04-01T10:00:00Z",
             None,
+            CacheTier::Long1h,
             0,
             0,
-            0,
-            0,
+            Vec::new(),
         );
         let other = meta_with(
             SessionKind::Parent,
@@ -1194,10 +1866,10 @@ mod tests {
             "a",
             "2026-04-01T10:00:00Z",
             None,
+            CacheTier::Long1h,
             0,
             0,
-            0,
-            0,
+            Vec::new(),
         );
         assert!(filter.accepts(&target));
         assert!(!filter.accepts(&other));
@@ -1217,10 +1889,10 @@ mod tests {
             "a",
             "2026-04-10T00:00:00Z",
             None,
+            CacheTier::Long1h,
             0,
             0,
-            0,
-            0,
+            Vec::new(),
         );
         let on_until = meta_with(
             SessionKind::Parent,
@@ -1229,10 +1901,10 @@ mod tests {
             "a",
             "2026-04-20T00:00:00Z",
             None,
+            CacheTier::Long1h,
             0,
             0,
-            0,
-            0,
+            Vec::new(),
         );
         let before = meta_with(
             SessionKind::Parent,
@@ -1241,10 +1913,10 @@ mod tests {
             "a",
             "2026-04-09T23:59:59Z",
             None,
+            CacheTier::Long1h,
             0,
             0,
-            0,
-            0,
+            Vec::new(),
         );
         let after = meta_with(
             SessionKind::Parent,
@@ -1253,10 +1925,10 @@ mod tests {
             "a",
             "2026-04-20T00:00:01Z",
             None,
+            CacheTier::Long1h,
             0,
             0,
-            0,
-            0,
+            Vec::new(),
         );
         assert!(filter.accepts(&on_since));
         assert!(filter.accepts(&on_until));
@@ -1277,10 +1949,10 @@ mod tests {
             "foo",
             "2026-04-01T10:00:00Z",
             None,
+            CacheTier::Long1h,
             0,
             0,
-            0,
-            0,
+            Vec::new(),
         );
         let bar = meta_with(
             SessionKind::Parent,
@@ -1289,10 +1961,10 @@ mod tests {
             "bar",
             "2026-04-01T10:00:00Z",
             None,
+            CacheTier::Long1h,
             0,
             0,
-            0,
-            0,
+            Vec::new(),
         );
         assert!(filter.accepts(&foo));
         assert!(!filter.accepts(&bar));

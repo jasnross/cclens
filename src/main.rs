@@ -210,9 +210,9 @@ fn run_inputs(
 
 /// Read a single subagent's transcript and return its `SessionMeta`.
 ///
-/// Phase 1 contract: an absent or unreadable `.meta.json` sidecar
-/// causes the subagent to be skipped entirely (returns `None`). v2
-/// could fall back to correlating against the parent's
+/// An absent or unreadable `.meta.json` sidecar causes the subagent
+/// to be skipped entirely (returns `None`); a future version could
+/// fall back to correlating against the parent's
 /// `tool_result.agentId` if the sidecar shape regresses or older
 /// installs ship without one — out of scope for now.
 ///

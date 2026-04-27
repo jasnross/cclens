@@ -23,7 +23,7 @@ use crate::aggregation::{Exchange, exchange_filter_totals, user_display_string};
 use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
 use crate::domain::{CacheCreation, Session, Turn, Usage};
 use crate::filter::Thresholds;
-use crate::inventory::{CacheTier, ContextFileKind};
+use crate::inventory::ContextFileKind;
 use crate::pricing::PricingCatalog;
 
 const TITLE_MAX_CHARS: usize = 80;
@@ -45,11 +45,11 @@ const SHOW_CUMULATIVE_COL_INDEX: usize = 4;
 const SHOW_CUM_COST_COL_INDEX: usize = 5;
 
 // `inputs` view column indices. Header order:
-//   file | kind | tier | tokens | events | billed | attributed_cost
+//   file | kind | tier | tokens | loads | billed | attributed_cost
 // Note that the `tier` column shifts the numeric columns one slot
 // right vs. the original (no-tier) header layout.
 const INPUTS_TOKENS_COL_INDEX: usize = 3;
-const INPUTS_EVENTS_COL_INDEX: usize = 4;
+const INPUTS_LOADS_COL_INDEX: usize = 4;
 const INPUTS_BILLED_COL_INDEX: usize = 5;
 const INPUTS_ATTRIBUTED_COST_COL_INDEX: usize = 6;
 
@@ -371,7 +371,7 @@ pub fn render_inputs(rows: &[AttributionRow], coverage: &CoverageStats) -> Strin
         "kind",
         "tier",
         "tokens",
-        "events",
+        "loads",
         "billed",
         "attributed_cost",
     ]);
@@ -379,16 +379,16 @@ pub fn render_inputs(rows: &[AttributionRow], coverage: &CoverageStats) -> Strin
         table.add_row(vec![
             pretty_path(&row.file.path),
             kind_label(&row.file.kind),
-            tier_label(row.file.kind.tier()),
+            row.tier_label().to_string(),
             row.file.tokens.to_string(),
-            row.events.to_string(),
+            row.total_loads().to_string(),
             row.estimated_tokens_billed.to_string(),
             format_cost_opt(row.attributed_cost),
         ]);
     }
     for idx in [
         INPUTS_TOKENS_COL_INDEX,
-        INPUTS_EVENTS_COL_INDEX,
+        INPUTS_LOADS_COL_INDEX,
         INPUTS_BILLED_COL_INDEX,
         INPUTS_ATTRIBUTED_COST_COL_INDEX,
     ] {
@@ -417,13 +417,6 @@ fn kind_label(kind: &ContextFileKind) -> String {
         ContextFileKind::ProjectLocalCommand => "project:command".to_string(),
         ContextFileKind::ProjectLocalRule => "project:rule".to_string(),
         ContextFileKind::ProjectLocalAgent => "project:agent".to_string(),
-    }
-}
-
-fn tier_label(tier: CacheTier) -> String {
-    match tier {
-        CacheTier::Long1h => "1h".to_string(),
-        CacheTier::Short5m => "5m".to_string(),
     }
 }
 
@@ -1020,11 +1013,13 @@ mod tests {
     use crate::attribution::TierCoverage;
     use crate::inventory::{ContextFile, ContextFileKind, Scope};
 
+    #[allow(clippy::similar_names)]
     fn inputs_row(
         path: &str,
         kind: ContextFileKind,
         tokens: u64,
-        events: u64,
+        loads_1h: u64,
+        loads_5m: u64,
         billed: u64,
         cost: Option<f64>,
     ) -> AttributionRow {
@@ -1035,7 +1030,8 @@ mod tests {
                 tokens,
                 scope: Scope::Global,
             },
-            events,
+            loads_1h,
+            loads_5m,
             estimated_tokens_billed: billed,
             attributed_cost: cost,
         }
@@ -1065,11 +1061,13 @@ mod tests {
 
     #[test]
     fn render_inputs_renders_header_and_rows() {
+        // Single 1h-tier load → loads_1h=5, loads_5m=0; tier_label() = "1h".
         let rows = vec![inputs_row(
             "/some/CLAUDE.md",
             ContextFileKind::GlobalClaudeMd,
             100,
             5,
+            0,
             500,
             Some(0.003),
         )];
@@ -1080,7 +1078,7 @@ mod tests {
             "kind",
             "tier",
             "tokens",
-            "events",
+            "loads",
             "billed",
             "attributed_cost",
         ] {
@@ -1097,14 +1095,15 @@ mod tests {
     #[test]
     fn render_inputs_right_aligns_numeric_columns() {
         // Two rows with very different scalar widths; the
-        // events/billed/cost columns must right-align so each row's
-        // prefix-up-to-events ends at the same character count.
+        // loads/billed/cost columns must right-align so each row's
+        // prefix-up-to-loads ends at the same character count.
         let rows = vec![
             inputs_row(
                 "/a/CLAUDE.md",
                 ContextFileKind::GlobalClaudeMd,
                 9,
                 9,
+                0,
                 81,
                 Some(0.001),
             ),
@@ -1113,6 +1112,7 @@ mod tests {
                 ContextFileKind::GlobalClaudeMd,
                 123_456,
                 123_456,
+                0,
                 15_241_383_936,
                 Some(123.4567),
             ),
@@ -1124,8 +1124,8 @@ mod tests {
             .filter(|l| l.contains("/a/CLAUDE.md") || l.contains("/b/CLAUDE.md"))
             .collect();
         assert_eq!(data_lines.len(), 2);
-        // Strip from the right: cost cell, billed cell, events cell —
-        // what remains should end at the events column's right edge.
+        // Strip from the right: cost cell, billed cell, loads cell —
+        // what remains should end at the loads column's right edge.
         let strip = |l: &str| -> usize {
             let trimmed = l.trim_end();
             // Cost is the last cell; strip it off.
@@ -1153,12 +1153,59 @@ mod tests {
             ContextFileKind::GlobalClaudeMd,
             100,
             5,
+            0,
             500,
             None,
         )];
         let cov = cov_with(0, 0, None, 0, 0, None);
         let out = render_inputs(&rows, &cov);
         assert!(out.contains('—'), "expected em-dash; got:\n{out}");
+    }
+
+    #[test]
+    fn render_inputs_renders_mixed_tier_label() {
+        // Loaded at both 1h (parent) and 5m (subagent) — tier column
+        // should render `1h+5m` rather than collapsing to one tier.
+        let rows = vec![inputs_row(
+            "/some/CLAUDE.md",
+            ContextFileKind::GlobalClaudeMd,
+            100,
+            1,
+            1,
+            200,
+            Some(0.0012),
+        )];
+        let cov = cov_with(0, 0, None, 0, 0, None);
+        let out = render_inputs(&rows, &cov);
+        assert!(
+            out.contains("1h+5m"),
+            "expected mixed tier label `1h+5m`; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn render_inputs_renders_em_dash_tier_for_unloaded_row() {
+        // In-scope file that no session loaded — both load counts
+        // are 0 and the tier column collapses to `—`.
+        let rows = vec![inputs_row(
+            "/some/agents/never-invoked.md",
+            ContextFileKind::UserAgent,
+            42,
+            0,
+            0,
+            0,
+            Some(0.0),
+        )];
+        let cov = cov_with(0, 0, None, 0, 0, None);
+        let out = render_inputs(&rows, &cov);
+        let agent_line = out
+            .lines()
+            .find(|l| l.contains("never-invoked.md"))
+            .expect("agent row present");
+        assert!(
+            agent_line.contains('—'),
+            "expected em-dash tier for unloaded row; got: {agent_line}",
+        );
     }
 
     #[test]

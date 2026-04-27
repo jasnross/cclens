@@ -260,19 +260,20 @@ fn inputs_coverage_indicator_renders_both_tier_ratios() {
 
 #[test]
 fn inputs_handles_unknown_model_session_with_em_dash() {
-    // Skills (5m-tier) get all their events from session C which
-    // has unknown model — every 5m row's cost should collapse to —.
+    // Per-load math: session C (claude-fake-9-9) attributes its
+    // CLAUDE.md/rule loads at the 5m tier (its primary_tier) because
+    // its only cache_creation event is 5m. The unknown model
+    // collapses cost on every row session C touches — so the global
+    // CLAUDE.md and global rule rows render `—` in the cost column
+    // (they're loaded by session C *and* the priced sessions A/B).
     let (stdout, _) = run_inputs(&[]);
-    // Locate by kind+tier rather than file name (path truncates).
-    // The `skill` kind label paired with `5m` tier is unique to
-    // user/global skills.
-    let skill_row = stdout
+    let global_row = stdout
         .lines()
-        .find(|l| l.contains(" skill ") && l.contains(" 5m "))
-        .unwrap_or_else(|| panic!("user-skill row missing:\n{stdout}"));
+        .find(|l| l.contains(" global "))
+        .unwrap_or_else(|| panic!("global CLAUDE.md row missing:\n{stdout}"));
     assert!(
-        skill_row.contains('—'),
-        "skill row priced via unknown-model session should show em-dash; got: {skill_row}",
+        global_row.contains('—'),
+        "global CLAUDE.md (loaded by unknown-model session C) should show em-dash cost; got: {global_row}",
     );
 }
 
@@ -317,18 +318,19 @@ fn inputs_observed_1h_matches_jsonl_sum_under_filters() {
 }
 
 #[test]
-fn inputs_with_subagents_directory_does_not_perturb_output() {
-    // Phase 1 behavior-preservation contract: discovery now walks
-    // `<session_stem>/subagents/` for subagent transcripts, but
-    // `compute_rows`/`compute_coverage` skip subagent metas. The
-    // rendered output of `cclens inputs` against a project carrying a
-    // populated `subagents/` directory must therefore be byte-identical
-    // to the same project without it.
+fn inputs_subagent_credits_matching_agent_and_extra_load_for_always_loaded_files() {
+    // Phase 2 contract: a subagent transcript credits the matching
+    // agent file (via `agentType` in `.meta.json`) and contributes
+    // one additional load to every always-loaded file in scope
+    // (CLAUDE.md, rules). It also enters the 5m observed-tokens sum.
     //
-    // We assert this by copying the `inputs-projects` fixture into a
-    // tempdir, planting a subagent JSONL + meta.json under one
-    // session's `<stem>/subagents/`, and comparing rendered stdout
-    // with and without the planted subagent directory present.
+    // We assert this by comparing two runs: vanilla fixture vs.
+    // fixture with one planted subagent. Specific deltas:
+    //   - test-agent row: 0 loads → 1 load.
+    //   - global CLAUDE.md: loads += 1 (now 4 instead of 3).
+    //   - 5m observed tokens: += 50 (subagent's ephemeral_5m).
+    //   - cclens list output stays identical (subagents aren't
+    //     standalone sessions for the listing browser).
     let cache = isolated_tempdir();
     let claude_home_owner = isolated_tempdir();
     let claude_home = build_inputs_claude_home(claude_home_owner.path());
@@ -340,7 +342,9 @@ fn inputs_with_subagents_directory_does_not_perturb_output() {
     let baseline = run_inputs_against(cache.path(), &claude_home, &projects_a);
 
     // Run #2: same fixture with a subagent JSONL + meta.json planted
-    // under one session's <stem>/subagents/ directory.
+    // under one session's <stem>/subagents/ directory. The subagent
+    // references `agentType: test-agent` (matches the inventory's
+    // agents/test-agent.md → identifier "test-agent").
     let projects_owner_b = isolated_tempdir();
     let projects_b = projects_owner_b.path().join("inputs-projects");
     copy_dir_recursive(&inputs_projects_fixture_dir(), &projects_b);
@@ -352,8 +356,6 @@ fn inputs_with_subagents_directory_does_not_perturb_output() {
     fs::create_dir_all(&subagents_dir).expect("create subagents dir");
     fs::write(
         subagents_dir.join("agent-1.jsonl"),
-        // One assistant turn with non-zero ephemeral_5m so a Phase 2
-        // attribution would credit the test-agent — Phase 1 must NOT.
         r#"{"type":"user","timestamp":"2026-04-15T10:02:00Z","cwd":"/proj-a","message":{"content":"sub"}}
 {"type":"assistant","timestamp":"2026-04-15T10:02:05Z","cwd":"/proj-a","message":{"id":"msg_sub1","model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":50,"ephemeral_1h_input_tokens":0},"cache_read_input_tokens":0},"content":[{"type":"text","text":"sub-reply"}]},"requestId":"req_sub1"}
 "#,
@@ -366,22 +368,60 @@ fn inputs_with_subagents_directory_does_not_perturb_output() {
     .expect("write subagent meta");
     let with_subagents = run_inputs_against(cache.path(), &claude_home, &projects_b);
 
+    // Cell extraction: rows are space-separated; cell at index 4 is
+    // `loads`. Locate by kind label since paths truncate.
+    let loads_for_kind = |stdout: &str, kind: &str| -> u64 {
+        let row = stdout
+            .lines()
+            .find(|l| l.contains(&format!(" {kind} ")))
+            .unwrap_or_else(|| panic!("row for kind `{kind}` missing in:\n{stdout}"));
+        row.split_whitespace()
+            .nth(4)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("could not parse loads cell from row: {row}"))
+    };
+
+    let baseline_global_loads = loads_for_kind(&baseline, "global");
+    let with_global_loads = loads_for_kind(&with_subagents, "global");
     assert_eq!(
-        baseline, with_subagents,
-        "Phase 1 contract: presence of <stem>/subagents/ must NOT \
-         perturb cclens inputs output. Diff between runs:\n\n\
-         --- baseline ---\n{baseline}\n\
-         --- with subagents ---\n{with_subagents}",
+        with_global_loads,
+        baseline_global_loads + 1,
+        "subagent should add one load to the global CLAUDE.md row\n\nbaseline:\n{baseline}\n\nwith subagents:\n{with_subagents}",
     );
 
-    // Spot-check that the `cclens list` view is also byte-identical —
-    // it explicitly ignores subagents (they are partitions of the
-    // parent, not standalone sessions).
+    let baseline_agent_loads = loads_for_kind(&baseline, "agent");
+    let with_agent_loads = loads_for_kind(&with_subagents, "agent");
+    assert_eq!(
+        baseline_agent_loads, 0,
+        "no subagent → no agent load attributed",
+    );
+    assert_eq!(
+        with_agent_loads, 1,
+        "matching subagent should credit the agent file once\n\n{with_subagents}",
+    );
+
+    // 5m observed tokens delta: subagent contributed 50 ephemeral_5m
+    // tokens. Parse the coverage line to verify it lands in the
+    // denominator.
+    let baseline_cov = coverage_line(&baseline);
+    let with_cov = coverage_line(&with_subagents);
+    let (_, baseline_5m) = parse_coverage(baseline_cov);
+    let (_, with_5m) = parse_coverage(with_cov);
+    let (_, baseline_5m_obs) = baseline_5m.expect("5m observed in baseline");
+    let (_, with_5m_obs) = with_5m.expect("5m observed with subagent");
+    assert_eq!(
+        with_5m_obs,
+        baseline_5m_obs + 50,
+        "subagent's 50 ephemeral_5m tokens must enter the 5m denominator",
+    );
+
+    // cclens list view stays byte-identical — subagents aren't
+    // standalone sessions for the listing browser.
     let baseline_list = run_list_against(cache.path(), &projects_a);
     let with_subagents_list = run_list_against(cache.path(), &projects_b);
     assert_eq!(
         baseline_list, with_subagents_list,
-        "cclens list output must also stay byte-identical",
+        "cclens list output must stay byte-identical when only subagents are added",
     );
 }
 

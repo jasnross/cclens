@@ -27,8 +27,9 @@ use serde::Deserialize;
 
 // ---- core types ----
 
-/// Categorical kind of a discovered context file. Drives both the cache
-/// tier (via `tier()`) and the rendering label.
+/// Categorical kind of a discovered context file. Drives the
+/// rendering label and the per-load attribution dispatch in
+/// `attribution::compute_rows`.
 ///
 /// Variants with `plugin` / `marketplace` fields carry the
 /// `<plugin>@<marketplace>` parts parsed out of the
@@ -70,48 +71,24 @@ pub enum ContextFileKind {
     ProjectLocalAgent,
 }
 
-/// Which prompt-cache tier a context file's tokens are billed against
-/// when the harness loads it.
+/// Which prompt-cache tier a `cache_creation` event was billed against.
 ///
-/// Routing rule (single source of truth in
-/// `ContextFileKind::tier()`): system-prompt-region content
-/// (`CLAUDE.md`, rules, agents) sits in the 1h tier alongside the
-/// built-in system prompt; on-demand mid-conversation content (skills,
-/// commands loaded by slash invocation) sits in the 5m tier.
+/// Tier is a property of the load *event*, not of the file body —
+/// `attribution::SessionMeta::primary_tier` and
+/// `OnDemandLoad::tier` carry the tier per session / per load. A
+/// single file (e.g. CLAUDE.md) can attribute at 1h in one session
+/// and 5m in another (parent session uses 1h, subagent uses 5m).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTier {
-    /// System-prompt region: `CLAUDE.md`, rules, agents. Billed at the
-    /// 1h cache-creation rate.
+    /// System-prompt region tier — billed at the 1h cache-creation
+    /// rate. Always-loaded content (`CLAUDE.md`, rules) and matched
+    /// agent files attribute here in parent sessions.
     Long1h,
-    /// On-demand mid-conversation content: skills, commands. Billed at
-    /// the 5m cache-creation rate.
+    /// On-demand / in-conversation cache point tier — billed at the
+    /// 5m cache-creation rate. Skill / command bodies attribute here
+    /// (per the harness's observed convention), as do always-loaded
+    /// files in subagent sessions whose `primary_tier` is 5m.
     Short5m,
-}
-
-impl ContextFileKind {
-    /// Which cache tier the harness routes this kind into.
-    ///
-    /// Single mapping point — every consumer that needs to know a
-    /// file's tier calls this method. Adding a new variant forces a
-    /// compile-time update at this match arm via
-    /// `wildcard_enum_match_arm`.
-    #[must_use]
-    pub fn tier(&self) -> CacheTier {
-        match self {
-            Self::GlobalClaudeMd
-            | Self::UserRule
-            | Self::UserAgent
-            | Self::PluginRule { .. }
-            | Self::PluginAgent { .. }
-            | Self::ProjectClaudeMd
-            | Self::ProjectLocalRule
-            | Self::ProjectLocalAgent => CacheTier::Long1h,
-            Self::UserSkill
-            | Self::PluginSkill { .. }
-            | Self::ProjectLocalSkill
-            | Self::ProjectLocalCommand => CacheTier::Short5m,
-        }
-    }
 }
 
 /// In-scope predicate for a `ContextFile`. The walker produces this
@@ -145,9 +122,12 @@ impl Scope {
 /// One discovered context file with everything `attribution` needs to
 /// price it.
 ///
-/// `tier` is intentionally not a field — derive it from
-/// `kind.tier()` at the use site so it can't drift out of sync with
-/// the kind.
+/// `tier` is intentionally not a field — under the per-load attribution
+/// model the cache tier comes from session evidence (the
+/// `cache_creation` event the load triggered), not from a property of
+/// the file itself. `attribution::compute_rows` reads the tier off
+/// each `SessionMeta`'s `primary_tier` / `OnDemandLoad.tier` rather
+/// than off `ContextFileKind`.
 ///
 /// `Clone` is `cfg(test)`-only — production code consumes
 /// `ContextFile` exactly once via `compute_rows`.
@@ -158,6 +138,53 @@ pub struct ContextFile {
     pub kind: ContextFileKind,
     pub tokens: u64,
     pub scope: Scope,
+}
+
+impl ContextFile {
+    /// The harness-name a session's `Turn.content` evidence will refer
+    /// to this file by, or `None` for always-loaded kinds (CLAUDE.md
+    /// and rules) where evidence isn't keyed by name.
+    ///
+    /// Mapping:
+    /// - Agent kinds (`UserAgent`, `PluginAgent`, `ProjectLocalAgent`):
+    ///   the file stem (`tw-code-reviewer.md` → `tw-code-reviewer`),
+    ///   matched against `SessionKind::Subagent { agent_type }`.
+    /// - Skill kinds (`UserSkill`, `PluginSkill`,
+    ///   `ProjectLocalSkill`): the parent directory's name (skills are
+    ///   subdir-keyed at `<root>/skills/<name>/SKILL.md`), matched
+    ///   against the path that follows the `Base directory for this
+    ///   skill: ` prefix in user-turn content.
+    /// - `ProjectLocalCommand`: the file stem
+    ///   (`commands/foo.md` → `foo`), matched against the
+    ///   `<command-name>/foo</command-name>` tag in user-turn content.
+    /// - Always-loaded kinds (`GlobalClaudeMd`, `ProjectClaudeMd`,
+    ///   `UserRule`, `PluginRule`, `ProjectLocalRule`): `None`. These
+    ///   files load once per session (parent + each subagent that
+    ///   inherits scope) regardless of any harness identifier.
+    #[must_use]
+    pub fn identifier(&self) -> Option<String> {
+        match &self.kind {
+            ContextFileKind::UserAgent
+            | ContextFileKind::PluginAgent { .. }
+            | ContextFileKind::ProjectLocalAgent
+            | ContextFileKind::ProjectLocalCommand => self
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned()),
+            ContextFileKind::UserSkill
+            | ContextFileKind::PluginSkill { .. }
+            | ContextFileKind::ProjectLocalSkill => self
+                .path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned()),
+            ContextFileKind::GlobalClaudeMd
+            | ContextFileKind::ProjectClaudeMd
+            | ContextFileKind::UserRule
+            | ContextFileKind::PluginRule { .. }
+            | ContextFileKind::ProjectLocalRule => None,
+        }
+    }
 }
 
 /// Overridable filesystem roots for the walker. In production, callers
@@ -849,52 +876,117 @@ mod tests {
         assert!(!s.matches(Path::new("/a/c")));
     }
 
-    // --- ContextFileKind::tier ---
+    // --- ContextFile::identifier ---
+
+    fn ctx(path: &str, kind: ContextFileKind) -> ContextFile {
+        ContextFile {
+            path: PathBuf::from(path),
+            kind,
+            tokens: 0,
+            scope: Scope::Global,
+        }
+    }
 
     #[test]
-    fn context_file_kind_tier_routes_system_prompt_region_to_long_1h() {
-        assert_eq!(ContextFileKind::GlobalClaudeMd.tier(), CacheTier::Long1h);
-        assert_eq!(ContextFileKind::UserRule.tier(), CacheTier::Long1h);
-        assert_eq!(ContextFileKind::UserAgent.tier(), CacheTier::Long1h);
-        assert_eq!(ContextFileKind::ProjectClaudeMd.tier(), CacheTier::Long1h);
-        assert_eq!(ContextFileKind::ProjectLocalRule.tier(), CacheTier::Long1h);
-        assert_eq!(ContextFileKind::ProjectLocalAgent.tier(), CacheTier::Long1h);
+    fn identifier_returns_file_stem_for_agent_kinds() {
         assert_eq!(
-            ContextFileKind::PluginRule {
-                plugin: "p".into(),
-                marketplace: "m".into()
-            }
-            .tier(),
-            CacheTier::Long1h
+            ctx("/g/agents/tw-code-reviewer.md", ContextFileKind::UserAgent)
+                .identifier()
+                .as_deref(),
+            Some("tw-code-reviewer"),
         );
         assert_eq!(
-            ContextFileKind::PluginAgent {
-                plugin: "p".into(),
-                marketplace: "m".into()
-            }
-            .tier(),
-            CacheTier::Long1h
+            ctx(
+                "/proj/.claude/agents/local-helper.md",
+                ContextFileKind::ProjectLocalAgent
+            )
+            .identifier()
+            .as_deref(),
+            Some("local-helper"),
+        );
+        assert_eq!(
+            ctx(
+                "/cache/plug/agents/some-agent.md",
+                ContextFileKind::PluginAgent {
+                    plugin: "p".into(),
+                    marketplace: "m".into()
+                }
+            )
+            .identifier()
+            .as_deref(),
+            Some("some-agent"),
         );
     }
 
     #[test]
-    fn context_file_kind_tier_routes_on_demand_to_short_5m() {
-        assert_eq!(ContextFileKind::UserSkill.tier(), CacheTier::Short5m);
+    fn identifier_returns_file_stem_for_command_kind() {
         assert_eq!(
-            ContextFileKind::ProjectLocalSkill.tier(),
-            CacheTier::Short5m
+            ctx(
+                "/proj/.claude/commands/foo.md",
+                ContextFileKind::ProjectLocalCommand
+            )
+            .identifier()
+            .as_deref(),
+            Some("foo"),
+        );
+    }
+
+    #[test]
+    fn identifier_returns_parent_dir_name_for_skill_kinds() {
+        // Skills are subdir-keyed: <root>/skills/<NAME>/SKILL.md.
+        // identifier() must return <NAME>, not the SKILL.md stem.
+        assert_eq!(
+            ctx(
+                "/g/skills/tw-implement-plan/SKILL.md",
+                ContextFileKind::UserSkill
+            )
+            .identifier()
+            .as_deref(),
+            Some("tw-implement-plan"),
         );
         assert_eq!(
-            ContextFileKind::ProjectLocalCommand.tier(),
-            CacheTier::Short5m
+            ctx(
+                "/proj/.claude/skills/local-skill/SKILL.md",
+                ContextFileKind::ProjectLocalSkill
+            )
+            .identifier()
+            .as_deref(),
+            Some("local-skill"),
         );
         assert_eq!(
-            ContextFileKind::PluginSkill {
+            ctx(
+                "/cache/plug/skills/plugin-skill/SKILL.md",
+                ContextFileKind::PluginSkill {
+                    plugin: "p".into(),
+                    marketplace: "m".into()
+                }
+            )
+            .identifier()
+            .as_deref(),
+            Some("plugin-skill"),
+        );
+    }
+
+    #[test]
+    fn identifier_returns_none_for_always_loaded_kinds() {
+        // CLAUDE.md and rules are always-loaded; the harness doesn't
+        // refer to them by name in the JSONL evidence.
+        for kind in [
+            ContextFileKind::GlobalClaudeMd,
+            ContextFileKind::ProjectClaudeMd,
+            ContextFileKind::UserRule,
+            ContextFileKind::ProjectLocalRule,
+            ContextFileKind::PluginRule {
                 plugin: "p".into(),
-                marketplace: "m".into()
-            }
-            .tier(),
-            CacheTier::Short5m
-        );
+                marketplace: "m".into(),
+            },
+        ] {
+            let f = ctx("/some/file.md", kind);
+            assert!(
+                f.identifier().is_none(),
+                "expected identifier() = None for {:?}",
+                f.kind,
+            );
+        }
     }
 }

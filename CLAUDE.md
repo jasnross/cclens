@@ -121,19 +121,28 @@ order below is for orientation):
 ```
 domain        ← Session, Turn, Role, Usage, CacheCreation
 parsing       ← RawLine / RawMessage / RawUsage + parse_jsonl + raw_to_turn
-discovery     ← projects_dir walk → (project_dir, [jsonl_paths])
+discovery     ← projects_dir walk → ProjectSessions { project_dir,
+                sessions: [SessionPaths { jsonl, subagents:
+                [SubagentPaths { jsonl, meta }] }] }; per-session
+                three-level walk into <stem>/subagents/ for
+                agent-*.jsonl + .meta.json sidecars; read_subagent_meta
+                helper for the sidecar
 inventory     ← walks ~/.claude/{CLAUDE.md,rules,skills,agents},
                 plugin cache, and per-session ancestor + project-local
                 context; tokenizes via tiktoken_rs cl100k_base;
-                returns Vec<ContextFile> with kind/tier/scope
+                returns Vec<ContextFile> with kind/scope; identifier()
+                returns the harness-name for skill/command/agent kinds,
+                None for always-loaded kinds (CLAUDE.md, rules)
 aggregation   ← turn list → Session; Exchange grouping;
                 title extraction; project short-name derivation;
                 zero-billable filter; cross-file dedup_assistant_turns
-attribution   ← turn list → SessionMeta (per-tier event counts,
-                observed_*_tokens, majority model);
-                inventory + session_metas + pricing → ranked
-                AttributionRow rows with strict None cost propagation;
-                per-tier CoverageStats (observed vs attributed)
+attribution   ← turn list → SessionMeta { kind: Parent | Subagent
+                { agent_type }, primary_tier, on_demand_loads:
+                Vec<OnDemandLoad>, observed_*_tokens, majority model };
+                inventory + session_metas + pricing → per-load
+                AttributionRow { loads_1h, loads_5m, ... } with strict
+                None cost propagation; per-tier CoverageStats summed
+                across parent + subagent metas
 pricing       ← LiteLLM-catalog fetch/cache/lookup, tiered cost math,
                 pricing-subcommand handlers; cost_for_cache_creation_{1h,5m}
                 helpers exposed for the inputs subcommand
@@ -150,8 +159,10 @@ Binary entry point (`src/main.rs`):
 - Declares `mod cli;` (binary-only — `src/cli.rs` is **not** in
   `lib.rs`) so library code cannot reach into clap-derived types.
 - Imports library modules via `use cclens::...`.
-- Holds `main`, `run_list`, `run_show`, `run_pricing`, the per-project
-  `dedup_assistant_turns` orchestration helper, and `stem_matches`.
+- Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs`, the
+  per-project `dedup_assistant_turns` orchestration helper, the
+  `build_subagent_meta` helper that drives per-subagent transcript
+  parsing for `run_inputs`, and `stem_matches`.
 
 Binary CLI submodule (`src/cli.rs`):
 
