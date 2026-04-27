@@ -43,8 +43,15 @@ use crate::pricing::PricingCatalog;
 ///
 /// Field semantics:
 /// - `id` — the JSONL stem (passed in by the caller).
+/// - `kind` — discriminates a parent session from a subagent
+///   transcript. `compute_rows`' agent-row gating uses the
+///   `Subagent { agent_type }` payload to credit only the matching
+///   inventory file (Phase 2 wiring; in Phase 1 subagent-kind metas
+///   are gated out so behavior matches the pre-refactor pipeline).
 /// - `cwd` — first non-`None` `Turn.cwd` across any role, mirroring
-///   `aggregation::derive_project_short_name`'s rule.
+///   `aggregation::derive_project_short_name`'s rule. Subagent metas
+///   constructed by `run_inputs` fall back to the parent session's
+///   cwd when the subagent JSONL has none.
 /// - `project_short_name` — `cwd.file_name()` if the cwd was found,
 ///   else `project_dir.file_name()`. Carrying it pre-derived keeps
 ///   `AttributionFilter::accepts` a single-argument predicate.
@@ -61,6 +68,7 @@ use crate::pricing::PricingCatalog;
 #[derive(Debug)]
 pub struct SessionMeta {
     pub id: String,
+    pub kind: SessionKind,
     pub cwd: Option<PathBuf>,
     pub project_short_name: String,
     pub started_at: DateTime<Utc>,
@@ -69,6 +77,20 @@ pub struct SessionMeta {
     pub events_5m: u64,
     pub observed_1h_tokens: u64,
     pub observed_5m_tokens: u64,
+}
+
+/// Discriminates a parent session JSONL from a subagent transcript.
+///
+/// The `Subagent` variant carries the `agentType` resolved from the
+/// sibling `.meta.json` sidecar — Phase 2 will use it to credit only
+/// the matching agent inventory entry rather than crediting every
+/// agent file in scope. In Phase 1 the variant is only used as a
+/// gate keeping subagent metas out of the hot loop so the renderer's
+/// output stays byte-identical to the pre-refactor baseline.
+#[derive(Debug, Clone)]
+pub enum SessionKind {
+    Parent,
+    Subagent { agent_type: String },
 }
 
 /// One ranked attribution row.
@@ -156,6 +178,7 @@ impl AttributionFilter {
 #[allow(clippy::similar_names)]
 #[must_use]
 pub fn session_meta_from_turns(
+    kind: SessionKind,
     session_id: String,
     project_dir: &Path,
     turns: &[Turn],
@@ -197,6 +220,7 @@ pub fn session_meta_from_turns(
 
     Some(SessionMeta {
         id: session_id,
+        kind,
         cwd,
         project_short_name,
         started_at,
@@ -308,6 +332,15 @@ fn build_row(
     let mut total_cost: Option<f64> = Some(0.0);
 
     for meta in session_metas {
+        // Phase 1 gate: subagent transcripts are plumbed through the
+        // pipeline but Phase 2 owns the per-load attribution math that
+        // actually credits them. Skipping them here keeps `compute_rows`
+        // byte-identical to the pre-refactor baseline so the snapshot
+        // suite stays green during the refactor.
+        match &meta.kind {
+            SessionKind::Parent => {}
+            SessionKind::Subagent { .. } => continue,
+        }
         let Some(meta_cwd) = meta.cwd.as_deref() else {
             continue;
         };
@@ -364,6 +397,15 @@ pub fn compute_coverage(session_metas: &[SessionMeta], rows: &[AttributionRow]) 
     let mut long_observed: u64 = 0;
     let mut short_observed: u64 = 0;
     for meta in session_metas {
+        // Phase 1 mirrors the gate in `compute_rows`: subagent
+        // transcripts are excluded from the coverage denominator so
+        // the rendered ratio stays byte-identical to the pre-refactor
+        // baseline. Phase 2 will sum across both kinds once attribution
+        // also credits them.
+        match &meta.kind {
+            SessionKind::Parent => {}
+            SessionKind::Subagent { .. } => continue,
+        }
         long_observed += meta.observed_1h_tokens;
         short_observed += meta.observed_5m_tokens;
     }
@@ -473,6 +515,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
     fn meta_with(
+        kind: SessionKind,
         id: &str,
         cwd: Option<&Path>,
         project: &str,
@@ -485,6 +528,7 @@ mod tests {
     ) -> SessionMeta {
         SessionMeta {
             id: id.to_string(),
+            kind,
             cwd: cwd.map(Path::to_path_buf),
             project_short_name: project.to_string(),
             started_at: ts(started_at_str),
@@ -521,8 +565,13 @@ mod tests {
             assistant_turn("2026-04-01T10:02:00Z", Some("claude-opus-4-7"), 50, 50),
             assistant_turn_no_usage("2026-04-01T10:03:00Z", Some("claude-opus-4-7")),
         ];
-        let meta =
-            session_meta_from_turns("session-id".to_string(), Path::new("/proj"), &turns).unwrap();
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "session-id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
         assert_eq!(meta.events_1h, 2, "expected events_1h == 2");
         assert_eq!(meta.events_5m, 2, "expected events_5m == 2");
         assert_eq!(meta.observed_1h_tokens, 150);
@@ -536,7 +585,13 @@ mod tests {
             assistant_turn("2026-04-01T10:01:00Z", Some("model-a"), 100, 0),
             assistant_turn("2026-04-01T10:02:00Z", Some("model-b"), 100, 0),
         ];
-        let meta = session_meta_from_turns("id".to_string(), Path::new("/proj"), &turns).unwrap();
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
         assert_eq!(meta.model.as_deref(), Some("model-a"));
     }
 
@@ -547,7 +602,13 @@ mod tests {
             assistant_turn("2026-04-01T10:00:00Z", Some("model-x"), 100, 0),
             assistant_turn("2026-04-01T10:01:00Z", Some("model-y"), 100, 0),
         ];
-        let meta = session_meta_from_turns("id".to_string(), Path::new("/proj"), &turns).unwrap();
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
         assert_eq!(meta.model.as_deref(), Some("model-x"));
     }
 
@@ -560,7 +621,13 @@ mod tests {
         let mut asst = assistant_turn("2026-04-01T10:01:00Z", Some("model-a"), 100, 0);
         asst.cwd = Some(PathBuf::from("/y"));
         let turns = vec![user, asst];
-        let meta = session_meta_from_turns("id".to_string(), Path::new("/proj"), &turns).unwrap();
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
         assert_eq!(meta.cwd, Some(PathBuf::from("/x")));
         assert_eq!(meta.project_short_name, "x");
     }
@@ -569,7 +636,15 @@ mod tests {
     fn session_meta_returns_none_for_no_timestamps() {
         // Empty turns → None.
         let empty: Vec<Turn> = Vec::new();
-        assert!(session_meta_from_turns("id".to_string(), Path::new("/p"), &empty).is_none());
+        assert!(
+            session_meta_from_turns(
+                SessionKind::Parent,
+                "id".to_string(),
+                Path::new("/p"),
+                &empty
+            )
+            .is_none()
+        );
 
         // Only-untimestamped turns → also None.
         let untimestamped = vec![Turn {
@@ -583,7 +658,13 @@ mod tests {
             cwd: None,
         }];
         assert!(
-            session_meta_from_turns("id".to_string(), Path::new("/p"), &untimestamped).is_none()
+            session_meta_from_turns(
+                SessionKind::Parent,
+                "id".to_string(),
+                Path::new("/p"),
+                &untimestamped
+            )
+            .is_none()
         );
     }
 
@@ -595,8 +676,13 @@ mod tests {
             100,
             0,
         )];
-        let meta = session_meta_from_turns("id".to_string(), Path::new("/some/proj-name"), &turns)
-            .unwrap();
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "id".to_string(),
+            Path::new("/some/proj-name"),
+            &turns,
+        )
+        .unwrap();
         assert!(meta.cwd.is_none());
         assert_eq!(meta.project_short_name, "proj-name");
     }
@@ -613,6 +699,7 @@ mod tests {
         )];
         let metas = vec![
             meta_with(
+                SessionKind::Parent,
                 "s1",
                 Some(Path::new("/a")),
                 "a",
@@ -624,6 +711,7 @@ mod tests {
                 700,
             ),
             meta_with(
+                SessionKind::Parent,
                 "s2",
                 Some(Path::new("/b")),
                 "b",
@@ -651,6 +739,7 @@ mod tests {
         )];
         let metas = vec![
             meta_with(
+                SessionKind::Parent,
                 "s1",
                 Some(Path::new("/a")),
                 "a",
@@ -662,6 +751,7 @@ mod tests {
                 700,
             ),
             meta_with(
+                SessionKind::Parent,
                 "s2",
                 Some(Path::new("/b")),
                 "b",
@@ -691,6 +781,7 @@ mod tests {
         )];
         let metas = vec![
             meta_with(
+                SessionKind::Parent,
                 "s1",
                 Some(Path::new("/proj/sub")),
                 "sub",
@@ -702,6 +793,7 @@ mod tests {
                 0,
             ),
             meta_with(
+                SessionKind::Parent,
                 "s2",
                 Some(Path::new("/other")),
                 "other",
@@ -729,6 +821,7 @@ mod tests {
             Scope::Global,
         )];
         let metas = vec![meta_with(
+            SessionKind::Parent,
             "s1",
             Some(Path::new("/a")),
             "a",
@@ -758,6 +851,7 @@ mod tests {
         )];
         let metas = vec![
             meta_with(
+                SessionKind::Parent,
                 "s1",
                 Some(Path::new("/a")),
                 "a",
@@ -770,6 +864,7 @@ mod tests {
             ),
             // Unknown model with non-zero events → row's cost = None.
             meta_with(
+                SessionKind::Parent,
                 "s2",
                 Some(Path::new("/b")),
                 "b",
@@ -819,6 +914,7 @@ mod tests {
             ),
         ];
         let metas = vec![meta_with(
+            SessionKind::Parent,
             "s1",
             Some(Path::new("/scope")),
             "scope",
@@ -857,6 +953,118 @@ mod tests {
         assert_eq!(rows[0].attributed_cost, Some(0.0));
     }
 
+    // --- SessionKind plumbing ---
+
+    #[test]
+    fn session_meta_from_turns_propagates_subagent_kind() {
+        let turns = vec![assistant_turn(
+            "2026-04-01T10:00:00Z",
+            Some("claude-opus-4-7"),
+            0,
+            100,
+        )];
+        let meta = session_meta_from_turns(
+            SessionKind::Subagent {
+                agent_type: "tw-code-reviewer".to_string(),
+            },
+            "agent-abc".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
+        match meta.kind {
+            SessionKind::Subagent { agent_type } => {
+                assert_eq!(agent_type, "tw-code-reviewer");
+            }
+            SessionKind::Parent => panic!("expected Subagent kind, got Parent"),
+        }
+    }
+
+    #[test]
+    fn compute_rows_phase1_ignores_subagent_metas() {
+        // Phase 1 behavior-preservation guard: a subagent-kind meta
+        // contributes nothing to the row totals. Phase 2 will rewire
+        // the math to credit subagents per actual load.
+        let inv = vec![ctx_file(
+            "/g/CLAUDE.md",
+            ContextFileKind::GlobalClaudeMd,
+            100,
+            Scope::Global,
+        )];
+        let metas = vec![
+            meta_with(
+                SessionKind::Parent,
+                "parent",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:00:00Z",
+                Some("claude-opus-4-7"),
+                2,
+                0,
+                200,
+                0,
+            ),
+            meta_with(
+                SessionKind::Subagent {
+                    agent_type: "tw-code-reviewer".to_string(),
+                },
+                "agent-1",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:01:00Z",
+                Some("claude-opus-4-7"),
+                3,
+                0,
+                300,
+                0,
+            ),
+        ];
+        let rows = compute_rows(inv, &metas, &sample_catalog());
+        assert_eq!(
+            rows[0].events, 2,
+            "subagent meta must NOT contribute in Phase 1; events should equal parent's events_1h alone",
+        );
+    }
+
+    #[test]
+    fn compute_coverage_phase1_ignores_subagent_metas() {
+        // Behavior-preservation guard for the coverage denominator:
+        // subagent observed tokens stay out of the sum until Phase 2.
+        let metas = vec![
+            meta_with(
+                SessionKind::Parent,
+                "parent",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:00:00Z",
+                Some("claude-opus-4-7"),
+                0,
+                0,
+                500,
+                0,
+            ),
+            meta_with(
+                SessionKind::Subagent {
+                    agent_type: "tw-code-reviewer".to_string(),
+                },
+                "agent-1",
+                Some(Path::new("/proj")),
+                "proj",
+                "2026-04-01T10:01:00Z",
+                Some("claude-opus-4-7"),
+                0,
+                0,
+                999, // would inflate coverage if counted
+                0,
+            ),
+        ];
+        let cov = compute_coverage(&metas, &[]);
+        assert_eq!(
+            cov.long_1h.observed_tokens, 500,
+            "subagent observed tokens must NOT enter the denominator in Phase 1",
+        );
+    }
+
     // --- compute_coverage ---
 
     #[test]
@@ -872,6 +1080,7 @@ mod tests {
     #[test]
     fn compute_coverage_ratios_correctly_per_tier() {
         let metas = vec![meta_with(
+            SessionKind::Parent,
             "s1",
             Some(Path::new("/a")),
             "a",
@@ -946,7 +1155,13 @@ mod tests {
         assert_eq!(expected_1h, 425);
         assert_eq!(expected_5m, 350);
 
-        let meta = session_meta_from_turns("s1".to_string(), Path::new("/proj"), &turns).unwrap();
+        let meta = session_meta_from_turns(
+            SessionKind::Parent,
+            "s1".to_string(),
+            Path::new("/proj"),
+            &turns,
+        )
+        .unwrap();
         let cov = compute_coverage(&[meta], &[]);
         assert_eq!(cov.long_1h.observed_tokens, expected_1h);
         assert_eq!(cov.short_5m.observed_tokens, expected_5m);
@@ -961,6 +1176,7 @@ mod tests {
             ..Default::default()
         };
         let target = meta_with(
+            SessionKind::Parent,
             "target",
             Some(Path::new("/a")),
             "a",
@@ -972,6 +1188,7 @@ mod tests {
             0,
         );
         let other = meta_with(
+            SessionKind::Parent,
             "other",
             Some(Path::new("/a")),
             "a",
@@ -994,6 +1211,7 @@ mod tests {
             ..Default::default()
         };
         let on_since = meta_with(
+            SessionKind::Parent,
             "s1",
             Some(Path::new("/a")),
             "a",
@@ -1005,6 +1223,7 @@ mod tests {
             0,
         );
         let on_until = meta_with(
+            SessionKind::Parent,
             "s2",
             Some(Path::new("/a")),
             "a",
@@ -1016,6 +1235,7 @@ mod tests {
             0,
         );
         let before = meta_with(
+            SessionKind::Parent,
             "s3",
             Some(Path::new("/a")),
             "a",
@@ -1027,6 +1247,7 @@ mod tests {
             0,
         );
         let after = meta_with(
+            SessionKind::Parent,
             "s4",
             Some(Path::new("/a")),
             "a",
@@ -1050,6 +1271,7 @@ mod tests {
             ..Default::default()
         };
         let foo = meta_with(
+            SessionKind::Parent,
             "s1",
             Some(Path::new("/a")),
             "foo",
@@ -1061,6 +1283,7 @@ mod tests {
             0,
         );
         let bar = meta_with(
+            SessionKind::Parent,
             "s2",
             Some(Path::new("/a")),
             "bar",

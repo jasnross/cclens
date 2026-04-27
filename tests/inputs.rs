@@ -17,11 +17,13 @@
 
 mod common;
 
+use std::fs;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use common::{
-    build_inputs_claude_home, cclens_inputs_command, inputs_projects_fixture_dir,
-    pricing_fixture_url,
+    build_inputs_claude_home, cclens_command, cclens_inputs_command, copy_dir_recursive,
+    inputs_projects_fixture_dir, pricing_fixture_url,
 };
 use regex::Regex;
 
@@ -312,4 +314,87 @@ fn inputs_observed_1h_matches_jsonl_sum_under_filters() {
         obs_1h, 300,
         "observed_1h under filter must equal session B's 300; got {obs_1h}",
     );
+}
+
+#[test]
+fn inputs_with_subagents_directory_does_not_perturb_output() {
+    // Phase 1 behavior-preservation contract: discovery now walks
+    // `<session_stem>/subagents/` for subagent transcripts, but
+    // `compute_rows`/`compute_coverage` skip subagent metas. The
+    // rendered output of `cclens inputs` against a project carrying a
+    // populated `subagents/` directory must therefore be byte-identical
+    // to the same project without it.
+    //
+    // We assert this by copying the `inputs-projects` fixture into a
+    // tempdir, planting a subagent JSONL + meta.json under one
+    // session's `<stem>/subagents/`, and comparing rendered stdout
+    // with and without the planted subagent directory present.
+    let cache = isolated_tempdir();
+    let claude_home_owner = isolated_tempdir();
+    let claude_home = build_inputs_claude_home(claude_home_owner.path());
+
+    // Run #1: vanilla fixture, no subagents/ on disk.
+    let projects_owner_a = isolated_tempdir();
+    let projects_a = projects_owner_a.path().join("inputs-projects");
+    copy_dir_recursive(&inputs_projects_fixture_dir(), &projects_a);
+    let baseline = run_inputs_against(cache.path(), &claude_home, &projects_a);
+
+    // Run #2: same fixture with a subagent JSONL + meta.json planted
+    // under one session's <stem>/subagents/ directory.
+    let projects_owner_b = isolated_tempdir();
+    let projects_b = projects_owner_b.path().join("inputs-projects");
+    copy_dir_recursive(&inputs_projects_fixture_dir(), &projects_b);
+    let session_stem = "aaaa1111-1111-1111-1111-111111111111";
+    let subagents_dir = projects_b
+        .join("-test-inputs")
+        .join(session_stem)
+        .join("subagents");
+    fs::create_dir_all(&subagents_dir).expect("create subagents dir");
+    fs::write(
+        subagents_dir.join("agent-1.jsonl"),
+        // One assistant turn with non-zero ephemeral_5m so a Phase 2
+        // attribution would credit the test-agent — Phase 1 must NOT.
+        r#"{"type":"user","timestamp":"2026-04-15T10:02:00Z","cwd":"/proj-a","message":{"content":"sub"}}
+{"type":"assistant","timestamp":"2026-04-15T10:02:05Z","cwd":"/proj-a","message":{"id":"msg_sub1","model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":50,"ephemeral_1h_input_tokens":0},"cache_read_input_tokens":0},"content":[{"type":"text","text":"sub-reply"}]},"requestId":"req_sub1"}
+"#,
+    )
+    .expect("write subagent jsonl");
+    fs::write(
+        subagents_dir.join("agent-1.meta.json"),
+        r#"{"agentType":"test-agent","description":"test agent body"}"#,
+    )
+    .expect("write subagent meta");
+    let with_subagents = run_inputs_against(cache.path(), &claude_home, &projects_b);
+
+    assert_eq!(
+        baseline, with_subagents,
+        "Phase 1 contract: presence of <stem>/subagents/ must NOT \
+         perturb cclens inputs output. Diff between runs:\n\n\
+         --- baseline ---\n{baseline}\n\
+         --- with subagents ---\n{with_subagents}",
+    );
+
+    // Spot-check that the `cclens list` view is also byte-identical —
+    // it explicitly ignores subagents (they are partitions of the
+    // parent, not standalone sessions).
+    let baseline_list = run_list_against(cache.path(), &projects_a);
+    let with_subagents_list = run_list_against(cache.path(), &projects_b);
+    assert_eq!(
+        baseline_list, with_subagents_list,
+        "cclens list output must also stay byte-identical",
+    );
+}
+
+fn run_inputs_against(cache: &Path, claude_home: &Path, projects_dir: &Path) -> String {
+    let mut cmd = cclens_inputs_command(cache, &pricing_fixture_url(PRICING_FIXTURE), claude_home);
+    cmd.args(["--projects-dir"]).arg(projects_dir).arg("inputs");
+    let raw = cmd.assert().success().get_output().stdout.clone();
+    String::from_utf8(raw).unwrap()
+}
+
+fn run_list_against(cache: &Path, projects_dir: &Path) -> String {
+    let mut cmd = cclens_command(cache, &pricing_fixture_url(PRICING_FIXTURE));
+    cmd.args(["--projects-dir"]).arg(projects_dir).arg("list");
+    let raw = cmd.assert().success().get_output().stdout.clone();
+    String::from_utf8(raw).unwrap()
 }

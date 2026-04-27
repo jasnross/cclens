@@ -158,7 +158,10 @@ pub fn copy_fixture_to_tempdir_with_mtimes(
     tmp
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
+/// Recursively copy `src` into `dst`. Shared by
+/// `copy_fixture_to_tempdir_with_mtimes` here and by integration tests
+/// that need a writable copy of a fixture tree without mtime control.
+pub fn copy_dir_recursive(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create dst");
     for entry in fs::read_dir(src).expect("read src") {
         let entry = entry.expect("entry");
