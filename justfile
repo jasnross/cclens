@@ -12,8 +12,9 @@ test:
 
 # Format source files
 fmt:
-    prettier -w ./**/*.md
     cargo +nightly fmt
+    cargo fix --allow-dirty
+    prettier -w ./**/*.md
 
 # Run clippy on all targets
 lint:
