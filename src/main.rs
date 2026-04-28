@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use cclens::aggregation::{aggregate, dedup_assistant_turns, group_into_exchanges};
 use cclens::attribution::{
-    SessionKind, SessionMeta, compute_coverage, compute_rows, extend_inventory_for_session,
-    session_meta_from_turns,
+    InputsFilter, SessionKind, SessionMeta, compute_coverage, compute_rows,
+    extend_inventory_for_session, session_meta_from_turns,
 };
 use cclens::discovery::{
     ProjectSessions, SessionPaths, SubagentPaths, discover, read_subagent_meta,
@@ -19,8 +19,8 @@ use cclens::rendering::{render_inputs, render_session, render_table};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::{
-    Cli, Command, FilterArgs, InputsFilterArgs, PricingAction, emit_empty_result_hint,
-    emit_inputs_empty_hint,
+    Cli, Command, InputsArgs, PricingAction, SessionFilterArgs, ThresholdsFilterArgs,
+    emit_empty_result_hint, emit_inputs_empty_hint,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -28,24 +28,26 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::List {
-        filters: FilterArgs::default(),
+        thresholds: ThresholdsFilterArgs::default(),
     }) {
-        Command::List { filters } => run_list(&cli.projects_dir, filters),
+        Command::List { thresholds } => run_list(&cli.projects_dir, thresholds),
         Command::Show {
             session_id,
-            filters,
-        } => run_show(&cli.projects_dir, &session_id, filters),
+            thresholds,
+        } => run_show(&cli.projects_dir, &session_id, thresholds),
         Command::Pricing { action } => run_pricing(action),
         Command::Inputs {
-            inputs_filters,
-            filters,
-        } => run_inputs(&cli.projects_dir, &inputs_filters, filters),
+            scope,
+            inputs,
+            thresholds,
+        } => run_inputs(&cli.projects_dir, &scope, &inputs, thresholds),
     }
 }
 
-fn run_list(projects_dir: &Path, filters: FilterArgs) -> anyhow::Result<()> {
+fn run_list(projects_dir: &Path, thresholds: ThresholdsFilterArgs) -> anyhow::Result<()> {
     let catalog = pricing::load_catalog();
     let project_entries = discover(projects_dir)?;
+    let thresholds_filter = thresholds.thresholds_filter();
     let mut sessions = Vec::new();
     for ProjectSessions {
         project_dir,
@@ -75,19 +77,16 @@ fn run_list(projects_dir: &Path, filters: FilterArgs) -> anyhow::Result<()> {
                 .unwrap_or_default();
             let subagent_turn_lists: Vec<Vec<Turn>> =
                 subagents.iter().filter_map(build_subagent_turns).collect();
-            // The new threshold filter sits *after* `aggregate`'s
-            // existing zero-billable pre-pass, so it composes
-            // additively rather than altering the "session is
-            // meaningful" contract.
+            // The threshold filter sits *after* `aggregate`'s existing
+            // zero-billable pre-pass, so it composes additively rather
+            // than altering the "session is meaningful" contract.
             if let Some(session) = aggregate(
                 &project_dir,
                 session_id,
                 turns,
                 &subagent_turn_lists,
                 &catalog,
-            ) && filters
-                .thresholds()
-                .matches(session.total_billable, session.total_cost)
+            ) && thresholds_filter.matches(session.total_billable, session.total_cost)
             {
                 sessions.push(session);
             }
@@ -96,15 +95,20 @@ fn run_list(projects_dir: &Path, filters: FilterArgs) -> anyhow::Result<()> {
     sessions.sort_by_key(|s| s.started_at);
     println!("{}", render_table(&sessions));
     if sessions.is_empty() {
-        emit_empty_result_hint(&filters);
+        // Phase 3 will replace the default `SessionFilterArgs` with a
+        // real `scope` parameter; for now `cclens list` still has no
+        // scope flags, so the default reports `any_active() == false`
+        // and the hint suppression path is preserved exactly.
+        emit_empty_result_hint(&SessionFilterArgs::default(), &thresholds);
     }
     Ok(())
 }
 
 fn run_inputs(
     projects_dir: &Path,
-    inputs_filters: &InputsFilterArgs,
-    filters: FilterArgs,
+    scope: &SessionFilterArgs,
+    inputs: &InputsArgs,
+    thresholds: ThresholdsFilterArgs,
 ) -> anyhow::Result<()> {
     let catalog = pricing::load_catalog();
     let inventory_config = InventoryConfig::default();
@@ -115,7 +119,10 @@ fn run_inputs(
     }
 
     let project_entries = discover(projects_dir)?;
-    let attribution_filter = inputs_filters.attribution_filter();
+    let inputs_filter = InputsFilter {
+        session_id: inputs.session_id(),
+        scope: scope.session_filter(),
+    };
     let mut session_metas: Vec<SessionMeta> = Vec::new();
     for ProjectSessions {
         project_dir,
@@ -138,7 +145,7 @@ fn run_inputs(
             else {
                 continue;
             };
-            if !attribution_filter.accepts(&parent_meta) {
+            if !inputs_filter.accepts(&parent_meta) {
                 // Whole session (parent + subagents) is filtered out
                 // — `--session foo` and `--project bar` apply to the
                 // parent session, and a subagent inherits its parent's
@@ -202,16 +209,16 @@ fn run_inputs(
 
     let rows = compute_rows(inventory, &session_metas, &catalog);
     let coverage = compute_coverage(&session_metas, &rows);
-    let thresholds = filters.thresholds();
+    let thresholds_filter = thresholds.thresholds_filter();
     // Apply --min-tokens / --min-cost as a presentation-only row filter:
     // coverage stats reflect every session in scope, not just rows kept.
     let visible_rows: Vec<_> = rows
         .into_iter()
-        .filter(|row| thresholds.matches(row.estimated_tokens_billed, row.attributed_cost))
+        .filter(|row| thresholds_filter.matches(row.estimated_tokens_billed, row.attributed_cost))
         .collect();
     println!("{}", render_inputs(&visible_rows, &coverage));
     if visible_rows.is_empty() {
-        emit_inputs_empty_hint(inputs_filters, &filters);
+        emit_inputs_empty_hint(scope, inputs, &thresholds);
     }
     Ok(())
 }
@@ -344,7 +351,11 @@ fn run_pricing(action: PricingAction) -> anyhow::Result<()> {
 /// parent's exchanges, sorted by user-turn timestamp. The body's
 /// `cumulative` column at the bottom equals what `cclens list` reports
 /// for the same session — list/show consistency by construction.
-fn run_show(projects_dir: &Path, session_id: &str, filters: FilterArgs) -> anyhow::Result<()> {
+fn run_show(
+    projects_dir: &Path,
+    session_id: &str,
+    thresholds: ThresholdsFilterArgs,
+) -> anyhow::Result<()> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         anyhow::bail!("session id must not be empty");
@@ -416,10 +427,15 @@ fn run_show(projects_dir: &Path, session_id: &str, filters: FilterArgs) -> anyho
             .timestamp
             .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
     });
-    let (rendered, rows_shown) = render_session(&all_exchanges, &catalog, filters.thresholds());
+    let (rendered, rows_shown) =
+        render_session(&all_exchanges, &catalog, thresholds.thresholds_filter());
     println!("{rendered}");
     if rows_shown == 0 {
-        emit_empty_result_hint(&filters);
+        // `cclens show` deliberately excludes scope flags (its required
+        // <session-id> argument already pins a single session), so the
+        // default `SessionFilterArgs` reports `any_active() == false`
+        // and the hint suppression path is preserved exactly.
+        emit_empty_result_hint(&SessionFilterArgs::default(), &thresholds);
     }
     Ok(())
 }
