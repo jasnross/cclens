@@ -50,6 +50,8 @@ pub(super) enum Command {
     /// discounted cache-read rate) — the `tokens` column does not.
     List {
         #[command(flatten)]
+        scope: SessionFilterArgs,
+        #[command(flatten)]
         thresholds: ThresholdsFilterArgs,
     },
     /// Show per-exchange token + cost breakdown for one session.

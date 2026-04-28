@@ -28,9 +28,10 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::List {
+        scope: SessionFilterArgs::default(),
         thresholds: ThresholdsFilterArgs::default(),
     }) {
-        Command::List { thresholds } => run_list(&cli.projects_dir, thresholds),
+        Command::List { scope, thresholds } => run_list(&cli.projects_dir, &scope, thresholds),
         Command::Show {
             session_id,
             thresholds,
@@ -44,9 +45,14 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn run_list(projects_dir: &Path, thresholds: ThresholdsFilterArgs) -> anyhow::Result<()> {
+fn run_list(
+    projects_dir: &Path,
+    scope: &SessionFilterArgs,
+    thresholds: ThresholdsFilterArgs,
+) -> anyhow::Result<()> {
     let catalog = pricing::load_catalog();
     let project_entries = discover(projects_dir)?;
+    let session_filter = scope.session_filter();
     let thresholds_filter = thresholds.thresholds_filter();
     let mut sessions = Vec::new();
     for ProjectSessions {
@@ -77,16 +83,22 @@ fn run_list(projects_dir: &Path, thresholds: ThresholdsFilterArgs) -> anyhow::Re
                 .unwrap_or_default();
             let subagent_turn_lists: Vec<Vec<Turn>> =
                 subagents.iter().filter_map(build_subagent_turns).collect();
-            // The threshold filter sits *after* `aggregate`'s existing
-            // zero-billable pre-pass, so it composes additively rather
-            // than altering the "session is meaningful" contract.
+            // Both filters sit *after* `aggregate`'s existing
+            // zero-billable pre-pass, so they compose additively
+            // rather than altering the "session is meaningful"
+            // contract. Scope check runs before thresholds for
+            // readability — both are cheap once `aggregate` has
+            // produced the session, and the ordering matches how
+            // the flags appear left-to-right in the user-facing
+            // CLI surface.
             if let Some(session) = aggregate(
                 &project_dir,
                 session_id,
                 turns,
                 &subagent_turn_lists,
                 &catalog,
-            ) && thresholds_filter.matches(session.total_billable, session.total_cost)
+            ) && session_filter.accepts(&session.project_short_name, session.started_at)
+                && thresholds_filter.matches(session.total_billable, session.total_cost)
             {
                 sessions.push(session);
             }
@@ -95,11 +107,7 @@ fn run_list(projects_dir: &Path, thresholds: ThresholdsFilterArgs) -> anyhow::Re
     sessions.sort_by_key(|s| s.started_at);
     println!("{}", render_table(&sessions));
     if sessions.is_empty() {
-        // Phase 3 will replace the default `SessionFilterArgs` with a
-        // real `scope` parameter; for now `cclens list` still has no
-        // scope flags, so the default reports `any_active() == false`
-        // and the hint suppression path is preserved exactly.
-        emit_empty_result_hint(&SessionFilterArgs::default(), &thresholds);
+        emit_empty_result_hint(scope, &thresholds);
     }
     Ok(())
 }

@@ -16,6 +16,7 @@ mod common;
 use common::{
     cclens_command, cost_projects_fixture_dir, pricing_fixture_url, projects_fixture_dir,
 };
+use predicates::prelude::PredicateBooleanExt;
 
 fn isolated_cache() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
@@ -524,13 +525,370 @@ fn show_empty_result_emits_stderr_hint() {
     );
 }
 
+// ------------------------- list scope filters --------------------------
+
+// Baseline fixture timestamps (verified against
+// tests/fixtures/projects/...):
+//   alpha       (ALPHA_UUID)      2026-04-01T10:00:00Z
+//   beta-prose  (BETA_PROSE_UUID) 2026-04-15T14:33:00Z
+//   beta-late   (BETA_LATE_UUID)  2026-04-20T09:00:00Z
+// The fixture has additional sessions (show-fixture, etc.) whose
+// presence is ignored by these tests' positive/negative-only
+// assertions — adding new fixture sessions never breaks them.
+
+#[test]
+fn list_project_only_keeps_matching_short_name() {
+    // `--project beta` keeps both beta sessions (project_short_name
+    // == "beta") and drops alpha.
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args(["list", "--project", "beta"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains(BETA_PROSE_UUID),
+        "beta-prose should remain:\n{stdout}",
+    );
+    assert!(
+        stdout.contains(BETA_LATE_UUID),
+        "beta-late should remain:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(ALPHA_UUID),
+        "alpha (project=alpha) should be dropped:\n{stdout}",
+    );
+}
+
+#[test]
+fn list_project_no_match_emits_empty_hint() {
+    // `--project zzz` matches nothing; stdout still shows the header,
+    // stderr gets the hint, exit is 0.
+    let cache = isolated_cache();
+    let assertion = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args(["list", "--project", "zzz"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "note: no rows matched --project zzz",
+        ));
+    let output = assertion.get_output();
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("datetime"),
+        "header should still print:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(ALPHA_UUID),
+        "no priced rows should remain:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(BETA_PROSE_UUID),
+        "no priced rows should remain:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(BETA_LATE_UUID),
+        "no priced rows should remain:\n{stdout}",
+    );
+}
+
+#[test]
+fn list_since_inclusive_at_boundary() {
+    // `--since 2026-04-15T14:33:00Z` (beta-prose's exact start) keeps
+    // beta-prose (boundary) and beta-late (after); drops alpha
+    // (before).
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args(["list", "--since", "2026-04-15T14:33:00Z"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains(BETA_PROSE_UUID),
+        "beta-prose at boundary should remain:\n{stdout}",
+    );
+    assert!(
+        stdout.contains(BETA_LATE_UUID),
+        "beta-late (after boundary) should remain:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(ALPHA_UUID),
+        "alpha (before boundary) should be dropped:\n{stdout}",
+    );
+}
+
+#[test]
+fn list_since_excludes_one_second_before() {
+    // `--since 2026-04-15T14:33:01Z` (one second past beta-prose)
+    // drops beta-prose; keeps beta-late.
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args(["list", "--since", "2026-04-15T14:33:01Z"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        !stdout.contains(BETA_PROSE_UUID),
+        "beta-prose (one second before --since) should be dropped:\n{stdout}",
+    );
+    assert!(
+        stdout.contains(BETA_LATE_UUID),
+        "beta-late should remain:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(ALPHA_UUID),
+        "alpha should be dropped:\n{stdout}",
+    );
+}
+
+#[test]
+fn list_until_inclusive_at_boundary() {
+    // `--until 2026-04-15T14:33:00Z` (beta-prose's exact start) keeps
+    // alpha and beta-prose (boundary); drops beta-late.
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args(["list", "--until", "2026-04-15T14:33:00Z"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains(ALPHA_UUID),
+        "alpha (before boundary) should remain:\n{stdout}",
+    );
+    assert!(
+        stdout.contains(BETA_PROSE_UUID),
+        "beta-prose at boundary should remain:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(BETA_LATE_UUID),
+        "beta-late (after boundary) should be dropped:\n{stdout}",
+    );
+}
+
+#[test]
+fn list_since_until_brackets_window() {
+    // `--since 2026-04-10T00:00:00Z --until 2026-04-18T00:00:00Z`:
+    // alpha (2026-04-01) before window; beta-prose (2026-04-15) in
+    // window; beta-late (2026-04-20) after window.
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args([
+            "list",
+            "--since",
+            "2026-04-10T00:00:00Z",
+            "--until",
+            "2026-04-18T00:00:00Z",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains(BETA_PROSE_UUID),
+        "beta-prose (in window) should remain:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(ALPHA_UUID),
+        "alpha (before window) should be dropped:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(BETA_LATE_UUID),
+        "beta-late (after window) should be dropped:\n{stdout}",
+    );
+}
+
+#[test]
+fn list_project_combined_with_min_tokens_logical_and() {
+    // `--project beta --min-tokens 100` keeps only beta-prose
+    // (boundary at 100 tokens). beta-late has 10 tokens so fails the
+    // threshold; alpha is dropped on project. Exercises both axes
+    // composing as logical AND.
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args(["list", "--project", "beta", "--min-tokens", "100"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains(BETA_PROSE_UUID),
+        "beta-prose (project + tokens both clear) should remain:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(BETA_LATE_UUID),
+        "beta-late (10 < 100) should be dropped:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(ALPHA_UUID),
+        "alpha (project mismatch) should be dropped:\n{stdout}",
+    );
+}
+
+#[test]
+fn list_invalid_date_format_clap_error() {
+    // Bare `YYYY-MM-DD` (no time, no offset) is rejected by chrono's
+    // RFC 3339 parser at clap parse time. The flag name appears in
+    // stderr (anchoring on the offending flag is more stable across
+    // clap/chrono error-template versions).
+    let cache = isolated_cache();
+    cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args(["list", "--since", "2026-04-15"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--since"));
+}
+
+#[test]
+fn list_combined_empty_hint_describes_all_active_flags() {
+    // `--project alpha --min-cost 99999`: scope keeps alpha (the
+    // sole alpha session); threshold rejects it (alpha's cost is
+    // ~$0.0379 ≪ $99999). Both filters causally contribute to the
+    // empty result, so both flag descriptions must appear in the
+    // hint. Using a large min-cost rather than `--project zzz`
+    // ensures the threshold check actually fires (a non-existent
+    // project would short-circuit before threshold matters).
+    let cache = isolated_cache();
+    cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args(["list", "--project", "alpha", "--min-cost", "99999"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("--project alpha"))
+        .stderr(predicates::str::contains("--min-cost 99999"));
+}
+
+#[test]
+fn list_full_stack_combined_filters() {
+    // End-to-end: every layer (clap parsing →
+    // SessionFilterArgs::session_filter() → SessionFilter::accepts →
+    // ThresholdsFilter::matches → render).
+    //
+    // beta-prose:  beta + 2026-04-15T14:33:00Z + 100 tokens — clears
+    //              project, since-boundary, until, min-tokens 50 → kept
+    // beta-late:   beta + 2026-04-20T09:00:00Z + 10 tokens — clears
+    //              project, since, until-boundary; fails min-tokens 50
+    // alpha:       alpha (project mismatch)
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args([
+            "list",
+            "--project",
+            "beta",
+            "--since",
+            "2026-04-15T14:33:00Z",
+            "--until",
+            "2026-04-20T09:00:00Z",
+            "--min-tokens",
+            "50",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains(BETA_PROSE_UUID),
+        "beta-prose clears all four filters:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(BETA_LATE_UUID),
+        "beta-late fails on tokens (10 < 50):\n{stdout}",
+    );
+    assert!(
+        !stdout.contains(ALPHA_UUID),
+        "alpha fails on project:\n{stdout}",
+    );
+}
+
+#[test]
+fn list_inputs_project_filter_parity() {
+    // The same `--project alpha` filter against the same fixture must
+    // keep and drop the same project sessions on `list` and `inputs`.
+    // Divergence here would indicate a derivation drift between
+    // `Session.project_short_name` (used by `list`) and
+    // `SessionMeta.project_short_name` (used by `inputs`). We can't
+    // compare full row sets (the two views render different things),
+    // but we can assert that the `list` row count is ≥ 1 (alpha is
+    // present) and that `inputs` produces a non-empty rendered table
+    // for the same project — i.e. neither view incorrectly filters
+    // alpha out.
+    let cache_list = isolated_cache();
+    let list_stdout = String::from_utf8(
+        cclens_command(cache_list.path(), &pricing_fixture_url("litellm-mini.json"))
+            .args(["--projects-dir"])
+            .arg(projects_fixture_dir())
+            .args(["list", "--project", "alpha"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        list_stdout.contains(ALPHA_UUID),
+        "list --project alpha should keep alpha:\n{list_stdout}",
+    );
+
+    let cache_inputs = isolated_cache();
+    cclens_command(
+        cache_inputs.path(),
+        &pricing_fixture_url("litellm-mini.json"),
+    )
+    .args(["--projects-dir"])
+    .arg(projects_fixture_dir())
+    .args(["inputs", "--project", "alpha"])
+    .assert()
+    .success()
+    // Negative assertion: no empty-result hint means inputs found
+    // at least one session in scope.
+    .stderr(predicates::str::contains("no rows matched").not());
+}
+
 // ----------------------------- filter scope ------------------------------
 
 #[test]
 fn pricing_subcommand_rejects_filter_flags() {
-    // Confirms `FilterArgs` is NOT flattened into `Command::Pricing`:
-    // passing `--min-tokens` or `--min-cost` to `pricing refresh`
-    // must be a clap parse error (non-zero exit, "unexpected argument").
+    // Confirms `ThresholdsFilterArgs` is NOT flattened into
+    // `Command::Pricing`: passing `--min-tokens` or `--min-cost` to
+    // `pricing refresh` must be a clap parse error (non-zero exit,
+    // "unexpected argument").
     let cache = isolated_cache();
     cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
         .args(["pricing", "refresh", "--min-tokens", "1"])
@@ -544,4 +902,31 @@ fn pricing_subcommand_rejects_filter_flags() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("--min-cost"));
+}
+
+#[test]
+fn pricing_subcommand_rejects_scope_flags() {
+    // Sibling of `pricing_subcommand_rejects_filter_flags`: confirms
+    // `SessionFilterArgs` is NOT flattened into `Command::Pricing`.
+    // Each scope flag must produce a clap parse error.
+    let cache = isolated_cache();
+    cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["pricing", "refresh", "--project", "foo"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--project"));
+
+    let cache = isolated_cache();
+    cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["pricing", "refresh", "--since", "2026-01-01T00:00:00Z"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--since"));
+
+    let cache = isolated_cache();
+    cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["pricing", "refresh", "--until", "2026-01-01T00:00:00Z"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--until"));
 }

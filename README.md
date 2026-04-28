@@ -61,18 +61,35 @@ not abort the listing.
 
 #### Filtering
 
-Two flags narrow the result set; both apply to `list` and `show`:
+Two groups of flags shared across subcommands narrow the result set
+(`inputs` adds one extra flag of its own — see [the inputs
+section](#inputs)).
+
+**Scope** — apply to `list` and `inputs` (not `show`, which already pins a
+single session via its `<session-id>` argument):
+
+- `--project <NAME>` — exact match against the short project name shown
+  in the `project` column. Case-sensitive; substring / glob / regex
+  matching is not supported.
+- `--since <RFC3339>` / `--until <RFC3339>` — inclusive bounds on the
+  session's `started_at`. ISO 8601 / RFC 3339 timestamps with an explicit
+  timezone offset (e.g. `2026-04-15T00:00:00Z`). Bare `YYYY-MM-DD` is
+  not accepted.
+
+**Thresholds** — apply to `list`, `show`, and `inputs`:
 
 - `--min-tokens <N>` — show only rows with at least N billable tokens
   (e.g. `--min-tokens 50000`).
 - `--min-cost <USD>` — show only rows costing at least USD (e.g.
   `--min-cost 0.50`).
 
-When both are passed, both must clear (logical AND). Rows whose cost is
-unknown (renders `—` in the `cost` column — i.e. an unknown-model row)
-are excluded by any active `--min-cost`. Orphan user exchanges in
-`show` (whose `tokens` cell renders `—`) are excluded by any
-`--min-tokens >= 1`.
+When multiple flags are passed, all must clear (logical AND) — for
+example, `cclens list --project beta --min-tokens 100` keeps only
+sessions in project `beta` whose total billable tokens are also at
+least 100. Rows whose cost is unknown (renders `—` in the `cost`
+column — i.e. an unknown-model row) are excluded by any active
+`--min-cost`. Orphan user exchanges in `show` (whose `tokens` cell
+renders `—`) are excluded by any `--min-tokens >= 1`.
 
 If the filter drops every row, stdout still prints the table header,
 stderr prints a one-line hint (`note: no rows matched <flags>`), and
@@ -122,6 +139,35 @@ hidden together). `cumulative` and `cum_cost` continue to fold over
 **every** exchange so the final visible row's running totals match
 the session's `list` totals — visible cells may "jump" between rows
 when the filter drops middle exchanges.
+
+### inputs
+
+Rank user-controlled context files (CLAUDE.md, rules, skills, agents,
+plugin-shipped bundles, per-project ancestor files) by attributed
+cache-creation cost. Walks `~/.claude/{CLAUDE.md,rules,skills,agents}`,
+the plugin cache, and per-session ancestor + project-local context,
+then attributes each file's tokens to the matching-tier
+`cache_creation_*` events observed in the JSONL stream.
+
+```sh
+$ cclens inputs
+$ cclens inputs --project beta
+```
+
+The same scope flags described under
+[Filtering](#filtering) — `--project`, `--since`, `--until` — apply
+here, plus an `inputs`-only flag:
+
+- `--session <UUID>` — restrict attribution to one session by full
+  session UUID. Exact match.
+
+`--min-tokens` / `--min-cost` apply as row-level filters on the
+rendered table (the per-tier coverage line below the table reflects
+every session in scope, not just the rows kept).
+
+The empty-result behavior matches `list`: if every row is dropped,
+stdout still prints the header, stderr prints
+`note: no rows matched <flags>`, and the exit code is 0.
 
 ### pricing
 
