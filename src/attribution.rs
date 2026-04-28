@@ -15,9 +15,9 @@
 //!   record extracted from user-turn content.
 //! - `session_meta_from_turns(...)` — fold a turn list into a
 //!   `SessionMeta`. Returns `None` if no turns carried a timestamp.
-//! - `AttributionFilter` — `--session` / `--project` / `--since` /
-//!   `--until` predicate. Applied to `SessionMeta` before
-//!   `compute_rows`.
+//! - `InputsFilter` — composes the inputs-only `--session` flag with
+//!   a shared `SessionFilter` (covering `--project` / `--since` /
+//!   `--until`). Applied to `SessionMeta` before `compute_rows`.
 //! - `extend_inventory_for_session(...)` — append per-session
 //!   `walk_for_session` results into a shared inventory, dedup-keyed
 //!   on resulting file paths so a shared ancestor `CLAUDE.md` doesn't
@@ -67,6 +67,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::domain::{Role, Turn};
+use crate::filter::SessionFilter;
 use crate::inventory::{
     CacheTier, ContextFile, ContextFileKind, InventoryConfig, walk_for_session,
 };
@@ -88,7 +89,7 @@ use crate::pricing::PricingCatalog;
 ///   cwd when the subagent JSONL has none.
 /// - `project_short_name` — `cwd.file_name()` if the cwd was found,
 ///   else `project_dir.file_name()`. Carrying it pre-derived keeps
-///   `AttributionFilter::accepts` a single-argument predicate.
+///   `InputsFilter::accepts` a single-argument predicate.
 /// - `started_at` — earliest `Turn.timestamp`.
 /// - `model` — most-frequent model across this session's assistant
 ///   turns, ties broken by first-occurrence. Used as the per-load
@@ -234,20 +235,21 @@ pub struct CoverageStats {
     pub short_5m: TierCoverage,
 }
 
-/// `--session` / `--project` / `--since` / `--until` predicate. The
-/// `--min-tokens` / `--min-cost` row-level filter is applied
-/// separately by `run_inputs` after attribution.
+/// Inputs-side session predicate. Composes the inputs-only
+/// `--session` flag with a shared `SessionFilter` covering
+/// `--project` / `--since` / `--until`. The `--min-tokens` /
+/// `--min-cost` row-level filter is applied separately by
+/// `run_inputs` after attribution.
 #[derive(Debug, Default)]
-pub struct AttributionFilter {
+pub struct InputsFilter {
     pub session_id: Option<String>,
-    pub project_name: Option<String>,
-    pub since: Option<DateTime<Utc>>,
-    pub until: Option<DateTime<Utc>>,
+    pub scope: SessionFilter,
 }
 
-impl AttributionFilter {
-    /// Whether this filter accepts `meta`. `since` and `until` are
-    /// inclusive on both ends.
+impl InputsFilter {
+    /// Whether this filter accepts `meta`. The session-id check is
+    /// inputs-specific; the rest delegates to `SessionFilter::accepts`,
+    /// which is the same predicate `cclens list` runs.
     #[must_use]
     pub fn accepts(&self, meta: &SessionMeta) -> bool {
         if let Some(id) = &self.session_id
@@ -255,22 +257,8 @@ impl AttributionFilter {
         {
             return false;
         }
-        if let Some(name) = &self.project_name
-            && meta.project_short_name != *name
-        {
-            return false;
-        }
-        if let Some(since) = &self.since
-            && meta.started_at < *since
-        {
-            return false;
-        }
-        if let Some(until) = &self.until
-            && meta.started_at > *until
-        {
-            return false;
-        }
-        true
+        self.scope
+            .accepts(&meta.project_short_name, meta.started_at)
     }
 }
 
@@ -1843,13 +1831,13 @@ mod tests {
         assert_eq!(cov.short_5m.observed_tokens, expected_5m);
     }
 
-    // --- AttributionFilter ---
+    // --- InputsFilter ---
 
     #[test]
-    fn attribution_filter_session_id_match() {
-        let filter = AttributionFilter {
+    fn inputs_filter_session_id_match() {
+        let filter = InputsFilter {
             session_id: Some("target".to_string()),
-            ..Default::default()
+            scope: SessionFilter::default(),
         };
         let target = meta_with(
             SessionKind::Parent,
@@ -1880,11 +1868,14 @@ mod tests {
     }
 
     #[test]
-    fn attribution_filter_since_until_inclusive() {
-        let filter = AttributionFilter {
-            since: Some(ts("2026-04-10T00:00:00Z")),
-            until: Some(ts("2026-04-20T00:00:00Z")),
-            ..Default::default()
+    fn inputs_filter_since_until_inclusive() {
+        let filter = InputsFilter {
+            session_id: None,
+            scope: SessionFilter {
+                since: Some(ts("2026-04-10T00:00:00Z")),
+                until: Some(ts("2026-04-20T00:00:00Z")),
+                ..Default::default()
+            },
         };
         let on_since = meta_with(
             SessionKind::Parent,
@@ -1941,10 +1932,13 @@ mod tests {
     }
 
     #[test]
-    fn attribution_filter_project_name_match() {
-        let filter = AttributionFilter {
-            project_name: Some("foo".to_string()),
-            ..Default::default()
+    fn inputs_filter_project_name_match() {
+        let filter = InputsFilter {
+            session_id: None,
+            scope: SessionFilter {
+                project_name: Some("foo".to_string()),
+                ..Default::default()
+            },
         };
         let foo = meta_with(
             SessionKind::Parent,

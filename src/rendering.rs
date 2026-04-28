@@ -3,7 +3,7 @@
 //!
 //! Public API:
 //! - `render_table(&[Session]) -> String` — the `list` view.
-//! - `render_session(&[Exchange<'_>], &PricingCatalog, Thresholds) -> (String, usize)`
+//! - `render_session(&[Exchange<'_>], &PricingCatalog, ThresholdsFilter) -> (String, usize)`
 //!   — the `show` view; returns rendered table plus visible-row count
 //!   for the empty-result hint decision. Dispatches on
 //!   `Turn.origin`: parent exchanges render two rows (user + assistant
@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::aggregation::{Exchange, exchange_filter_totals, user_display_string};
 use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
 use crate::domain::{CacheCreation, Session, Turn, TurnOrigin, Usage};
-use crate::filter::Thresholds;
+use crate::filter::ThresholdsFilter;
 use crate::inventory::ContextFileKind;
 use crate::pricing::PricingCatalog;
 
@@ -480,7 +480,7 @@ fn render_subagent_exchange(
 pub fn render_session(
     exchanges: &[Exchange<'_>],
     catalog: &PricingCatalog,
-    thresholds: Thresholds,
+    thresholds: ThresholdsFilter,
 ) -> (String, usize) {
     let mut table = Table::new();
     table.load_preset(NOTHING);
@@ -1006,7 +1006,7 @@ mod tests {
     #[test]
     fn render_session_header_includes_all_seven_columns() {
         let (out, rows_shown) =
-            render_session(&[], &PricingCatalog::empty(), Thresholds::default());
+            render_session(&[], &PricingCatalog::empty(), ThresholdsFilter::default());
         assert_eq!(rows_shown, 0);
         assert!(out.contains("datetime"));
         assert!(out.contains("role"));
@@ -1040,7 +1040,11 @@ mod tests {
                 assistants: Vec::new(),
             },
         ];
-        let (out, _) = render_session(&exchanges, &PricingCatalog::empty(), Thresholds::default());
+        let (out, _) = render_session(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
         let lines: Vec<&str> = out.lines().collect();
         let assistant_line = lines
             .iter()
@@ -1114,7 +1118,11 @@ mod tests {
             },
         ];
         // Expected billable total = (100+50+200) + (10+20+0) = 380.
-        let (out, _) = render_session(&exchanges, &PricingCatalog::empty(), Thresholds::default());
+        let (out, _) = render_session(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
         let last_line = out
             .lines()
             .rfind(|l| l.contains("r2"))
@@ -1153,7 +1161,11 @@ mod tests {
                 assistants: vec![&a2],
             },
         ];
-        let (out, _) = render_session(&exchanges, &PricingCatalog::empty(), Thresholds::default());
+        let (out, _) = render_session(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
         // After Phase 3 the column order is:
         //   datetime | role | tokens | cost | cumulative | cum_cost | content
         // With an empty catalog, both `cost` and `cum_cost` render as
@@ -1206,7 +1218,11 @@ mod tests {
             user: &u,
             assistants: vec![&a],
         }];
-        let (out, _) = render_session(&exchanges, &PricingCatalog::empty(), Thresholds::default());
+        let (out, _) = render_session(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
         assert!(
             out.contains("reading +2 tool uses"),
             "expected tool-use suffix; got:\n{out}",
@@ -1291,8 +1307,11 @@ mod tests {
             user: &user,
             assistants: vec![&asst],
         }];
-        let (out, rows) =
-            render_session(&exchanges, &PricingCatalog::empty(), Thresholds::default());
+        let (out, rows) = render_session(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
         assert_eq!(rows, 1, "subagent exchange must render exactly one row");
         assert!(
             out.contains("subagent"),
@@ -1331,7 +1350,11 @@ mod tests {
             user: &user,
             assistants: vec![&asst],
         }];
-        let (out, _) = render_session(&exchanges, &PricingCatalog::empty(), Thresholds::default());
+        let (out, _) = render_session(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
         assert!(
             out.contains("(tw-code-reviewer) all good"),
             "no-description form should be `(<agent_type>) <response>`; got:\n{out}",
@@ -1367,7 +1390,11 @@ mod tests {
                 assistants: vec![&sa],
             },
         ];
-        let (out, _) = render_session(&exchanges, &PricingCatalog::empty(), Thresholds::default());
+        let (out, _) = render_session(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
         let last_data_line = out
             .lines()
             .rfind(|l| l.contains("done"))
@@ -1390,8 +1417,11 @@ mod tests {
             user: &user,
             assistants: Vec::new(),
         }];
-        let (out, rows) =
-            render_session(&exchanges, &PricingCatalog::empty(), Thresholds::default());
+        let (out, rows) = render_session(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
         assert_eq!(rows, 1);
         assert!(
             out.contains("— (no response)"),
@@ -1430,7 +1460,11 @@ mod tests {
             user: &u,
             assistants: vec![&a],
         }];
-        let (out, _) = render_session(&exchanges, &PricingCatalog::empty(), Thresholds::default());
+        let (out, _) = render_session(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
         assert!(
             out.contains('…'),
             "truncated content should end with ellipsis; got:\n{out}",

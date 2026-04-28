@@ -7,10 +7,10 @@
 //! Public API (binary-internal):
 //! - `Cli` / `Command` / `PricingAction` — clap parser types.
 //! - `FilterArgs` — flattened threshold flags; `.thresholds()` produces
-//!   a library `Thresholds`.
+//!   a library `ThresholdsFilter`.
 //! - `InputsFilterArgs` — flattened session/project/since/until flags
 //!   for the `inputs` subcommand; `.attribution_filter()` produces a
-//!   library `AttributionFilter`.
+//!   library `InputsFilter`.
 //! - `emit_empty_result_hint(&FilterArgs)` — stderr hint used by
 //!   `run_list` and `run_show` when a filter dropped every row.
 //! - `emit_inputs_empty_hint(&InputsFilterArgs, &FilterArgs)` —
@@ -19,8 +19,8 @@
 
 use std::path::PathBuf;
 
-use cclens::attribution::AttributionFilter;
-use cclens::filter::Thresholds;
+use cclens::attribution::InputsFilter;
+use cclens::filter::{SessionFilter, ThresholdsFilter};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 
@@ -106,13 +106,13 @@ pub(super) struct FilterArgs {
 }
 
 impl FilterArgs {
-    /// Project the clap-derived flags into the library-side `Thresholds`.
-    /// `FilterArgs` is binary-only (clap-derived); `Thresholds` lives in
+    /// Project the clap-derived flags into the library-side `ThresholdsFilter`.
+    /// `FilterArgs` is binary-only (clap-derived); `ThresholdsFilter` lives in
     /// the library crate and is what `render_session` and the library's
     /// session-level filter take — keeping the library/CLI seam free of
     /// clap dependencies.
-    pub(super) fn thresholds(&self) -> Thresholds {
-        Thresholds {
+    pub(super) fn thresholds(&self) -> ThresholdsFilter {
+        ThresholdsFilter {
             min_tokens: self.min_tokens,
             min_cost: self.min_cost,
         }
@@ -155,7 +155,7 @@ pub(super) fn emit_empty_result_hint(filters: &FilterArgs) {
 
 /// Session-level filters for `cclens inputs`. Mirrors `FilterArgs`'s
 /// CLI-only / library-projection split: clap-derived flags here,
-/// `.attribution_filter()` produces the library-side `AttributionFilter`.
+/// `.attribution_filter()` produces the library-side `InputsFilter`.
 #[derive(Args, Debug, Clone, Default)]
 pub(super) struct InputsFilterArgs {
     /// Restrict attribution to one session by full UUID.
@@ -177,14 +177,16 @@ pub(super) struct InputsFilterArgs {
 
 impl InputsFilterArgs {
     /// Project the clap-derived flags into the library-side
-    /// `AttributionFilter`. Same library/CLI seam pattern as
+    /// `InputsFilter`. Same library/CLI seam pattern as
     /// `FilterArgs::thresholds`.
-    pub(super) fn attribution_filter(&self) -> AttributionFilter {
-        AttributionFilter {
+    pub(super) fn attribution_filter(&self) -> InputsFilter {
+        InputsFilter {
             session_id: self.session.clone(),
-            project_name: self.project.clone(),
-            since: self.since,
-            until: self.until,
+            scope: SessionFilter {
+                project_name: self.project.clone(),
+                since: self.since,
+                until: self.until,
+            },
         }
     }
 
@@ -292,7 +294,7 @@ mod tests {
         assert_eq!(t.min_cost, Some(0.50));
 
         let empty = FilterArgs::default();
-        assert_eq!(empty.thresholds(), Thresholds::default());
+        assert_eq!(empty.thresholds(), ThresholdsFilter::default());
     }
 
     #[test]
