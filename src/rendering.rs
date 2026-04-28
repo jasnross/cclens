@@ -2,7 +2,14 @@
 //! subcommands.
 //!
 //! Public API:
-//! - `render_table(&[Session]) -> String` — the `list` view.
+//! - `render_table(&[Session]) -> String` — the `list` view; appends a
+//!   totals row beneath the per-session rows when 2+ sessions are
+//!   visible. The totals row's `title` cell carries a right-aligned
+//!   `total` label flush against the tokens column; its numeric cells
+//!   use the same formatters as data rows. Cost follows the same
+//!   strict-`None` propagation as `Session.total_cost` — any visible
+//!   session with `total_cost: None` collapses the totals cost cell
+//!   to `—`.
 //! - `render_session(&[Exchange<'_>], &PricingCatalog, ThresholdsFilter) -> (String, usize)`
 //!   — the `show` view; returns rendered table plus visible-row count
 //!   for the empty-result hint decision. Dispatches on
@@ -28,7 +35,7 @@
 
 use chrono::{DateTime, Utc};
 use comfy_table::presets::NOTHING;
-use comfy_table::{CellAlignment, Table};
+use comfy_table::{Cell, CellAlignment, Table};
 use serde_json::Value;
 
 use crate::aggregation::{Exchange, exchange_filter_totals, user_display_string};
@@ -132,8 +139,12 @@ pub fn render_table(sessions: &[Session]) -> String {
             session.id.clone(),
         ]);
     }
+    add_totals_row(&mut table, sessions);
     // column_mut returns Option; the columns are guaranteed present because
-    // the header above defines them at the indices.
+    // the header above defines them at the indices. The totals row's
+    // numeric cells inherit this column-level right alignment; its `total`
+    // label cell carries a per-cell right-alignment override set inside
+    // `add_totals_row` so it stays flush against the tokens column.
     if let Some(col) = table.column_mut(TOKENS_COL_INDEX) {
         col.set_cell_alignment(CellAlignment::Right);
     }
@@ -141,6 +152,35 @@ pub fn render_table(sessions: &[Session]) -> String {
         col.set_cell_alignment(CellAlignment::Right);
     }
     format!("{table}")
+}
+
+/// Append a totals row when 2+ sessions are visible. The `title` cell
+/// carries a right-aligned `total` label flush against the tokens
+/// column; numeric cells use the same formatters as data rows and
+/// inherit the column-level right alignment applied by `render_table`
+/// after this call. Cost follows strict-`None` propagation via
+/// `fold_cum_cost`: any visible session with `total_cost: None`
+/// collapses the totals cost cell to `—`.
+fn add_totals_row(table: &mut Table, sessions: &[Session]) {
+    if sessions.len() < 2 {
+        return;
+    }
+    let total_tokens: u64 = sessions.iter().map(|s| s.total_billable).sum();
+    // `try_fold` short-circuits on the first `None`, matching the
+    // strict-`None` contract that `fold_cum_cost` enforces in the
+    // show view's `cum_cost` column. Reusing `fold_cum_cost` keeps
+    // the propagation rule single-sourced.
+    let total_cost: Option<f64> = sessions
+        .iter()
+        .try_fold(0.0, |acc, s| fold_cum_cost(Some(acc), s.total_cost));
+    table.add_row(vec![
+        Cell::new(""),
+        Cell::new(""),
+        Cell::new("total").set_alignment(CellAlignment::Right),
+        Cell::new(format_tokens(total_tokens)),
+        Cell::new(format_cost_opt(total_cost)),
+        Cell::new(""),
+    ]);
 }
 
 fn user_content_preview(turn: &Turn) -> String {
@@ -748,6 +788,16 @@ mod tests {
         total_billable: u64,
         started_at: &str,
     ) -> Session {
+        session_for_render_with_cost(project, title, total_billable, None, started_at)
+    }
+
+    fn session_for_render_with_cost(
+        project: &str,
+        title: &str,
+        total_billable: u64,
+        total_cost: Option<f64>,
+        started_at: &str,
+    ) -> Session {
         let ts: DateTime<Utc> = started_at.parse().unwrap();
         Session {
             id: "sid".to_string(),
@@ -757,7 +807,7 @@ mod tests {
             title: title.to_string(),
             turns: Vec::new(),
             total_billable,
-            total_cost: None,
+            total_cost,
         }
     }
 
@@ -906,6 +956,122 @@ mod tests {
         // Right-alignment: shorter value has leading whitespace padding,
         // so the prefix-up-to-tokens has the same scalar count for both.
         assert_eq!(end_of_9.chars().count(), end_of_123456.chars().count());
+    }
+
+    // --- render_table totals row ---
+
+    // Returns the single totals row (if any) from rendered output. The
+    // totals row is the only line whose `title`-column cell is the
+    // literal `total`; data rows place project names and titles there
+    // (the test fixtures use innocuous strings that don't contain
+    // `total` as a substring).
+    fn find_totals_row(rendered: &str) -> Option<String> {
+        rendered
+            .lines()
+            .find(|l| l.contains("total"))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn render_table_appends_totals_row_when_two_or_more_sessions() {
+        let sessions = vec![
+            session_for_render_with_cost(
+                "alpha",
+                "first",
+                1500,
+                Some(0.01),
+                "2026-04-01T10:00:00Z",
+            ),
+            session_for_render_with_cost(
+                "beta",
+                "second",
+                2500,
+                Some(0.02),
+                "2026-04-02T10:00:00Z",
+            ),
+        ];
+        let out = render_table(&sessions);
+        let totals = find_totals_row(&out).expect("totals row missing");
+        // 1500 + 2500 = 4000 → "4.00k"; 0.01 + 0.02 = 0.03 → "$0.0300".
+        assert!(totals.contains("total"), "row missing label: {totals}");
+        assert!(totals.contains("4.00k"), "row missing token sum: {totals}");
+        assert!(totals.contains("$0.0300"), "row missing cost sum: {totals}");
+        // Sanity: it really is the last non-empty line of output.
+        let last_non_empty = out
+            .lines()
+            .rfind(|l| !l.trim().is_empty())
+            .expect("output must have at least one line");
+        assert!(
+            last_non_empty.contains("total"),
+            "totals row must be the final non-empty line; got: {last_non_empty}"
+        );
+    }
+
+    #[test]
+    fn render_table_totals_row_collapses_cost_to_em_dash_on_any_none() {
+        let sessions = vec![
+            session_for_render_with_cost(
+                "alpha",
+                "first",
+                1000,
+                Some(0.01),
+                "2026-04-01T10:00:00Z",
+            ),
+            // Middle session is unknown-model: total_cost: None should
+            // latch the totals cost cell to `—` even though the other
+            // two are priced.
+            session_for_render_with_cost("beta", "second", 2000, None, "2026-04-02T10:00:00Z"),
+            session_for_render_with_cost(
+                "gamma",
+                "third",
+                3000,
+                Some(0.03),
+                "2026-04-03T10:00:00Z",
+            ),
+        ];
+        let out = render_table(&sessions);
+        let totals = find_totals_row(&out).expect("totals row missing");
+        // Tokens always sum (no None propagation on u64): 1000+2000+3000=6000.
+        assert!(totals.contains("6.00k"), "row missing token sum: {totals}");
+        // Cost collapses to em-dash; no `$` should appear in the totals
+        // row, since the only cost-shaped value is the em-dash.
+        assert!(
+            totals.contains('—'),
+            "totals cost cell should render as em-dash: {totals}"
+        );
+        assert!(
+            !totals.contains('$'),
+            "totals cost cell must not show a dollar amount when any session is None: {totals}"
+        );
+    }
+
+    #[test]
+    fn render_table_omits_totals_row_for_single_session() {
+        let sessions = vec![session_for_render_with_cost(
+            "alpha",
+            "only one",
+            1234,
+            Some(0.0123),
+            "2026-04-01T10:00:00Z",
+        )];
+        let out = render_table(&sessions);
+        // The single data row does not contain "total" (title is "only
+        // one", project "alpha"), and no totals row should be added.
+        assert!(
+            !out.contains("total"),
+            "single-session output must not include a totals row; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_table_omits_totals_row_for_empty_input() {
+        let out = render_table(&[]);
+        // Header columns do not include the substring "total" (the
+        // closest is `title`, which does not contain it).
+        assert!(
+            !out.contains("total"),
+            "empty input must produce header-only output (no totals row); got:\n{out}"
+        );
     }
 
     // --- user_content_preview ---

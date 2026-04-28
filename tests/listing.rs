@@ -147,6 +147,72 @@ fn list_renders_sessions_oldest_first_with_correct_totals() {
 }
 
 #[test]
+fn list_appends_totals_row_summing_tokens_and_cost_across_visible_sessions() {
+    // render_table appends a totals row beneath the visible data
+    // rows whenever 2+ sessions are shown. The default fixture
+    // surfaces 5 priced sessions (alpha, beta-prose, after-malformed,
+    // show-fixture demo, beta-review). Per-row tokens are
+    // integer-exact: 650 + 100 + 10 + 780 + 540 = 2080 → "2.08k".
+    // The cost cell is asserted at the cent-bucket level ($0.10*)
+    // rather than the 4th decimal because f64 summation order
+    // changes shouldn't fail this regression check; the unit tests
+    // in `src/rendering.rs` exercise the exact arithmetic on
+    // simpler numbers.
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .arg("list")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    // The totals row's `title` cell carries the literal `total`; the
+    // header row carries `title` (which does not contain `total` as a
+    // substring), and no fixture title contains `total` either.
+    let totals = lines
+        .iter()
+        .find(|l| l.contains("total") && !l.contains("title"))
+        .expect("totals row missing");
+    assert!(
+        totals.contains(" 2.08k"),
+        "totals row should sum tokens to 2.08k; got: {totals}",
+    );
+    assert!(
+        totals.contains("$0.10"),
+        "totals row should sum cost into the $0.10* bucket; got: {totals}",
+    );
+    assert!(
+        !totals.contains('—'),
+        "totals cost cell should not show `—` when every visible session is priced; got: {totals}",
+    );
+
+    // Totals row appears strictly below every data row (the data
+    // rows each end with a UUID; the totals row's id cell is empty).
+    let last_data_idx = lines
+        .iter()
+        .rposition(|l| {
+            l.contains("aaaa1111")
+                || l.contains("bbbb2222")
+                || l.contains("dddd4444")
+                || l.contains("eeee5555")
+        })
+        .expect("at least one data row should be present");
+    let totals_idx = lines
+        .iter()
+        .position(|l| l.contains("total") && !l.contains("title"))
+        .unwrap();
+    assert!(
+        totals_idx > last_data_idx,
+        "totals row should appear after all data rows; got totals at {totals_idx}, last data at {last_data_idx}",
+    );
+}
+
+#[test]
 fn list_handles_empty_projects_dir() {
     let cache = isolated_cache();
     let tmp = tempfile::tempdir().unwrap();

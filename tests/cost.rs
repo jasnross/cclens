@@ -56,6 +56,23 @@ fn list_renders_dash_for_unknown_model_session() {
         !pre_uuid.contains('$'),
         "unknown-model session must not show a `$` cost; got: {row}",
     );
+
+    // Totals row: cost-projects has 4 sessions, one of which is
+    // unknown-model. The strict-`None` cost fold inside add_totals_row
+    // must collapse the totals cost cell to `—` even though the other
+    // three are priced.
+    let totals = out
+        .lines()
+        .find(|l| l.contains("total") && !l.contains("title"))
+        .expect("totals row missing");
+    assert!(
+        totals.contains('—'),
+        "totals cost cell should be `—` when any visible session is unknown-model; got: {totals}",
+    );
+    assert!(
+        !totals.contains('$'),
+        "totals row should not show a `$` cost when any visible session is unknown-model; got: {totals}",
+    );
 }
 
 #[test]
