@@ -12,6 +12,7 @@ test:
 
 # Format source files
 fmt:
+    prettier -w ./**/*.md
     cargo +nightly fmt
 
 # Run clippy on all targets

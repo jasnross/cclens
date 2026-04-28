@@ -1,9 +1,6 @@
 # cclens
 
-A tiny Rust CLI that lists your Claude Code conversations: when they happened,
-what project they were in, what they were about, and how many tokens they
-consumed. It reads `~/.claude/projects/` and prints a plain aligned table to
-stdout.
+A tiny Rust CLI that lists your Claude Code conversations: when they happened, what project they were in, what they were about, and how many tokens they consumed. It reads `~/.claude/projects/` and prints a plain aligned table to stdout.
 
 ## Install
 
@@ -26,13 +23,11 @@ $ cclens
  ...
 ```
 
-Column widths adapt to the data in each column; the example above is
-illustrative.
+Column widths adapt to the data in each column; the example above is illustrative.
 
 `cclens list` is the explicit equivalent of the default.
 
-Point at a non-default location (e.g. a backup or sshfs mount) with
-`--projects-dir`:
+Point at a non-default location (e.g. a backup or sshfs mount) with `--projects-dir`:
 
 ```sh
 $ cclens --projects-dir /mnt/backup/claude/projects list
@@ -42,58 +37,30 @@ $ cclens --projects-dir /mnt/backup/claude/projects list
 
 - **datetime** — local-timezone start of the session (`YYYY-MM-DD HH:MM`).
 - **project** — final path segment of the session's working directory.
-- **title** — the user's first substantive prompt, or the slash command they
-  ran, truncated to 80 characters with `…`.
-- **tokens** — sum of billable tokens (`input + output + cache_creation`)
-  across every assistant turn, including subagent/sidechain turns.
-- **cost** — per-session USD cost (`$X.XXXX`), summed from the same turns,
-  computed via the LiteLLM pricing catalog. Diverges from `tokens` by
-  including `cache_read` tokens (priced at the discounted cache-read
-  rate). Renders `—` if any assistant turn has an unknown model — strict
-  no-partial-sums propagation.
-- **id** — the session UUID, taken from the JSONL filename in
-  `~/.claude/projects/`.
+- **title** — the user's first substantive prompt, or the slash command they ran, truncated to 80 characters with `…`.
+- **tokens** — sum of billable tokens (`input + output + cache_creation`) across every assistant turn, including subagent/sidechain turns.
+- **cost** — per-session USD cost (`$X.XXXX`), summed from the same turns, computed via the LiteLLM pricing catalog. Diverges from `tokens` by including `cache_read` tokens (priced at the discounted cache-read rate). Renders `—` if any assistant turn has an unknown model — strict no-partial-sums propagation.
+- **id** — the session UUID, taken from the JSONL filename in `~/.claude/projects/`.
 
-Sessions with zero billable tokens **and** zero cost are hidden — sessions
-that are non-zero-cost only via `cache_read` stay visible. Malformed JSONL
-lines are silently skipped. One unreadable file or project directory does
-not abort the listing.
+Sessions with zero billable tokens **and** zero cost are hidden — sessions that are non-zero-cost only via `cache_read` stay visible. Malformed JSONL lines are silently skipped. One unreadable file or project directory does not abort the listing.
 
 #### Filtering
 
-Two groups of flags shared across subcommands narrow the result set
-(`inputs` adds one extra flag of its own — see [the inputs
-section](#inputs)).
+Two groups of flags shared across subcommands narrow the result set (`inputs` adds one extra flag of its own — see [the inputs section](#inputs)).
 
-**Scope** — apply to `list` and `inputs` (not `show`, which already pins a
-single session via its `<session-id>` argument):
+**Scope** — apply to `list` and `inputs` (not `show`, which already pins a single session via its `<session-id>` argument):
 
-- `--project <NAME>` — exact match against the short project name shown
-  in the `project` column. Case-sensitive; substring / glob / regex
-  matching is not supported.
-- `--since <RFC3339>` / `--until <RFC3339>` — inclusive bounds on the
-  session's `started_at`. ISO 8601 / RFC 3339 timestamps with an explicit
-  timezone offset (e.g. `2026-04-15T00:00:00Z`). Bare `YYYY-MM-DD` is
-  not accepted.
+- `--project <NAME>` — exact match against the short project name shown in the `project` column. Case-sensitive; substring / glob / regex matching is not supported.
+- `--since <RFC3339>` / `--until <RFC3339>` — inclusive bounds on the session's `started_at`. ISO 8601 / RFC 3339 timestamps with an explicit timezone offset (e.g. `2026-04-15T00:00:00Z`). Bare `YYYY-MM-DD` is not accepted.
 
 **Thresholds** — apply to `list`, `show`, and `inputs`:
 
-- `--min-tokens <N>` — show only rows with at least N billable tokens
-  (e.g. `--min-tokens 50000`).
-- `--min-cost <USD>` — show only rows costing at least USD (e.g.
-  `--min-cost 0.50`).
+- `--min-tokens <N>` — show only rows with at least N billable tokens (e.g. `--min-tokens 50000`).
+- `--min-cost <USD>` — show only rows costing at least USD (e.g. `--min-cost 0.50`).
 
-When multiple flags are passed, all must clear (logical AND) — for
-example, `cclens list --project beta --min-tokens 100` keeps only
-sessions in project `beta` whose total billable tokens are also at
-least 100. Rows whose cost is unknown (renders `—` in the `cost`
-column — i.e. an unknown-model row) are excluded by any active
-`--min-cost`. Orphan user exchanges in `show` (whose `tokens` cell
-renders `—`) are excluded by any `--min-tokens >= 1`.
+When multiple flags are passed, all must clear (logical AND) — for example, `cclens list --project beta --min-tokens 100` keeps only sessions in project `beta` whose total billable tokens are also at least 100. Rows whose cost is unknown (renders `—` in the `cost` column — i.e. an unknown-model row) are excluded by any active `--min-cost`. Orphan user exchanges in `show` (whose `tokens` cell renders `—`) are excluded by any `--min-tokens >= 1`.
 
-If the filter drops every row, stdout still prints the table header,
-stderr prints a one-line hint (`note: no rows matched <flags>`), and
-the exit code is 0.
+If the filter drops every row, stdout still prints the table header, stderr prints a one-line hint (`note: no rows matched <flags>`), and the exit code is 0.
 
 ### show
 
@@ -103,89 +70,49 @@ Drill into a single session and see a per-exchange token breakdown:
 $ cclens show <session-id>
 ```
 
-The session ID argument must match a full session UUID exactly (case-
-sensitive; surrounding whitespace is trimmed). Tool-use round-trips
-(assistant tool call → user tool result → assistant reply) collapse into a
-single exchange; orphaned trailing user turns (no assistant response) render
-with `—` in the tokens column.
+The session ID argument must match a full session UUID exactly (case- sensitive; surrounding whitespace is trimmed). Tool-use round-trips (assistant tool call → user tool result → assistant reply) collapse into a single exchange; orphaned trailing user turns (no assistant response) render with `—` in the tokens column.
 
-Unlike `list`, `show` does not hide zero-billable sessions — it's an
-inspection tool and will render any valid session ID.
+Unlike `list`, `show` does not hide zero-billable sessions — it's an inspection tool and will render any valid session ID.
 
 #### Columns
 
 - **datetime** — local-timezone timestamp of the turn (`YYYY-MM-DD HH:MM`).
 - **role** — `user` or `assistant`.
-- **tokens** — per-row token total. User rows count
-  `input + cache_creation` across the following assistant cluster; assistant
-  rows count `output`. Orphan user rows show `—`.
-- **cost** — per-row USD cost (`$X.XXXX`). User rows price `input +
-  cache_creation + cache_read`; assistant rows price `output`. Includes
-  `cache_read` (the `tokens` column doesn't). Orphan user rows show `—`.
-  Any unknown-model row shows `—`.
-- **cumulative** — running sum of billable tokens through this row. Matches
-  the session's `list` tokens value at the final assistant row.
-- **cum_cost** — running USD cost through this row. Strict propagation:
-  once any row is `—` (unknown model), every subsequent `cum_cost`
-  cell is also `—`.
-- **content** — user prose (or slash-command reconstruction) on user rows;
-  assistant reply preview with an optional `+N tool uses` suffix on assistant
-  rows. Truncated to 80 characters with `…`.
+- **tokens** — per-row token total. User rows count `input + cache_creation` across the following assistant cluster; assistant rows count `output`. Orphan user rows show `—`.
+- **cost** — per-row USD cost (`$X.XXXX`). User rows price `input + cache_creation + cache_read`; assistant rows price `output`. Includes `cache_read` (the `tokens` column doesn't). Orphan user rows show `—`. Any unknown-model row shows `—`.
+- **cumulative** — running sum of billable tokens through this row. Matches the session's `list` tokens value at the final assistant row.
+- **cum_cost** — running USD cost through this row. Strict propagation: once any row is `—` (unknown model), every subsequent `cum_cost` cell is also `—`.
+- **content** — user prose (or slash-command reconstruction) on user rows; assistant reply preview with an optional `+N tool uses` suffix on assistant rows. Truncated to 80 characters with `…`.
 
-The `--min-tokens` / `--min-cost` flags described under
-[Filtering](#filtering) work on `show` too — the filter unit is a
-collapsed exchange (so a user row and its assistant row are shown or
-hidden together). `cumulative` and `cum_cost` continue to fold over
-**every** exchange so the final visible row's running totals match
-the session's `list` totals — visible cells may "jump" between rows
-when the filter drops middle exchanges.
+The `--min-tokens` / `--min-cost` flags described under [Filtering](#filtering) work on `show` too — the filter unit is a collapsed exchange (so a user row and its assistant row are shown or hidden together). `cumulative` and `cum_cost` continue to fold over **every** exchange so the final visible row's running totals match the session's `list` totals — visible cells may "jump" between rows when the filter drops middle exchanges.
 
 ### inputs
 
-Rank user-controlled context files (CLAUDE.md, rules, skills, agents,
-plugin-shipped bundles, per-project ancestor files) by attributed
-cache-creation cost. Walks `~/.claude/{CLAUDE.md,rules,skills,agents}`,
-the plugin cache, and per-session ancestor + project-local context,
-then attributes each file's tokens to the matching-tier
-`cache_creation_*` events observed in the JSONL stream.
+Rank user-controlled context files (CLAUDE.md, rules, skills, agents, plugin-shipped bundles, per-project ancestor files) by attributed cache-creation cost. Walks `~/.claude/{CLAUDE.md,rules,skills,agents}`, the plugin cache, and per-session ancestor + project-local context, then attributes each file's tokens to the matching-tier `cache_creation_*` events observed in the JSONL stream.
 
 ```sh
 $ cclens inputs
 $ cclens inputs --project beta
 ```
 
-The same scope flags described under
-[Filtering](#filtering) — `--project`, `--since`, `--until` — apply
-here, plus an `inputs`-only flag:
+The same scope flags described under [Filtering](#filtering) — `--project`, `--since`, `--until` — apply here, plus an `inputs`-only flag:
 
-- `--session <UUID>` — restrict attribution to one session by full
-  session UUID. Exact match.
+- `--session <UUID>` — restrict attribution to one session by full session UUID. Exact match.
 
-`--min-tokens` / `--min-cost` apply as row-level filters on the
-rendered table (the per-tier coverage line below the table reflects
-every session in scope, not just the rows kept).
+`--min-tokens` / `--min-cost` apply as row-level filters on the rendered table (the per-tier coverage line below the table reflects every session in scope, not just the rows kept).
 
-The empty-result behavior matches `list`: if every row is dropped,
-stdout still prints the header, stderr prints
-`note: no rows matched <flags>`, and the exit code is 0.
+The empty-result behavior matches `list`: if every row is dropped, stdout still prints the header, stderr prints `note: no rows matched <flags>`, and the exit code is 0.
 
 ### pricing
 
-`cclens pricing refresh` re-fetches the LiteLLM catalog and overwrites
-the cache atomically. `cclens pricing info` prints the cache path,
-size, last-modified time, and Claude-entry count.
+`cclens pricing refresh` re-fetches the LiteLLM catalog and overwrites the cache atomically. `cclens pricing info` prints the cache path, size, last-modified time, and Claude-entry count.
 
-The catalog is fetched on first run (one synchronous HTTPS GET to
-`raw.githubusercontent.com`). It does not auto-expire; refresh is
-explicit. If the fetch fails, every cost cell renders `—` and a single
-stderr warning is printed — `list` and `show` still work.
+The catalog is fetched on first run (one synchronous HTTPS GET to `raw.githubusercontent.com`). It does not auto-expire; refresh is explicit. If the fetch fails, every cost cell renders `—` and a single stderr warning is printed — `list` and `show` still work.
 
-The cache lives at `dirs::cache_dir()/cclens/litellm-pricing.json`
-(macOS: `~/Library/Caches/cclens/`; Linux: `~/.cache/cclens/`). Two
-env vars override defaults:
+The cache lives at `dirs::cache_dir()/cclens/litellm-pricing.json` (macOS: `~/Library/Caches/cclens/`; Linux: `~/.cache/cclens/`). Two env vars override defaults:
+
 - `CCLENS_CACHE_DIR` — alternative cache directory
-- `CCLENS_PRICING_URL` — alternative catalog URL (accepts `http(s)://`,
-  `file://<absolute-path>`, or a plain filesystem path)
+- `CCLENS_PRICING_URL` — alternative catalog URL (accepts `http(s)://`, `file://<absolute-path>`, or a plain filesystem path)
 
 ## Development
 
