@@ -8,6 +8,9 @@
 //!   `cclens pricing refresh` can exit nonzero on failure.
 //! - `cache_info()` — infallible stat-like report for
 //!   `cclens pricing info`.
+//! - `PricingCatalog::sorted_entries` — iterate all entries (optionally
+//!   filtered to bare `claude-*` keys) in alphabetical order; used by
+//!   `cclens pricing list`.
 //! - `PricingCatalog::cost_for_components` /
 //!   `PricingCatalog::cost_for_turn` — generic cost folds.
 //! - `PricingCatalog::cost_for_cache_creation_1h` /
@@ -107,7 +110,7 @@ pub(crate) struct TieredRate {
 /// `LiteLLM` today only for two Bedrock-routed Sonnet 3.5 entries; for
 /// other models the `tier_from_raw` fallback inherits the 1h base rate.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ClaudePricing {
+pub struct ClaudePricing {
     pub(crate) input: TieredRate,
     pub(crate) output: TieredRate,
     pub(crate) cache_creation_5m: TieredRate,
@@ -155,6 +158,25 @@ impl PricingCatalog {
     /// the `pricing refresh` success report.
     pub(crate) fn claude_entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// All catalog entries sorted alphabetically by key.
+    ///
+    /// When `include_provider_keys` is false, only bare `claude-*` keys
+    /// are returned (no `/` or `.` in the key) — these carry canonical
+    /// Anthropic API rates and are the only keys that match Claude Code
+    /// transcript model strings. When true, all 250+ entries are
+    /// returned including provider/region variants.
+    #[must_use]
+    pub fn sorted_entries(&self, include_provider_keys: bool) -> Vec<(&str, &ClaudePricing)> {
+        let mut entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(k, _)| include_provider_keys || is_bare_key(k))
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        entries.sort_unstable_by_key(|(k, _)| *k);
+        entries
     }
 
     /// Parse a raw `LiteLLM` JSON payload, filter to Claude entries, and
@@ -256,6 +278,10 @@ fn is_claude_entry(key_lower: &str) -> bool {
     key_lower.starts_with("claude")
         || key_lower.starts_with("anthropic/")
         || key_lower.contains("claude-")
+}
+
+fn is_bare_key(key: &str) -> bool {
+    !key.contains('/') && !key.contains('.')
 }
 
 // `cache_creation_5m` and `cache_creation_1h` differ by one character
@@ -1118,5 +1144,62 @@ mod tests {
         // Sonnet has no above-200k entries — fallback to base rate.
         let sonnet = catalog.lookup("claude-sonnet-4-6").unwrap();
         assert!((sonnet.input.above_200k_rate - 0.000_003).abs() < 1e-12);
+    }
+
+    #[test]
+    fn is_bare_key_accepts_bare_claude_keys() {
+        assert!(is_bare_key("claude-opus-4-7"));
+        assert!(is_bare_key("claude-sonnet-4-6-20260514"));
+        assert!(is_bare_key("claude-haiku-4-5-20251001"));
+        assert!(is_bare_key("claude-3-5-sonnet-20241022"));
+    }
+
+    #[test]
+    fn is_bare_key_rejects_provider_prefixed_keys() {
+        assert!(!is_bare_key("bedrock/anthropic.claude-3-5-sonnet"));
+        assert!(!is_bare_key("us.anthropic.claude-opus-4-7"));
+        assert!(!is_bare_key("openrouter/anthropic/claude-sonnet-4-5"));
+        assert!(!is_bare_key("vertex_ai/claude-sonnet-4-6"));
+        assert!(!is_bare_key("anthropic.claude-3-5-sonnet-20241022-v2:0"));
+    }
+
+    #[test]
+    fn sorted_entries_returns_bare_keys_only_by_default() {
+        let bare = sample_pricing();
+        let provider = ClaudePricing {
+            input: sample_tier(10e-6, 10e-6),
+            ..bare
+        };
+        let catalog = catalog_with(&[
+            ("claude-sonnet-4-6", bare),
+            ("claude-opus-4-7", bare),
+            ("bedrock/anthropic.claude-opus-4-7", provider),
+            ("us.anthropic.claude-sonnet-4-6", provider),
+        ]);
+        let bare_only = catalog.sorted_entries(false);
+        assert_eq!(bare_only.len(), 2);
+        assert_eq!(bare_only[0].0, "claude-opus-4-7");
+        assert_eq!(bare_only[1].0, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn sorted_entries_returns_all_keys_when_include_provider_keys() {
+        let bare = sample_pricing();
+        let provider = ClaudePricing {
+            input: sample_tier(10e-6, 10e-6),
+            ..bare
+        };
+        let catalog = catalog_with(&[
+            ("claude-sonnet-4-6", bare),
+            ("claude-opus-4-7", bare),
+            ("bedrock/anthropic.claude-opus-4-7", provider),
+            ("us.anthropic.claude-sonnet-4-6", provider),
+        ]);
+        let all = catalog.sorted_entries(true);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0].0, "bedrock/anthropic.claude-opus-4-7");
+        assert_eq!(all[1].0, "claude-opus-4-7");
+        assert_eq!(all[2].0, "claude-sonnet-4-6");
+        assert_eq!(all[3].0, "us.anthropic.claude-sonnet-4-6");
     }
 }

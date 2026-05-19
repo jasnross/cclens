@@ -5,7 +5,8 @@
 //! types — keeps the library/CLI seam visible.
 //!
 //! Public API (binary-internal):
-//! - `Cli` / `Command` / `PricingAction` — clap parser types.
+//! - `Cli` / `Command` / `PricingAction` (variants: `Refresh`, `Info`,
+//!   `List`) — clap parser types.
 //! - `ThresholdsFilterArgs` — flattened `--min-tokens` / `--min-cost`
 //!   threshold flags; `.thresholds_filter()` produces a library
 //!   `ThresholdsFilter`.
@@ -293,6 +294,13 @@ pub(super) enum PricingAction {
     Refresh,
     /// Print cache path, size, mtime, and Claude-entry count.
     Info,
+    /// Show per-model rates for all Claude entries in the catalog.
+    List {
+        /// Include provider/region-prefixed entries (`bedrock`, `vertex_ai`,
+        /// etc.) in addition to bare `claude-*` keys.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn default_projects_dir() -> PathBuf {
@@ -488,5 +496,27 @@ mod tests {
             "--session aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         );
         assert!(with_session.any_active());
+    }
+
+    #[test]
+    fn pricing_list_parses_without_all_flag() {
+        let cli = Cli::try_parse_from(["cclens", "pricing", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Pricing {
+                action: PricingAction::List { all: false }
+            })
+        ));
+    }
+
+    #[test]
+    fn pricing_list_parses_with_all_flag() {
+        let cli = Cli::try_parse_from(["cclens", "pricing", "list", "--all"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Pricing {
+                action: PricingAction::List { all: true }
+            })
+        ));
     }
 }

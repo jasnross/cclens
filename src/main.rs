@@ -15,7 +15,7 @@ use cclens::domain::{Turn, TurnOrigin};
 use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
-use cclens::rendering::{render_inputs, render_session, render_table};
+use cclens::rendering::{render_inputs, render_prices, render_session, render_table};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::{
@@ -321,6 +321,16 @@ fn run_pricing(action: PricingAction) -> anyhow::Result<()> {
                 report.previous_size, report.new_size,
             );
             println!("  Claude entries: {}", report.entry_count);
+            Ok(())
+        }
+        PricingAction::List { all } => {
+            let catalog = pricing::load_catalog();
+            let entries = catalog.sorted_entries(all);
+            if entries.is_empty() {
+                eprintln!("note: pricing catalog is empty — try `cclens pricing refresh`");
+            } else {
+                println!("{}", render_prices(&entries));
+            }
             Ok(())
         }
         PricingAction::Info => {

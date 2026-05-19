@@ -1,5 +1,5 @@
-//! Comfy-table rendering for the `list`, `show`, and `inputs`
-//! subcommands.
+//! Comfy-table rendering for the `list`, `show`, `inputs`, and
+//! `pricing list` subcommands.
 //!
 //! Public API:
 //! - `render_table(&[Session]) -> String` — the `list` view; appends a
@@ -20,6 +20,9 @@
 //! - `render_inputs(&[AttributionRow], &CoverageStats) -> String` —
 //!   the `inputs` view; returns the table plus a per-tier coverage
 //!   line below it.
+//! - `render_prices(&[(&str, &ClaudePricing)]) -> String` — the
+//!   `pricing list` view; renders per-model rates in `$/MTok` with
+//!   conditional sub-rows for models whose above-200k rates differ.
 //!
 //! Show-view content cells (every row, parent and subagent) are
 //! truncated to `SHOW_CONTENT_MAX_CHARS` so a long subagent prefix
@@ -29,9 +32,9 @@
 //! `Task[<agent_type>]` when the input carries a `subagent_type`,
 //! pointing the parent's tool-loop row at the matching subagent.
 //!
-//! All formatter helpers (`format_cost_opt`, `truncate_title`,
-//! `format_local`, `format_local_or_empty`) and the cumulative-fold
-//! helpers are module-private.
+//! All formatter helpers (`format_cost_opt`, `format_rate_mtok`,
+//! `truncate_title`, `format_local`, `format_local_or_empty`) and
+//! the cumulative-fold helpers are module-private.
 
 use chrono::{DateTime, Utc};
 use comfy_table::presets::NOTHING;
@@ -43,7 +46,7 @@ use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
 use crate::domain::{CacheCreation, Session, Turn, TurnOrigin, Usage};
 use crate::filter::ThresholdsFilter;
 use crate::inventory::ContextFileKind;
-use crate::pricing::PricingCatalog;
+use crate::pricing::{ClaudePricing, PricingCatalog};
 
 const TITLE_MAX_CHARS: usize = 80;
 
@@ -82,10 +85,22 @@ const INPUTS_ATTRIBUTED_COST_COL_INDEX: usize = 6;
 
 const INPUTS_PATH_MAX_CHARS: usize = 60;
 
+// `pricing list` view column indices. Header order:
+//   model | tier | input | output | cache_rd | cache_5m | cache_1h
+const PRICES_INPUT_COL_INDEX: usize = 2;
+const PRICES_OUTPUT_COL_INDEX: usize = 3;
+const PRICES_CACHE_RD_COL_INDEX: usize = 4;
+const PRICES_CACHE_5M_COL_INDEX: usize = 5;
+const PRICES_CACHE_1H_COL_INDEX: usize = 6;
+
 /// Format an optional cost as `$X.XXXX` or `—` for the unknown-model
 /// case. Centralized so list and show share the exact same vocabulary.
 fn format_cost_opt(c: Option<f64>) -> String {
     c.map_or_else(|| "—".to_string(), |n| format!("${n:.4}"))
+}
+
+fn format_rate_mtok(per_token_rate: f64) -> String {
+    format!("${:.2}", per_token_rate * 1_000_000.0)
 }
 
 fn truncate_title(s: &str, max: usize) -> String {
@@ -590,6 +605,74 @@ pub fn render_session(
         col.set_cell_alignment(CellAlignment::Right);
     }
     (format!("{table}"), rows_shown)
+}
+
+// ---- pricing list view ----
+
+#[allow(clippy::float_cmp)]
+fn tiers_differ(pricing: &ClaudePricing) -> bool {
+    let rates = [
+        &pricing.input,
+        &pricing.output,
+        &pricing.cache_read,
+        &pricing.cache_creation_5m,
+        &pricing.cache_creation_1h,
+    ];
+    rates.iter().any(|r| r.first_200k_rate != r.above_200k_rate)
+}
+
+#[must_use]
+pub fn render_prices(entries: &[(&str, &ClaudePricing)]) -> String {
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+    table.set_header(vec![
+        "model", "tier", "input", "output", "cache_rd", "cache_5m", "cache_1h",
+    ]);
+    for &(model, pricing) in entries {
+        if tiers_differ(pricing) {
+            table.add_row(vec![
+                model.to_string(),
+                "\u{2264}200k".to_string(),
+                format_rate_mtok(pricing.input.first_200k_rate),
+                format_rate_mtok(pricing.output.first_200k_rate),
+                format_rate_mtok(pricing.cache_read.first_200k_rate),
+                format_rate_mtok(pricing.cache_creation_5m.first_200k_rate),
+                format_rate_mtok(pricing.cache_creation_1h.first_200k_rate),
+            ]);
+            table.add_row(vec![
+                String::new(),
+                ">200k".to_string(),
+                format_rate_mtok(pricing.input.above_200k_rate),
+                format_rate_mtok(pricing.output.above_200k_rate),
+                format_rate_mtok(pricing.cache_read.above_200k_rate),
+                format_rate_mtok(pricing.cache_creation_5m.above_200k_rate),
+                format_rate_mtok(pricing.cache_creation_1h.above_200k_rate),
+            ]);
+        } else {
+            table.add_row(vec![
+                model.to_string(),
+                String::new(),
+                format_rate_mtok(pricing.input.first_200k_rate),
+                format_rate_mtok(pricing.output.first_200k_rate),
+                format_rate_mtok(pricing.cache_read.first_200k_rate),
+                format_rate_mtok(pricing.cache_creation_5m.first_200k_rate),
+                format_rate_mtok(pricing.cache_creation_1h.first_200k_rate),
+            ]);
+        }
+    }
+    for idx in [
+        PRICES_INPUT_COL_INDEX,
+        PRICES_OUTPUT_COL_INDEX,
+        PRICES_CACHE_RD_COL_INDEX,
+        PRICES_CACHE_5M_COL_INDEX,
+        PRICES_CACHE_1H_COL_INDEX,
+    ] {
+        if let Some(col) = table.column_mut(idx) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+    }
+    let table_str = format!("{table}");
+    format!("{table_str}\n\nRates in $/MTok (dollars per million tokens).")
 }
 
 // ---- inputs view ----
@@ -1952,6 +2035,133 @@ mod tests {
             assert!(!label.is_empty(), "label for {k:?} should not be empty");
         }
     }
+
+    // --- pricing list view ---
+
+    use crate::pricing::TieredRate;
+
+    fn uniform_pricing(rate: f64) -> ClaudePricing {
+        let tier = TieredRate {
+            first_200k_rate: rate,
+            above_200k_rate: rate,
+        };
+        ClaudePricing {
+            input: tier,
+            output: tier,
+            cache_creation_5m: tier,
+            cache_creation_1h: tier,
+            cache_read: tier,
+        }
+    }
+
+    fn split_pricing() -> ClaudePricing {
+        ClaudePricing {
+            input: TieredRate {
+                first_200k_rate: 3e-6,
+                above_200k_rate: 6e-6,
+            },
+            output: TieredRate {
+                first_200k_rate: 15e-6,
+                above_200k_rate: 22.5e-6,
+            },
+            cache_read: TieredRate {
+                first_200k_rate: 0.3e-6,
+                above_200k_rate: 0.6e-6,
+            },
+            cache_creation_5m: TieredRate {
+                first_200k_rate: 3.75e-6,
+                above_200k_rate: 7.5e-6,
+            },
+            cache_creation_1h: TieredRate {
+                first_200k_rate: 3e-6,
+                above_200k_rate: 6e-6,
+            },
+        }
+    }
+
+    #[test]
+    fn tiers_differ_returns_false_for_uniform_rates() {
+        assert!(!tiers_differ(&uniform_pricing(3e-6)));
+    }
+
+    #[test]
+    fn tiers_differ_returns_true_when_any_rate_differs() {
+        assert!(tiers_differ(&split_pricing()));
+        let mut only_output_differs = uniform_pricing(3e-6);
+        only_output_differs.output.above_200k_rate = 6e-6;
+        assert!(tiers_differ(&only_output_differs));
+    }
+
+    #[test]
+    fn format_rate_mtok_converts_per_token_to_dollars_per_million() {
+        assert_eq!(format_rate_mtok(3e-6), "$3.00");
+        assert_eq!(format_rate_mtok(15e-6), "$15.00");
+        assert_eq!(format_rate_mtok(0.3e-6), "$0.30");
+        assert_eq!(format_rate_mtok(3.75e-6), "$3.75");
+        assert_eq!(format_rate_mtok(0.0), "$0.00");
+    }
+
+    #[test]
+    fn render_prices_uniform_tier_produces_one_row_per_model() {
+        let p = uniform_pricing(3e-6);
+        let entries = vec![("claude-haiku-4-5", &p)];
+        let out = render_prices(&entries);
+        assert!(out.contains("claude-haiku-4-5"));
+        assert!(out.contains("$3.00"));
+        assert!(out.contains("$/MTok"));
+        let data_lines: Vec<&str> = out.lines().filter(|l| l.contains("claude-haiku")).collect();
+        assert_eq!(
+            data_lines.len(),
+            1,
+            "uniform-tier model should have exactly one row"
+        );
+    }
+
+    #[test]
+    fn render_prices_split_tier_produces_two_rows() {
+        let p = split_pricing();
+        let entries = vec![("claude-sonnet-4-5", &p)];
+        let out = render_prices(&entries);
+        assert!(out.contains("claude-sonnet-4-5"));
+        assert!(out.contains("\u{2264}200k"));
+        assert!(out.contains(">200k"));
+        assert!(out.contains("$3.00"));
+        assert!(out.contains("$6.00"));
+        let tier_rows: Vec<&str> = out.lines().filter(|l| l.contains("200k")).collect();
+        assert_eq!(
+            tier_rows.len(),
+            2,
+            "split-tier model should produce two sub-rows (\u{2264}200k and >200k)"
+        );
+    }
+
+    #[test]
+    fn render_prices_mixed_entries_sort_and_display() {
+        let uniform = uniform_pricing(15e-6);
+        let split = split_pricing();
+        let entries = vec![("claude-opus-4-7", &uniform), ("claude-sonnet-4-5", &split)];
+        let out = render_prices(&entries);
+        let opus_pos = out.find("claude-opus-4-7").expect("opus present");
+        let sonnet_pos = out.find("claude-sonnet-4-5").expect("sonnet present");
+        assert!(
+            opus_pos < sonnet_pos,
+            "entries should appear in order given"
+        );
+        assert!(out.contains("$15.00"));
+        assert!(out.contains("$3.00"));
+    }
+
+    #[test]
+    fn render_prices_includes_all_header_columns() {
+        let out = render_prices(&[]);
+        for col in [
+            "model", "tier", "input", "output", "cache_rd", "cache_5m", "cache_1h",
+        ] {
+            assert!(out.contains(col), "header column `{col}` missing");
+        }
+    }
+
+    // --- pretty_path ---
 
     #[test]
     fn pretty_path_replaces_home_with_tilde() {
