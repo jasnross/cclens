@@ -26,7 +26,7 @@
 //!   into ranked `AttributionRow`s. Each file's row reports
 //!   `loads_1h` / `loads_5m` — the actual count of cache-creation
 //!   events that loaded its body, not a session-wide multiplier. Per-
-//!   tier pricing comes from `PricingCatalog::cost_for_cache_creation_{1h,5m}`.
+//!   tier pricing comes from `PricingCatalog::cost_for_components`.
 //! - `compute_coverage(...)` — per-tier `(observed, attributed,
 //!   ratio)` triple summed across every parent + subagent session.
 //!
@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::domain::{Role, Turn};
+use crate::domain::{CacheCreation, Role, Turn};
 use crate::filter::SessionFilter;
 use crate::inventory::{
     CacheTier, ContextFile, ContextFileKind, InventoryConfig, walk_for_session,
@@ -557,12 +557,30 @@ fn build_row(
             continue;
         }
         let per_load = match tier {
-            CacheTier::Long1h => {
-                catalog.cost_for_cache_creation_1h(file.tokens, meta.model.as_deref())
-            }
-            CacheTier::Short5m => {
-                catalog.cost_for_cache_creation_5m(file.tokens, meta.model.as_deref())
-            }
+            CacheTier::Long1h => catalog
+                .cost_for_components(
+                    0,
+                    0,
+                    CacheCreation {
+                        ephemeral_1h: file.tokens,
+                        ephemeral_5m: 0,
+                    },
+                    0,
+                    meta.model.as_deref(),
+                )
+                .map(|b| b.cache_creation_1h),
+            CacheTier::Short5m => catalog
+                .cost_for_components(
+                    0,
+                    0,
+                    CacheCreation {
+                        ephemeral_5m: file.tokens,
+                        ephemeral_1h: 0,
+                    },
+                    0,
+                    meta.model.as_deref(),
+                )
+                .map(|b| b.cache_creation_5m),
         };
         match per_load {
             Some(c) => {

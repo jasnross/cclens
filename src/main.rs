@@ -98,7 +98,10 @@ fn run_list(
                 &subagent_turn_lists,
                 &catalog,
             ) && session_filter.accepts(&session.project_short_name, session.started_at)
-                && thresholds_filter.matches(session.total_billable, session.total_cost)
+                && thresholds_filter.matches(
+                    session.total_billable,
+                    session.cost_breakdown.map(|b| b.total()),
+                )
             {
                 sessions.push(session);
             }

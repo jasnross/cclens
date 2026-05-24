@@ -12,10 +12,8 @@
 //!   filtered to bare `claude-*` keys) in alphabetical order; used by
 //!   `cclens pricing list`.
 //! - `PricingCatalog::cost_for_components` /
-//!   `PricingCatalog::cost_for_turn` — generic cost folds.
-//! - `PricingCatalog::cost_for_cache_creation_1h` /
-//!   `PricingCatalog::cost_for_cache_creation_5m` — per-tier
-//!   cache-creation cost helpers used by the `inputs` subcommand.
+//!   `PricingCatalog::cost_for_turn` — return `Option<CostBreakdown>`
+//!   preserving per-component costs through to rendering.
 //!
 //! The catalog comes from `LiteLLM`'s
 //! `model_prices_and_context_window.json`. Pricing is computed with
@@ -32,7 +30,7 @@ use std::time::SystemTime;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::domain::{CacheCreation, Usage};
+use crate::domain::{CacheCreation, CostBreakdown, Usage};
 
 // ---- raw schema ----
 
@@ -358,17 +356,18 @@ fn tiered_cost(tokens: u64, rate: &TieredRate) -> f64 {
 }
 
 impl PricingCatalog {
-    /// Compute the total cost for a set of token components.
+    /// Compute the per-component cost breakdown for a set of token counts.
     ///
     /// Diverges from `Usage::billable()` by including `cache_read` —
     /// cache reads are billed (at a heavily discounted rate) and cost
     /// should reflect that.
     ///
-    /// Returns `Some(0.0)` without any lookup if all four counts are
-    /// zero (covers synthetic / zero-usage turns on any model, including
-    /// `None`). Otherwise returns `Some(sum)` on model hit or `None` on
-    /// miss — strict `None` propagation is the contract that Phase 3's
-    /// session and running-total folds rely on.
+    /// Returns `Some(CostBreakdown::default())` without any lookup if
+    /// all four counts are zero (covers synthetic / zero-usage turns on
+    /// any model, including `None`). Otherwise returns
+    /// `Some(breakdown)` on model hit or `None` on miss — strict `None`
+    /// propagation is the contract that session and running-total folds
+    /// rely on.
     #[must_use]
     pub fn cost_for_components(
         &self,
@@ -377,66 +376,30 @@ impl PricingCatalog {
         cache_creation: CacheCreation,
         cache_read: u64,
         model: Option<&str>,
-    ) -> Option<f64> {
+    ) -> Option<CostBreakdown> {
         if input == 0 && output == 0 && cache_creation.total() == 0 && cache_read == 0 {
-            return Some(0.0);
+            return Some(CostBreakdown::default());
         }
         let model = model?;
         let pricing = self.lookup(model)?;
-        Some(
-            tiered_cost(input, &pricing.input)
-                + tiered_cost(output, &pricing.output)
-                + tiered_cost(cache_creation.ephemeral_5m, &pricing.cache_creation_5m)
-                + tiered_cost(cache_creation.ephemeral_1h, &pricing.cache_creation_1h)
-                + tiered_cost(cache_read, &pricing.cache_read),
-        )
+        Some(CostBreakdown {
+            input: tiered_cost(input, &pricing.input),
+            output: tiered_cost(output, &pricing.output),
+            cache_creation_5m: tiered_cost(cache_creation.ephemeral_5m, &pricing.cache_creation_5m),
+            cache_creation_1h: tiered_cost(cache_creation.ephemeral_1h, &pricing.cache_creation_1h),
+            cache_read: tiered_cost(cache_read, &pricing.cache_read),
+        })
     }
 
     /// Thin wrapper over `cost_for_components` for callers that already
     /// hold a `Usage`.
     #[must_use]
-    pub fn cost_for_turn(&self, usage: &Usage, model: Option<&str>) -> Option<f64> {
+    pub fn cost_for_turn(&self, usage: &Usage, model: Option<&str>) -> Option<CostBreakdown> {
         self.cost_for_components(
             usage.input,
             usage.output,
             usage.cache_creation,
             usage.cache_read,
-            model,
-        )
-    }
-
-    /// Cost of `tokens` priced at the 1-hour cache-creation tier for `model`.
-    /// Returns `Some(0.0)` when `tokens == 0`; `None` when `model` is
-    /// `Some(unknown)` and `tokens > 0`. Used by the `inputs` subcommand
-    /// to attribute system-prompt-region content (`CLAUDE.md`, rules, agents).
-    #[must_use]
-    pub fn cost_for_cache_creation_1h(&self, tokens: u64, model: Option<&str>) -> Option<f64> {
-        self.cost_for_components(
-            0,
-            0,
-            CacheCreation {
-                ephemeral_1h: tokens,
-                ephemeral_5m: 0,
-            },
-            0,
-            model,
-        )
-    }
-
-    /// Cost of `tokens` priced at the 5-minute cache-creation tier for
-    /// `model`. Same null/zero contracts as the 1h variant. Used by the
-    /// `inputs` subcommand to attribute on-demand content (skills,
-    /// commands).
-    #[must_use]
-    pub fn cost_for_cache_creation_5m(&self, tokens: u64, model: Option<&str>) -> Option<f64> {
-        self.cost_for_components(
-            0,
-            0,
-            CacheCreation {
-                ephemeral_5m: tokens,
-                ephemeral_1h: 0,
-            },
-            0,
             model,
         )
     }
@@ -750,11 +713,11 @@ mod tests {
         let empty = PricingCatalog::empty();
         assert_eq!(
             empty.cost_for_components(0, 0, CacheCreation::default(), 0, Some("any")),
-            Some(0.0),
+            Some(CostBreakdown::default()),
         );
         assert_eq!(
             empty.cost_for_components(0, 0, CacheCreation::default(), 0, None),
-            Some(0.0),
+            Some(CostBreakdown::default()),
         );
     }
 
@@ -869,18 +832,17 @@ mod tests {
         // cache_creation_5m:  500 * 3.75e-6 = 0.001875
         // cache_read:       10000 * 0.3e-6  = 0.003
         // total                             = 0.009375
-        let cost = c
+        let breakdown = c
             .cost_for_turn(&usage, Some("claude-opus-4-7"))
             .expect("pricing present");
-        assert!((cost - 0.009_375).abs() < 1e-9, "got {cost}");
+        let total = breakdown.total();
+        assert!((total - 0.009_375).abs() < 1e-9, "got {total}");
     }
 
     #[test]
     fn cost_for_components_counts_cache_read_even_when_other_fields_zero() {
-        // Regression: cache_read-only usage is non-zero; a session with
-        // only cache reads must not appear free.
         let c = catalog_with(&[("claude-opus-4-7", sample_pricing())]);
-        let cost = c
+        let breakdown = c
             .cost_for_components(
                 0,
                 0,
@@ -890,14 +852,13 @@ mod tests {
             )
             .expect("pricing present");
         // 1000 * 0.3e-6 = 0.0003
-        assert!((cost - 0.0003).abs() < 1e-12);
+        assert!((breakdown.cache_read - 0.0003).abs() < 1e-12);
+        assert!((breakdown.total() - 0.0003).abs() < 1e-12);
     }
 
     #[test]
     #[allow(clippy::similar_names)]
     fn cost_for_components_splits_5m_and_1h() {
-        // Pricing with distinct 5m and 1h rates:
-        // 5m base: 3.75e-6, 1h: 6e-6 (from sample_pricing).
         let c = catalog_with(&[("claude-opus-4-7", sample_pricing())]);
         let only_5m = c
             .cost_for_components(
@@ -912,7 +873,11 @@ mod tests {
             )
             .expect("pricing present");
         // 1000 * 3.75e-6 = 0.00375
-        assert!((only_5m - 0.003_75).abs() < 1e-12, "got {only_5m}");
+        assert!(
+            (only_5m.cache_creation_5m - 0.003_75).abs() < 1e-12,
+            "got {only_5m:?}",
+        );
+        assert!((only_5m.cache_creation_1h).abs() < 1e-12);
 
         let only_1h = c
             .cost_for_components(
@@ -927,7 +892,11 @@ mod tests {
             )
             .expect("pricing present");
         // 1000 * 6e-6 = 0.006
-        assert!((only_1h - 0.006).abs() < 1e-12, "got {only_1h}");
+        assert!(
+            (only_1h.cache_creation_1h - 0.006).abs() < 1e-12,
+            "got {only_1h:?}",
+        );
+        assert!((only_1h.cache_creation_5m).abs() < 1e-12);
 
         let both = c
             .cost_for_components(
@@ -942,61 +911,36 @@ mod tests {
             )
             .expect("pricing present");
         // 500 * 3.75e-6 + 500 * 6e-6 = 0.001875 + 0.003 = 0.004875
-        assert!((both - 0.004_875).abs() < 1e-12, "got {both}");
+        assert!((both.total() - 0.004_875).abs() < 1e-12, "got {both:?}");
     }
 
     #[test]
-    fn cost_for_cache_creation_1h_zero_short_circuits_unknown_model() {
-        let empty = PricingCatalog::empty();
-        assert_eq!(empty.cost_for_cache_creation_1h(0, Some("any")), Some(0.0));
-        assert_eq!(empty.cost_for_cache_creation_1h(0, None), Some(0.0));
-    }
-
-    #[test]
-    fn cost_for_cache_creation_5m_zero_short_circuits_unknown_model() {
-        let empty = PricingCatalog::empty();
-        assert_eq!(empty.cost_for_cache_creation_5m(0, Some("any")), Some(0.0));
-        assert_eq!(empty.cost_for_cache_creation_5m(0, None), Some(0.0));
-    }
-
-    #[test]
-    fn cost_for_cache_creation_1h_unknown_model_returns_none() {
-        let empty = PricingCatalog::empty();
-        assert_eq!(empty.cost_for_cache_creation_1h(1, Some("any")), None);
-        assert_eq!(empty.cost_for_cache_creation_1h(1, None), None);
-    }
-
-    #[test]
-    fn cost_for_cache_creation_5m_unknown_model_returns_none() {
-        let empty = PricingCatalog::empty();
-        assert_eq!(empty.cost_for_cache_creation_5m(1, Some("any")), None);
-        assert_eq!(empty.cost_for_cache_creation_5m(1, None), None);
-    }
-
-    #[test]
-    fn cost_for_cache_creation_1h_uses_1h_rate_not_5m() {
-        // Regression guard against an ephemeral_1h / ephemeral_5m field
-        // swap inside the helper. sample_pricing() sets distinct rates
-        // (1h base 6e-6, 5m base 3.75e-6); the 1h helper must price at
-        // the 1h rate.
+    fn cost_for_components_returns_correct_per_field_values() {
         let c = catalog_with(&[("claude-opus-4-7", sample_pricing())]);
-        let cost = c
-            .cost_for_cache_creation_1h(1000, Some("claude-opus-4-7"))
+        let b = c
+            .cost_for_components(
+                1000,
+                100,
+                CacheCreation {
+                    ephemeral_5m: 500,
+                    ephemeral_1h: 200,
+                },
+                10_000,
+                Some("claude-opus-4-7"),
+            )
             .expect("pricing present");
-        // 1000 * 6e-6 = 0.006 (1h rate), not 1000 * 3.75e-6 = 0.00375 (5m rate).
-        assert!((cost - 0.006).abs() < 1e-12, "got {cost}");
-    }
-
-    #[test]
-    fn cost_for_cache_creation_5m_uses_5m_rate_not_1h() {
-        // Symmetric regression guard: the 5m helper must price at the
-        // 5m rate, not the 1h rate.
-        let c = catalog_with(&[("claude-opus-4-7", sample_pricing())]);
-        let cost = c
-            .cost_for_cache_creation_5m(1000, Some("claude-opus-4-7"))
-            .expect("pricing present");
-        // 1000 * 3.75e-6 = 0.00375 (5m rate), not 1000 * 6e-6 = 0.006 (1h rate).
-        assert!((cost - 0.003_75).abs() < 1e-12, "got {cost}");
+        // input: 1000 * 3e-6 = 0.003
+        assert!((b.input - 0.003).abs() < 1e-12);
+        // output: 100 * 15e-6 = 0.0015
+        assert!((b.output - 0.0015).abs() < 1e-12);
+        // cache_creation_5m: 500 * 3.75e-6 = 0.001875
+        assert!((b.cache_creation_5m - 0.001_875).abs() < 1e-12);
+        // cache_creation_1h: 200 * 6e-6 = 0.0012
+        assert!((b.cache_creation_1h - 0.0012).abs() < 1e-12);
+        // cache_read: 10000 * 0.3e-6 = 0.003
+        assert!((b.cache_read - 0.003).abs() < 1e-12);
+        // total = 0.003 + 0.0015 + 0.001875 + 0.0012 + 0.003 = 0.010575
+        assert!((b.total() - 0.010_575).abs() < 1e-12);
     }
 
     #[test]

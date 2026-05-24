@@ -29,7 +29,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::domain::{Role, Session, Turn, Usage};
+use crate::domain::{CostBreakdown, Role, Session, Turn, Usage};
 use crate::pricing::PricingCatalog;
 
 // ---- session aggregation ----
@@ -47,17 +47,14 @@ pub fn aggregate(
         .chain(subagent_turn_lists.iter().flatten())
         .filter_map(billable_from_turn)
         .sum();
-    let total_cost = total_session_cost(&turns, subagent_turn_lists, catalog);
+    let cost_breakdown = total_session_cost(&turns, subagent_turn_lists, catalog);
     // Drop the session only when it's zero-billable AND its cost is
     // *known* to be exactly zero. A session with only `cache_read`
-    // tokens has `total_billable == 0` but a non-zero `total_cost` —
-    // keep it visible. A session whose cost couldn't be resolved
-    // (`None` from an unknown-model assistant turn) also stays
-    // visible and renders as `—`. Using `matches!(_, Some(c) if c ==
-    // 0.0)` rather than `unwrap_or(0.0) == 0.0` is what preserves the
-    // second case — `unwrap_or(0.0)` would silently treat `None` as
-    // zero and drop the session.
-    if total_billable == 0 && matches!(total_cost, Some(c) if c == 0.0) {
+    // tokens has `total_billable == 0` but a non-zero cost — keep it
+    // visible. A session whose cost couldn't be resolved (`None` from
+    // an unknown-model assistant turn) also stays visible and renders
+    // as `—`.
+    if total_billable == 0 && matches!(cost_breakdown, Some(b) if b.total() == 0.0) {
         return None;
     }
     let started_at = turns.iter().filter_map(|t| t.timestamp).min()?;
@@ -72,7 +69,7 @@ pub fn aggregate(
         title,
         turns,
         total_billable,
-        total_cost,
+        cost_breakdown,
     })
 }
 
@@ -93,21 +90,18 @@ fn total_session_cost(
     turns: &[Turn],
     subagent_turn_lists: &[Vec<Turn>],
     catalog: &PricingCatalog,
-) -> Option<f64> {
-    let mut sum = 0.0;
+) -> Option<CostBreakdown> {
+    let mut sum = CostBreakdown::default();
     for turn in turns.iter().chain(subagent_turn_lists.iter().flatten()) {
         match &turn.role {
             Role::Assistant => {}
             Role::User | Role::Attachment | Role::System | Role::Other(_) => continue,
         }
         let Some(usage) = turn.usage.as_ref() else {
-            // Assistant turn with no usage is treated as zero-cost
-            // (matches `billable_from_turn`'s None → 0 fold via
-            // `filter_map`); does not collapse the total to `None`.
             continue;
         };
-        let cost = catalog.cost_for_turn(usage, turn.model.as_deref())?;
-        sum += cost;
+        let breakdown = catalog.cost_for_turn(usage, turn.model.as_deref())?;
+        sum += breakdown;
     }
     Some(sum)
 }
@@ -381,14 +375,12 @@ pub(crate) fn exchange_filter_totals(
     let mut sum = 0.0;
     for turn in &exchange.assistants {
         let Some(usage) = turn.usage.as_ref() else {
-            // Assistant turn with no usage contributes zero (matches
-            // `total_session_cost`'s rule); does not collapse the sum.
             continue;
         };
-        let Some(cost) = catalog.cost_for_turn(usage, turn.model.as_deref()) else {
+        let Some(breakdown) = catalog.cost_for_turn(usage, turn.model.as_deref()) else {
             return (tokens, None);
         };
-        sum += cost;
+        sum += breakdown.total();
     }
     (tokens, Some(sum))
 }
@@ -666,7 +658,7 @@ mod tests {
         assert_eq!(session.total_billable, 300);
         // Empty catalog can't price the assistant turns; total_cost
         // collapses to None per the strict-propagation rule.
-        assert_eq!(session.total_cost, None);
+        assert_eq!(session.cost_breakdown.map(|b| b.total()), None);
     }
 
     #[test]
@@ -711,7 +703,7 @@ mod tests {
         )
         .expect("unknown-model zero-billable session must NOT be filtered out");
         assert_eq!(session.total_billable, 0);
-        assert_eq!(session.total_cost, None);
+        assert_eq!(session.cost_breakdown.map(|b| b.total()), None);
     }
 
     // --- short-name derivation ---
@@ -821,7 +813,7 @@ mod tests {
         //   = (0.00015 + 0.0015) + (0.000075 + 0.001125)
         //   = 0.00165 + 0.0012
         //   = 0.00285
-        let actual = session.total_cost.expect("priced");
+        let actual = session.cost_breakdown.map(|b| b.total()).expect("priced");
         assert!(
             (actual - 0.00285).abs() < 1e-9,
             "expected ~0.00285, got {actual}",
@@ -859,7 +851,7 @@ mod tests {
             &sample_catalog(),
         )
         .expect("session present");
-        assert_eq!(session.total_cost, None);
+        assert_eq!(session.cost_breakdown.map(|b| b.total()), None);
     }
 
     #[test]
@@ -876,7 +868,7 @@ mod tests {
         // Cost = 50*15e-6 + 75*75e-6 + 25*18.75e-6
         //      = 0.00075 + 0.005625 + 0.000469 (approx 0.00046875)
         //      = 0.00684375
-        let actual = session.total_cost.expect("priced");
+        let actual = session.cost_breakdown.map(|b| b.total()).expect("priced");
         assert!(
             (actual - 0.006_843_75).abs() < 1e-9,
             "expected ~0.00684375, got {actual}",

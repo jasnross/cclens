@@ -7,9 +7,9 @@
 //!   visible. The totals row's `title` cell carries a right-aligned
 //!   `total` label flush against the tokens column; its numeric cells
 //!   use the same formatters as data rows. Cost follows the same
-//!   strict-`None` propagation as `Session.total_cost` — any visible
-//!   session with `total_cost: None` collapses the totals cost cell
-//!   to `—`.
+//!   strict-`None` propagation as `Session.cost_breakdown` — any
+//!   visible session with `cost_breakdown: None` collapses the totals
+//!   cost cell to `—`.
 //! - `render_session(&[Exchange<'_>], &PricingCatalog, ThresholdsFilter) -> (String, usize)`
 //!   — the `show` view; returns rendered table plus visible-row count
 //!   for the empty-result hint decision. Dispatches on
@@ -43,7 +43,7 @@ use serde_json::Value;
 
 use crate::aggregation::{Exchange, exchange_filter_totals, user_display_string};
 use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
-use crate::domain::{CacheCreation, Session, Turn, TurnOrigin, Usage};
+use crate::domain::{CacheCreation, CostBreakdown, Session, Turn, TurnOrigin, Usage};
 use crate::filter::ThresholdsFilter;
 use crate::inventory::ContextFileKind;
 use crate::pricing::{ClaudePricing, PricingCatalog};
@@ -150,7 +150,7 @@ pub fn render_table(sessions: &[Session]) -> String {
             session.project_short_name.clone(),
             truncate_title(&session.title, TITLE_MAX_CHARS),
             format_tokens(session.total_billable),
-            format_cost_opt(session.total_cost),
+            format_cost_opt(session.cost_breakdown.map(|b| b.total())),
             session.id.clone(),
         ]);
     }
@@ -185,9 +185,9 @@ fn add_totals_row(table: &mut Table, sessions: &[Session]) {
     // strict-`None` contract that `fold_cum_cost` enforces in the
     // show view's `cum_cost` column. Reusing `fold_cum_cost` keeps
     // the propagation rule single-sourced.
-    let total_cost: Option<f64> = sessions
-        .iter()
-        .try_fold(0.0, |acc, s| fold_cum_cost(Some(acc), s.total_cost));
+    let total_cost: Option<f64> = sessions.iter().try_fold(0.0, |acc, s| {
+        fold_cum_cost(Some(acc), s.cost_breakdown.map(|b| b.total()))
+    });
     table.add_row(vec![
         Cell::new(""),
         Cell::new(""),
@@ -304,23 +304,21 @@ fn strict_fold_assistant_cost(
     assistants: &[&Turn],
     catalog: &PricingCatalog,
     pick: impl Fn(&Usage) -> (u64, u64, CacheCreation, u64),
-) -> Option<f64> {
-    let mut sum = 0.0;
+) -> Option<CostBreakdown> {
+    let mut sum = CostBreakdown::default();
     for turn in assistants {
         let Some(usage) = turn.usage.as_ref() else {
-            // Assistant turn with no usage: zero contribution, does
-            // not collapse the sum to `None`.
             continue;
         };
         let (input, output, cache_creation, cache_read) = pick(usage);
-        let cost = catalog.cost_for_components(
+        let breakdown = catalog.cost_for_components(
             input,
             output,
             cache_creation,
             cache_read,
             turn.model.as_deref(),
         )?;
-        sum += cost;
+        sum += breakdown;
     }
     Some(sum)
 }
@@ -392,10 +390,11 @@ fn render_parent_exchange(
     let (user_cost_display, user_cost_delta) = if exchange.assistants.is_empty() {
         (None, Some(0.0))
     } else {
-        let cost = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+        let breakdown = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
             (usage.input, 0, usage.cache_creation, usage.cache_read)
         });
-        (cost, cost)
+        let scalar = breakdown.map(|b| b.total());
+        (scalar, scalar)
     };
 
     *cumulative += user_tokens_opt.unwrap_or(0);
@@ -416,7 +415,8 @@ fn render_parent_exchange(
     if let Some(first_assistant) = exchange.assistants.first() {
         let assistant_cost = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
             (0, usage.output, CacheCreation::default(), 0)
-        });
+        })
+        .map(|b| b.total());
         *cumulative += output_tokens;
         *cum_cost = fold_cum_cost(*cum_cost, assistant_cost);
 
@@ -471,7 +471,7 @@ fn render_subagent_exchange(
     let (row_cost_display, row_cost_delta) = if exchange.assistants.is_empty() {
         (None, Some(0.0))
     } else {
-        let cost = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+        let breakdown = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
             (
                 usage.input,
                 usage.output,
@@ -479,7 +479,8 @@ fn render_subagent_exchange(
                 usage.cache_read,
             )
         });
-        (cost, cost)
+        let scalar = breakdown.map(|b| b.total());
+        (scalar, scalar)
     };
 
     *cumulative += row_tokens;
@@ -890,7 +891,10 @@ mod tests {
             title: title.to_string(),
             turns: Vec::new(),
             total_billable,
-            total_cost,
+            cost_breakdown: total_cost.map(|c| CostBreakdown {
+                output: c,
+                ..CostBreakdown::default()
+            }),
         }
     }
 

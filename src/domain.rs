@@ -12,6 +12,7 @@
 //!   multiple invocations of the same `agent_type`.
 //! - `Usage` — token counts; `billable()` excludes `cache_read`.
 //! - `CacheCreation` — 5m / 1h ephemeral split.
+//! - `CostBreakdown` — per-component cost decomposition (5 legs).
 
 use std::path::PathBuf;
 
@@ -28,12 +29,13 @@ pub struct Session {
     pub title: String,
     pub turns: Vec<Turn>,
     pub total_billable: u64,
-    /// `Some(sum)` only if every assistant turn's cost resolved to
-    /// `Some(_)`. A single unknown-model assistant turn collapses the
-    /// whole session to `None` (strict propagation, no partial sums)
-    /// — the rendered `cost` cell becomes `—`. Diverges from
-    /// `total_billable` by including `cache_read` tokens.
-    pub total_cost: Option<f64>,
+    /// `Some(breakdown)` only if every assistant turn's cost resolved
+    /// to `Some(_)`. A single unknown-model assistant turn collapses
+    /// the whole session to `None` (strict propagation, no partial
+    /// sums) — the rendered `cost` cell becomes `—`. Preserves
+    /// per-component decomposition; callers needing a scalar use
+    /// `.map(|b| b.total())`.
+    pub cost_breakdown: Option<CostBreakdown>,
 }
 
 impl Session {
@@ -118,6 +120,35 @@ impl CacheCreation {
     #[must_use]
     pub fn total(&self) -> u64 {
         self.ephemeral_5m + self.ephemeral_1h
+    }
+}
+
+/// Per-component cost decomposition preserving the five pricing legs
+/// through to rendering. Produced by `cost_for_components`, accumulated
+/// field-wise by `total_session_cost` and `strict_fold_assistant_cost`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct CostBreakdown {
+    pub input: f64,
+    pub output: f64,
+    pub cache_creation_5m: f64,
+    pub cache_creation_1h: f64,
+    pub cache_read: f64,
+}
+
+impl CostBreakdown {
+    #[must_use]
+    pub fn total(&self) -> f64 {
+        self.input + self.output + self.cache_creation_5m + self.cache_creation_1h + self.cache_read
+    }
+}
+
+impl std::ops::AddAssign for CostBreakdown {
+    fn add_assign(&mut self, rhs: Self) {
+        self.input += rhs.input;
+        self.output += rhs.output;
+        self.cache_creation_5m += rhs.cache_creation_5m;
+        self.cache_creation_1h += rhs.cache_creation_1h;
+        self.cache_read += rhs.cache_read;
     }
 }
 
