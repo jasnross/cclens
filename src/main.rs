@@ -1,6 +1,7 @@
 mod cli;
 
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use cclens::aggregation::{
@@ -18,6 +19,7 @@ use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
 use cclens::rendering::{render_inputs, render_prices, render_session, render_table};
+use cclens::tui::run_list_tui;
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::{
@@ -29,11 +31,12 @@ fn main() -> anyhow::Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
+    let tui = !cli.plain && std::io::stdout().is_terminal();
     match cli.command.unwrap_or(Command::List {
         scope: SessionFilterArgs::default(),
         thresholds: ThresholdsFilterArgs::default(),
     }) {
-        Command::List { scope, thresholds } => run_list(&cli.projects_dir, &scope, thresholds),
+        Command::List { scope, thresholds } => run_list(&cli.projects_dir, &scope, thresholds, tui),
         Command::Show {
             session_id,
             thresholds,
@@ -51,6 +54,7 @@ fn run_list(
     projects_dir: &Path,
     scope: &SessionFilterArgs,
     thresholds: ThresholdsFilterArgs,
+    tui: bool,
 ) -> anyhow::Result<()> {
     let catalog = pricing::load_catalog();
     let project_entries = discover(projects_dir)?;
@@ -110,9 +114,13 @@ fn run_list(
         }
     }
     sessions.sort_by_key(|s| s.started_at);
-    println!("{}", render_table(&sessions));
-    if sessions.is_empty() {
-        emit_empty_result_hint(scope, &thresholds);
+    if tui && !sessions.is_empty() {
+        run_list_tui(sessions)?;
+    } else {
+        println!("{}", render_table(&sessions));
+        if sessions.is_empty() {
+            emit_empty_result_hint(scope, &thresholds);
+        }
     }
     Ok(())
 }

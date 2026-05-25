@@ -27,10 +27,10 @@
 //! (or any other oversized content) cannot break the
 //! one-line-per-row invariant.
 //!
-//! All formatter helpers (`format_cost_opt`, `format_rate_mtok`,
-//! `truncate_title`, `format_local`, `format_local_or_empty`) are
-//! module-private. Content-preview and cumulative-fold helpers live
-//! in `aggregation`.
+//! Format helpers (`format_cost_opt`, `format_local`, `format_tokens`)
+//! live in `formatting` — shared with the `tui` module for visual
+//! consistency. Content-preview and cumulative-fold helpers live in
+//! `aggregation`.
 
 use chrono::{DateTime, Utc};
 use comfy_table::presets::NOTHING;
@@ -39,6 +39,7 @@ use comfy_table::{Cell, CellAlignment, Table};
 use crate::aggregation::{PreparedExchange, PreparedRowRole, fold_cum_cost};
 use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
 use crate::domain::{CostBreakdown, Session};
+use crate::formatting::{format_cost_opt, format_local, format_tokens};
 use crate::inventory::ContextFileKind;
 use crate::pricing::ClaudePricing;
 
@@ -87,12 +88,6 @@ const PRICES_CACHE_RD_COL_INDEX: usize = 4;
 const PRICES_CACHE_5M_COL_INDEX: usize = 5;
 const PRICES_CACHE_1H_COL_INDEX: usize = 6;
 
-/// Format an optional cost as `$X.XXXX` or `—` for the unknown-model
-/// case. Centralized so list and show share the exact same vocabulary.
-fn format_cost_opt(c: Option<f64>) -> String {
-    c.map_or_else(|| "—".to_string(), |n| format!("${n:.4}"))
-}
-
 /// Format a decomposed cost breakdown showing non-zero components.
 /// `None` renders as `—`; all-zero renders as `$0.0000`; otherwise
 /// space-separated `label:$X.XXXX` for each non-zero component.
@@ -138,24 +133,12 @@ fn truncate_title(s: &str, max: usize) -> String {
     result
 }
 
-fn format_local(ts: DateTime<Utc>) -> String {
-    ts.with_timezone(&chrono::Local)
-        .format("%Y-%m-%d %H:%M")
-        .to_string()
-}
-
 // Returns the empty string on `None` so `render_session` stays infallible
 // without `.unwrap()` (banned by the `unwrap_used` lint). In practice the
 // timestamp is always present for substantive user turns and assistant turns;
 // this branch exists only to keep the code panic-free.
 fn format_local_or_empty(ts: Option<DateTime<Utc>>) -> String {
     ts.map_or_else(String::new, format_local)
-}
-
-fn format_tokens(count: u64) -> String {
-    #[allow(clippy::cast_precision_loss)]
-    let count_float = count as f64;
-    format!("{:.2}k", count_float / 1000.0)
 }
 
 #[must_use]

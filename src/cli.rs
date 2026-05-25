@@ -39,6 +39,11 @@ pub(super) struct Cli {
     #[arg(long, default_value_os_t = default_projects_dir())]
     pub(super) projects_dir: PathBuf,
 
+    /// Disable the interactive TUI and print plain-text tables (the
+    /// default when stdout is not a terminal).
+    #[arg(long, global = true)]
+    pub(super) plain: bool,
+
     #[command(subcommand)]
     pub(super) command: Option<Command>,
 }
@@ -496,6 +501,24 @@ mod tests {
             "--session aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         );
         assert!(with_session.any_active());
+    }
+
+    #[test]
+    fn plain_flag_parses_before_subcommand() {
+        let cli = Cli::try_parse_from(["cclens", "--plain", "list"]).unwrap();
+        assert!(cli.plain);
+    }
+
+    #[test]
+    fn plain_flag_parses_after_subcommand() {
+        let cli = Cli::try_parse_from(["cclens", "list", "--plain"]).unwrap();
+        assert!(cli.plain);
+    }
+
+    #[test]
+    fn plain_flag_defaults_to_false() {
+        let cli = Cli::try_parse_from(["cclens"]).unwrap();
+        assert!(!cli.plain);
     }
 
     #[test]

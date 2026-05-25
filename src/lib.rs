@@ -11,13 +11,19 @@
 //! (`~/.claude/{CLAUDE.md,rules,skills,agents}` and the plugin cache);
 //! `attribution` folds inventory + per-session metadata + pricing into
 //! ranked rows for the `inputs` subcommand.
+//!
+//! `formatting` provides shared format helpers consumed by both
+//! `rendering` (comfy-table plain-text path) and `tui` (ratatui
+//! interactive path).
 
 pub mod aggregation;
 pub mod attribution;
 pub mod discovery;
 pub mod domain;
 pub mod filter;
+pub mod formatting;
 pub mod inventory;
 pub mod parsing;
 pub mod pricing;
 pub mod rendering;
+pub mod tui;
