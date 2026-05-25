@@ -32,14 +32,13 @@
 //! consistency. Content-preview and cumulative-fold helpers live in
 //! `aggregation`.
 
-use chrono::{DateTime, Utc};
 use comfy_table::presets::NOTHING;
 use comfy_table::{Cell, CellAlignment, Table};
 
 use crate::aggregation::{PreparedExchange, PreparedRowRole, fold_cum_cost};
 use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
 use crate::domain::{CostBreakdown, Session};
-use crate::formatting::{format_cost_opt, format_local, format_tokens};
+use crate::formatting::{format_cost_opt, format_local, format_local_or_empty, format_tokens};
 use crate::inventory::ContextFileKind;
 use crate::pricing::ClaudePricing;
 
@@ -131,14 +130,6 @@ fn truncate_title(s: &str, max: usize) -> String {
     let mut result: String = normalized.chars().take(max.saturating_sub(1)).collect();
     result.push('…');
     result
-}
-
-// Returns the empty string on `None` so `render_session` stays infallible
-// without `.unwrap()` (banned by the `unwrap_used` lint). In practice the
-// timestamp is always present for substantive user turns and assistant turns;
-// this branch exists only to keep the code panic-free.
-fn format_local_or_empty(ts: Option<DateTime<Utc>>) -> String {
-    ts.map_or_else(String::new, format_local)
 }
 
 #[must_use]
@@ -430,6 +421,8 @@ fn coverage_half(label: &str, tier: &TierCoverage) -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Utc};
+
     use super::*;
     use crate::aggregation::PreparedRow;
     use crate::domain::TurnOrigin;

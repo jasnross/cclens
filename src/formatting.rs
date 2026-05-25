@@ -5,6 +5,8 @@
 //!   and 4 decimal places, or `—` for `None`
 //! - `format_local(DateTime<Utc>) -> String` — `YYYY-MM-DD HH:MM`
 //!   in the system's local timezone
+//! - `format_local_or_empty(Option<DateTime<Utc>>) -> String` —
+//!   delegates to `format_local` or returns the empty string on `None`
 //! - `format_tokens(u64) -> String` — compact `0.12k` / `999.99k`
 //!   token count
 //!
@@ -23,6 +25,11 @@ pub fn format_local(ts: DateTime<Utc>) -> String {
     ts.with_timezone(&chrono::Local)
         .format("%Y-%m-%d %H:%M")
         .to_string()
+}
+
+#[must_use]
+pub fn format_local_or_empty(ts: Option<DateTime<Utc>>) -> String {
+    ts.map_or_else(String::new, format_local)
 }
 
 #[must_use]

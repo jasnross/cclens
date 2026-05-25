@@ -116,7 +116,14 @@ fn run_list(
     }
     sessions.sort_by_key(|s| s.started_at);
     if tui && !sessions.is_empty() {
-        run_list_tui(sessions)?;
+        run_list_tui(sessions, |session_id| {
+            load_show_detail(
+                projects_dir,
+                session_id,
+                &catalog,
+                ThresholdsFilter::default(),
+            )
+        })?;
     } else {
         println!("{}", render_table(&sessions));
         if sessions.is_empty() {
