@@ -40,9 +40,12 @@ use std::collections::HashSet;
 use std::hash::BuildHasher;
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Value;
 
-use crate::domain::{CacheCreation, CostBreakdown, Role, Session, Turn, Usage};
+use crate::domain::{CacheCreation, CostBreakdown, Role, Session, Turn, TurnOrigin, Usage};
+use crate::filter::ThresholdsFilter;
 use crate::pricing::PricingCatalog;
 
 // ---- session aggregation ----
@@ -355,6 +358,192 @@ pub fn group_into_exchanges(turns: &[Turn]) -> Vec<Exchange<'_>> {
     exchanges
 }
 
+// ---- prepared exchanges ----
+
+#[derive(Debug, Clone, Serialize)]
+pub enum PreparedRowRole {
+    User,
+    Assistant,
+    Subagent,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PreparedRow {
+    pub timestamp: Option<DateTime<Utc>>,
+    pub role: PreparedRowRole,
+    pub tokens: Option<u64>,
+    pub cost: Option<CostBreakdown>,
+    pub cumulative_tokens: u64,
+    pub cumulative_cost: Option<f64>,
+    pub content: String,
+    pub tool_use_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PreparedExchange {
+    pub origin: TurnOrigin,
+    pub rows: Vec<PreparedRow>,
+}
+
+/// Pre-compute per-exchange rows for the `show` view.
+///
+/// Returns only visible exchanges (those passing `thresholds`), but
+/// cumulative values on each `PreparedRow` include contributions from
+/// **all** exchanges — including filtered ones. This preserves the
+/// invariant that the last visible row's cumulative matches the
+/// session-level `list` totals.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn prepare_exchanges(
+    exchanges: &[Exchange<'_>],
+    catalog: &PricingCatalog,
+    thresholds: ThresholdsFilter,
+) -> Vec<PreparedExchange> {
+    let mut cumulative: u64 = 0;
+    let mut cum_cost: Option<f64> = Some(0.0);
+    let mut result = Vec::new();
+
+    for exchange in exchanges {
+        let (ex_tokens, ex_cost) = exchange_filter_totals(exchange, catalog);
+        let visible = thresholds.matches(ex_tokens, ex_cost);
+
+        let rows = match &exchange.user.origin {
+            TurnOrigin::Parent => {
+                let mut rows = Vec::new();
+
+                let user_tokens_opt: Option<u64> = if exchange.assistants.is_empty() {
+                    None
+                } else {
+                    let sum = exchange
+                        .assistants
+                        .iter()
+                        .filter_map(|t| t.usage.as_ref())
+                        .map(|u| u.input + u.cache_creation.total())
+                        .sum();
+                    Some(sum)
+                };
+                let output_tokens: u64 = exchange
+                    .assistants
+                    .iter()
+                    .filter_map(|t| t.usage.as_ref())
+                    .map(|u| u.output)
+                    .sum();
+
+                let (user_cost_breakdown, user_cost_delta) = if exchange.assistants.is_empty() {
+                    (None, Some(0.0))
+                } else {
+                    let breakdown =
+                        strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+                            (usage.input, 0, usage.cache_creation, usage.cache_read)
+                        });
+                    (breakdown, breakdown.map(|b| b.total()))
+                };
+
+                cumulative += user_tokens_opt.unwrap_or(0);
+                cum_cost = fold_cum_cost(cum_cost, user_cost_delta);
+
+                rows.push(PreparedRow {
+                    timestamp: exchange.user.timestamp,
+                    role: PreparedRowRole::User,
+                    tokens: user_tokens_opt,
+                    cost: user_cost_breakdown,
+                    cumulative_tokens: cumulative,
+                    cumulative_cost: cum_cost,
+                    content: user_content_preview(exchange.user),
+                    tool_use_count: 0,
+                });
+
+                if let Some(first_assistant) = exchange.assistants.first() {
+                    let assistant_breakdown =
+                        strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+                            (0, usage.output, CacheCreation::default(), 0)
+                        });
+                    cumulative += output_tokens;
+                    cum_cost = fold_cum_cost(cum_cost, assistant_breakdown.map(|b| b.total()));
+
+                    rows.push(PreparedRow {
+                        timestamp: first_assistant.timestamp,
+                        role: PreparedRowRole::Assistant,
+                        tokens: Some(output_tokens),
+                        cost: assistant_breakdown,
+                        cumulative_tokens: cumulative,
+                        cumulative_cost: cum_cost,
+                        content: assistant_cluster_preview(&exchange.assistants),
+                        #[allow(clippy::cast_possible_truncation)]
+                        tool_use_count: count_tool_uses(&exchange.assistants) as usize,
+                    });
+                }
+
+                rows
+            }
+            TurnOrigin::Subagent {
+                agent_type,
+                description,
+            } => {
+                let row_tokens: u64 = exchange
+                    .assistants
+                    .iter()
+                    .filter_map(|t| t.usage.as_ref())
+                    .map(|u| u.input + u.output + u.cache_creation.total())
+                    .sum();
+                let (row_cost_breakdown, row_cost_delta) = if exchange.assistants.is_empty() {
+                    (None, Some(0.0))
+                } else {
+                    let breakdown =
+                        strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+                            (
+                                usage.input,
+                                usage.output,
+                                usage.cache_creation,
+                                usage.cache_read,
+                            )
+                        });
+                    (breakdown, breakdown.map(|b| b.total()))
+                };
+
+                cumulative += row_tokens;
+                cum_cost = fold_cum_cost(cum_cost, row_cost_delta);
+
+                let ts = exchange
+                    .assistants
+                    .first()
+                    .and_then(|a| a.timestamp)
+                    .or(exchange.user.timestamp);
+
+                let tokens_display = if exchange.assistants.is_empty() {
+                    None
+                } else {
+                    Some(row_tokens)
+                };
+
+                vec![PreparedRow {
+                    timestamp: ts,
+                    role: PreparedRowRole::Subagent,
+                    tokens: tokens_display,
+                    cost: row_cost_breakdown,
+                    cumulative_tokens: cumulative,
+                    cumulative_cost: cum_cost,
+                    content: subagent_content_preview(
+                        agent_type,
+                        description.as_deref(),
+                        &exchange.assistants,
+                    ),
+                    tool_use_count: 0,
+                }]
+            }
+        };
+
+        if visible {
+            result.push(PreparedExchange {
+                origin: exchange.user.origin.clone(),
+                rows,
+            });
+        }
+    }
+
+    result
+}
+
 /// Exchange-level (`tokens`, `cost`) for filter decisions.
 ///
 /// `tokens` matches `Session.total_billable` semantics across the
@@ -368,9 +557,9 @@ pub fn group_into_exchanges(turns: &[Turn]) -> Vec<Exchange<'_>> {
 /// `--min-cost` excludes the orphan, and `--min-tokens >= 1` excludes
 /// it via the zero token count.
 ///
-/// These totals are for filter decisions only — `render_session`
-/// continues to compute its own row decomposition inline because that's
-/// a presentation concern (user-row vs assistant-row token slicing).
+/// These totals are for filter decisions only — `prepare_exchanges`
+/// handles the per-row decomposition (user-row vs assistant-row token
+/// slicing).
 #[must_use]
 pub(crate) fn exchange_filter_totals(
     exchange: &Exchange<'_>,
@@ -1645,5 +1834,346 @@ mod tests {
         let a = assistant_turn_with_content(tx, 0, 0, 0);
         let cluster: Vec<&Turn> = vec![&a];
         assert_eq!(count_tool_uses(&cluster), 0);
+    }
+
+    // --- strict_fold_assistant_cost ---
+
+    #[test]
+    fn strict_fold_assistant_cost_sums_across_cluster() {
+        let catalog = sample_catalog();
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "a" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:00:00Z",
+        );
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "b" }]),
+            5,
+            15,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        let cluster: Vec<&Turn> = vec![&a1, &a2];
+        let result = strict_fold_assistant_cost(&cluster, &catalog, |u| {
+            (u.input, u.output, u.cache_creation, u.cache_read)
+        });
+        let b = result.expect("should resolve");
+        assert!((b.input - (10.0 + 5.0) * 15e-6).abs() < 1e-12);
+        assert!((b.output - (20.0 + 15.0) * 75e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn strict_fold_assistant_cost_collapses_on_unknown_model() {
+        let catalog = sample_catalog();
+        let known = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "ok" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:00:00Z",
+        );
+        let mut unknown = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "?" }]),
+            5,
+            15,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        unknown.model = Some("claude-fake-9-9".to_string());
+        let cluster: Vec<&Turn> = vec![&known, &unknown];
+        let result = strict_fold_assistant_cost(&cluster, &catalog, |u| {
+            (u.input, u.output, u.cache_creation, u.cache_read)
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn strict_fold_assistant_cost_skips_turns_without_usage() {
+        let catalog = sample_catalog();
+        let with_usage = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "ok" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:00:00Z",
+        );
+        let no_usage = Turn {
+            timestamp: Some("2026-04-01T10:01:00Z".parse().unwrap()),
+            role: Role::Assistant,
+            model: Some("claude-opus-4-7".to_string()),
+            message_id: None,
+            request_id: None,
+            usage: None,
+            content: None,
+            cwd: None,
+            origin: TurnOrigin::default(),
+        };
+        let cluster: Vec<&Turn> = vec![&with_usage, &no_usage];
+        let result = strict_fold_assistant_cost(&cluster, &catalog, |u| {
+            (u.input, u.output, u.cache_creation, u.cache_read)
+        });
+        assert!(result.is_some());
+    }
+
+    // --- fold_cum_cost ---
+
+    #[test]
+    fn fold_cum_cost_accumulates_when_both_some() {
+        assert_eq!(fold_cum_cost(Some(1.0), Some(2.0)), Some(3.0));
+    }
+
+    #[test]
+    fn fold_cum_cost_latches_none_on_none_delta() {
+        assert_eq!(fold_cum_cost(Some(1.0), None), None);
+    }
+
+    #[test]
+    fn fold_cum_cost_stays_none_after_latch() {
+        assert_eq!(fold_cum_cost(None, Some(2.0)), None);
+    }
+
+    // --- prepare_exchanges ---
+
+    use crate::filter::ThresholdsFilter;
+
+    #[test]
+    fn prepare_exchanges_parent_exchange_produces_two_rows() {
+        let u = show_user_turn("q", "2026-04-01T10:00:00Z");
+        let a = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "r" }]),
+            100,
+            50,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        let exchanges = vec![Exchange {
+            user: &u,
+            assistants: vec![&a],
+        }];
+        let prepared = prepare_exchanges(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].rows.len(), 2);
+        assert!(matches!(prepared[0].rows[0].role, PreparedRowRole::User));
+        assert!(matches!(
+            prepared[0].rows[1].role,
+            PreparedRowRole::Assistant
+        ));
+        assert!(prepared[0].rows[0].cumulative_tokens < prepared[0].rows[1].cumulative_tokens,);
+    }
+
+    #[test]
+    fn prepare_exchanges_orphan_exchange_produces_one_row() {
+        let u = show_user_turn("orphan", "2026-04-01T10:00:00Z");
+        let exchanges = vec![Exchange {
+            user: &u,
+            assistants: Vec::new(),
+        }];
+        let prepared = prepare_exchanges(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].rows.len(), 1);
+        assert_eq!(prepared[0].rows[0].tokens, None);
+        assert_eq!(prepared[0].rows[0].cost, None);
+    }
+
+    #[test]
+    fn prepare_exchanges_subagent_exchange_produces_one_row() {
+        let mut u = show_user_turn("prompt", "2026-04-01T10:00:00Z");
+        u.origin = TurnOrigin::Subagent {
+            agent_type: "reviewer".to_string(),
+            description: None,
+        };
+        let mut a = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "ok" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        a.origin = TurnOrigin::Subagent {
+            agent_type: "reviewer".to_string(),
+            description: None,
+        };
+        let exchanges = vec![Exchange {
+            user: &u,
+            assistants: vec![&a],
+        }];
+        let prepared = prepare_exchanges(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].rows.len(), 1);
+        assert!(matches!(
+            prepared[0].rows[0].role,
+            PreparedRowRole::Subagent
+        ));
+    }
+
+    #[test]
+    fn prepare_exchanges_cumulative_includes_filtered_exchanges() {
+        let u1 = show_user_turn("small", "2026-04-01T10:00:00Z");
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "r1" }]),
+            50,
+            50,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        let u2 = show_user_turn("big", "2026-04-01T10:02:00Z");
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "r2" }]),
+            500,
+            500,
+            0,
+            "2026-04-01T10:03:00Z",
+        );
+        let exchanges = vec![
+            Exchange {
+                user: &u1,
+                assistants: vec![&a1],
+            },
+            Exchange {
+                user: &u2,
+                assistants: vec![&a2],
+            },
+        ];
+        let thresholds = ThresholdsFilter {
+            min_tokens: Some(500),
+            min_cost: None,
+        };
+        let prepared = prepare_exchanges(&exchanges, &PricingCatalog::empty(), thresholds);
+        assert_eq!(prepared.len(), 1);
+        let last_row = prepared[0].rows.last().expect("has rows");
+        assert!(
+            last_row.cumulative_tokens > 500,
+            "cumulative should include the filtered exchange's contribution; got: {}",
+            last_row.cumulative_tokens,
+        );
+    }
+
+    #[test]
+    fn prepare_exchanges_orphan_cost_delta_does_not_latch_cumulative() {
+        let u = show_user_turn("orphan", "2026-04-01T10:00:00Z");
+        let exchanges = vec![Exchange {
+            user: &u,
+            assistants: Vec::new(),
+        }];
+        let prepared = prepare_exchanges(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
+        assert_eq!(prepared[0].rows[0].cumulative_cost, Some(0.0));
+    }
+
+    #[test]
+    fn prepare_exchanges_unknown_model_latches_cumulative_cost_to_none() {
+        let u1 = show_user_turn("q1", "2026-04-01T10:00:00Z");
+        let mut a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "r1" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        a1.model = Some("claude-fake-9-9".to_string());
+        let u2 = show_user_turn("q2", "2026-04-01T10:02:00Z");
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "r2" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:03:00Z",
+        );
+        let exchanges = vec![
+            Exchange {
+                user: &u1,
+                assistants: vec![&a1],
+            },
+            Exchange {
+                user: &u2,
+                assistants: vec![&a2],
+            },
+        ];
+        let prepared =
+            prepare_exchanges(&exchanges, &sample_catalog(), ThresholdsFilter::default());
+        let last_row = prepared[1].rows.last().expect("has rows");
+        assert_eq!(last_row.cumulative_cost, None);
+    }
+
+    #[test]
+    fn prepare_exchanges_tool_use_count_populated_on_assistant_row() {
+        let u = show_user_turn("q", "2026-04-01T10:00:00Z");
+        let a = show_assistant_turn(
+            serde_json::json!([
+                { "type": "tool_use", "name": "Read", "id": "1", "input": {} },
+                { "type": "tool_use", "name": "Bash", "id": "2", "input": {} },
+            ]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        let exchanges = vec![Exchange {
+            user: &u,
+            assistants: vec![&a],
+        }];
+        let prepared = prepare_exchanges(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
+        assert_eq!(prepared[0].rows[0].tool_use_count, 0);
+        assert_eq!(prepared[0].rows[1].tool_use_count, 2);
+    }
+
+    #[test]
+    fn prepare_exchanges_preserves_origin() {
+        let mut u = show_user_turn("prompt", "2026-04-01T10:00:00Z");
+        u.origin = TurnOrigin::Subagent {
+            agent_type: "reviewer".to_string(),
+            description: Some("review auth".to_string()),
+        };
+        let mut a = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "ok" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        a.origin = TurnOrigin::Subagent {
+            agent_type: "reviewer".to_string(),
+            description: Some("review auth".to_string()),
+        };
+        let exchanges = vec![Exchange {
+            user: &u,
+            assistants: vec![&a],
+        }];
+        let prepared = prepare_exchanges(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
+        match &prepared[0].origin {
+            TurnOrigin::Subagent {
+                agent_type,
+                description,
+            } => {
+                assert_eq!(agent_type, "reviewer");
+                assert_eq!(description.as_deref(), Some("review auth"));
+            }
+            TurnOrigin::Parent => panic!("expected Subagent origin"),
+        }
     }
 }

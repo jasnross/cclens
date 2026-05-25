@@ -10,13 +10,11 @@
 //!   strict-`None` propagation as `Session.cost_breakdown` — any
 //!   visible session with `cost_breakdown: None` collapses the totals
 //!   cost cell to `—`.
-//! - `render_session(&[Exchange<'_>], &PricingCatalog, ThresholdsFilter) -> (String, usize)`
-//!   — the `show` view; returns rendered table plus visible-row count
-//!   for the empty-result hint decision. Dispatches on
-//!   `Turn.origin`: parent exchanges render two rows (user + assistant
-//!   cluster); subagent exchanges render one row labeled `subagent`
-//!   with a content prefix carrying the agent type and per-invocation
-//!   description.
+//! - `render_session(&[PreparedExchange]) -> (String, usize)` — the
+//!   `show` view; receives pre-computed exchanges and does pure layout.
+//!   Each `PreparedExchange` expands its nested `PreparedRow`s into
+//!   table rows. Domain computation (cost, cumulatives, filtering)
+//!   lives in `aggregation::prepare_exchanges`.
 //! - `render_inputs(&[AttributionRow], &CoverageStats) -> String` —
 //!   the `inputs` view; returns the table plus a per-tier coverage
 //!   line below it.
@@ -38,15 +36,11 @@ use chrono::{DateTime, Utc};
 use comfy_table::presets::NOTHING;
 use comfy_table::{Cell, CellAlignment, Table};
 
-use crate::aggregation::{
-    Exchange, assistant_cluster_preview, count_tool_uses, exchange_filter_totals, fold_cum_cost,
-    strict_fold_assistant_cost, subagent_content_preview, user_content_preview,
-};
+use crate::aggregation::{PreparedExchange, PreparedRowRole, fold_cum_cost};
 use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
-use crate::domain::{CacheCreation, CostBreakdown, Session, TurnOrigin};
-use crate::filter::ThresholdsFilter;
+use crate::domain::{CostBreakdown, Session};
 use crate::inventory::ContextFileKind;
-use crate::pricing::{ClaudePricing, PricingCatalog};
+use crate::pricing::ClaudePricing;
 
 const TITLE_MAX_CHARS: usize = 80;
 
@@ -223,196 +217,13 @@ fn add_totals_row(table: &mut Table, sessions: &[Session]) {
     ]);
 }
 
-/// Render a parent exchange as the canonical two-row pair (user row +
-/// assistant cluster row). Updates the cumulative trackers and the
-/// rendered-row count regardless of `visible` — the running totals
-/// must reflect every exchange even when the user filtered some out.
-#[allow(clippy::too_many_arguments)]
-fn render_parent_exchange(
-    table: &mut Table,
-    exchange: &Exchange<'_>,
-    catalog: &PricingCatalog,
-    visible: bool,
-    cumulative: &mut u64,
-    cum_cost: &mut Option<f64>,
-    rows_shown: &mut usize,
-) {
-    let user_tokens_opt: Option<u64> = if exchange.assistants.is_empty() {
-        None
-    } else {
-        let sum = exchange
-            .assistants
-            .iter()
-            .filter_map(|t| t.usage.as_ref())
-            .map(|u| u.input + u.cache_creation.total())
-            .sum();
-        Some(sum)
-    };
-    let output_tokens: u64 = exchange
-        .assistants
-        .iter()
-        .filter_map(|t| t.usage.as_ref())
-        .map(|u| u.output)
-        .sum();
-
-    // Per-row cost decomposes into a *displayed* cost (what the
-    // cell shows) and an *accumulator delta* (what's added to the
-    // running cum_cost). They diverge on the orphan-user case:
-    // an empty assistant cluster displays `—` but contributes
-    // `Some(0.0)` to the running total — same way `cumulative +=
-    // user_tokens_opt.unwrap_or(0)` treats orphans as a no-op.
-    // For non-empty clusters they're equal: any unknown-model turn
-    // collapses both to `None`, latching cum_cost through the rest
-    // of the session.
-    let (user_cost_breakdown, user_cost_delta) = if exchange.assistants.is_empty() {
-        (None, Some(0.0))
-    } else {
-        let breakdown = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
-            (usage.input, 0, usage.cache_creation, usage.cache_read)
-        });
-        (breakdown, breakdown.map(|b| b.total()))
-    };
-
-    *cumulative += user_tokens_opt.unwrap_or(0);
-    *cum_cost = fold_cum_cost(*cum_cost, user_cost_delta);
-    if visible {
-        table.add_row(vec![
-            format_local_or_empty(exchange.user.timestamp),
-            "user".to_string(),
-            user_tokens_opt.map_or_else(|| "—".to_string(), format_tokens),
-            format_cost_breakdown(user_cost_breakdown),
-            format_tokens(cumulative.to_owned()),
-            format_cost_opt(*cum_cost),
-            truncate_title(&user_content_preview(exchange.user), SHOW_CONTENT_MAX_CHARS),
-        ]);
-        *rows_shown += 1;
-    }
-
-    if let Some(first_assistant) = exchange.assistants.first() {
-        let assistant_breakdown =
-            strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
-                (0, usage.output, CacheCreation::default(), 0)
-            });
-        *cumulative += output_tokens;
-        *cum_cost = fold_cum_cost(*cum_cost, assistant_breakdown.map(|b| b.total()));
-
-        if visible {
-            let preview = assistant_cluster_preview(&exchange.assistants);
-            let n_tools = count_tool_uses(&exchange.assistants);
-            let content = if n_tools > 0 {
-                format!("{preview} +{n_tools} tool uses")
-            } else {
-                preview
-            };
-            table.add_row(vec![
-                format_local_or_empty(first_assistant.timestamp),
-                "assistant".to_string(),
-                format_tokens(output_tokens),
-                format_cost_breakdown(assistant_breakdown),
-                format_tokens(cumulative.to_owned()),
-                format_cost_opt(*cum_cost),
-                truncate_title(&content, SHOW_CONTENT_MAX_CHARS),
-            ]);
-            *rows_shown += 1;
-        }
-    }
-}
-
-/// Render a subagent exchange as a single row labeled `subagent`. The
-/// subagent's user prompt is suppressed — its content was already a
-/// per-invocation prompt summary, surfaced instead via the
-/// `description` in the row's content prefix. Tokens / cost / cumulative
-/// columns reflect the assistant cluster only (the subagent's user
-/// turn carries no usage in observed data).
-#[allow(clippy::too_many_arguments)]
-fn render_subagent_exchange(
-    table: &mut Table,
-    exchange: &Exchange<'_>,
-    catalog: &PricingCatalog,
-    visible: bool,
-    agent_type: &str,
-    description: Option<&str>,
-    cumulative: &mut u64,
-    cum_cost: &mut Option<f64>,
-    rows_shown: &mut usize,
-) {
-    // For an empty cluster, contribute 0 tokens / Some(0.0) cost — same
-    // accumulator-delta rule as the parent path's orphan-user branch.
-    let row_tokens: u64 = exchange
-        .assistants
-        .iter()
-        .filter_map(|t| t.usage.as_ref())
-        .map(|u| u.input + u.output + u.cache_creation.total())
-        .sum();
-    let (row_cost_breakdown, row_cost_delta) = if exchange.assistants.is_empty() {
-        (None, Some(0.0))
-    } else {
-        let breakdown = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
-            (
-                usage.input,
-                usage.output,
-                usage.cache_creation,
-                usage.cache_read,
-            )
-        });
-        (breakdown, breakdown.map(|b| b.total()))
-    };
-
-    *cumulative += row_tokens;
-    *cum_cost = fold_cum_cost(*cum_cost, row_cost_delta);
-
-    if visible {
-        // Pick a timestamp for the row: prefer the first assistant's
-        // (closest to a "this is when the subagent responded"
-        // signal), fall back to the user-prompt timestamp.
-        let ts = exchange
-            .assistants
-            .first()
-            .and_then(|a| a.timestamp)
-            .or(exchange.user.timestamp);
-        let content = subagent_content_preview(agent_type, description, &exchange.assistants);
-        // Empty cluster: render `—` for tokens so the "no signal"
-        // presentation matches the parent-orphan branch (which renders
-        // both tokens and cost as `—`). Cumulative columns still
-        // reflect the (zero) contribution.
-        let tokens_cell = if exchange.assistants.is_empty() {
-            "—".to_string()
-        } else {
-            format_tokens(row_tokens)
-        };
-        table.add_row(vec![
-            format_local_or_empty(ts),
-            "subagent".to_string(),
-            tokens_cell,
-            format_cost_breakdown(row_cost_breakdown),
-            format_tokens(cumulative.to_owned()),
-            format_cost_opt(*cum_cost),
-            truncate_title(&content, SHOW_CONTENT_MAX_CHARS),
-        ]);
-        *rows_shown += 1;
-    }
-}
-
-/// Render the per-exchange table.
+/// Render pre-computed exchanges into the `show` view table.
 ///
-/// Returns `(rendered, rows_shown)`. `rows_shown` counts physical
-/// rendered rows (1 for an orphan-only or subagent visible exchange,
-/// 2 for a normal parent visible exchange). `run_show` uses
-/// `rows_shown == 0` to decide whether to emit the empty-result
-/// stderr hint.
-///
-/// Filtering happens here rather than in a pre-pass so that
-/// `cumulative` and `cum_cost` continue to fold over **every**
-/// exchange — the running totals on visible rows must still match the
-/// session-level `list` totals, which means the renderer needs both
-/// the unfiltered slice (for accumulation) and the predicate (for
-/// skipping `add_row`).
+/// Returns `(rendered, rows_shown)`. Each `PreparedExchange` expands
+/// its nested `PreparedRow`s into table rows — the renderer does pure
+/// layout with no domain computation.
 #[must_use]
-pub fn render_session(
-    exchanges: &[Exchange<'_>],
-    catalog: &PricingCatalog,
-    thresholds: ThresholdsFilter,
-) -> (String, usize) {
+pub fn render_session(prepared: &[PreparedExchange]) -> (String, usize) {
     let mut table = Table::new();
     table.load_preset(NOTHING);
     table.set_header(vec![
@@ -424,47 +235,30 @@ pub fn render_session(
         "cum_cost",
         "content",
     ]);
-    let mut cumulative: u64 = 0;
-    let mut cum_cost: Option<f64> = Some(0.0);
     let mut rows_shown: usize = 0;
 
-    for exchange in exchanges {
-        let (ex_tokens, ex_cost) = exchange_filter_totals(exchange, catalog);
-        let visible = thresholds.matches(ex_tokens, ex_cost);
-
-        // Dispatch on the leading turn's origin. `wildcard_enum_match_arm`
-        // forces an explicit decision at every variant, so a future
-        // `TurnOrigin` addition is a compile-time prompt to wire it
-        // through both the user-row (or single-row) shape and the
-        // running-cumulative fold.
-        match &exchange.user.origin {
-            TurnOrigin::Parent => {
-                render_parent_exchange(
-                    &mut table,
-                    exchange,
-                    catalog,
-                    visible,
-                    &mut cumulative,
-                    &mut cum_cost,
-                    &mut rows_shown,
-                );
-            }
-            TurnOrigin::Subagent {
-                agent_type,
-                description,
-            } => {
-                render_subagent_exchange(
-                    &mut table,
-                    exchange,
-                    catalog,
-                    visible,
-                    agent_type,
-                    description.as_deref(),
-                    &mut cumulative,
-                    &mut cum_cost,
-                    &mut rows_shown,
-                );
-            }
+    for exchange in prepared {
+        for row in &exchange.rows {
+            let role_str = match row.role {
+                PreparedRowRole::User => "user",
+                PreparedRowRole::Assistant => "assistant",
+                PreparedRowRole::Subagent => "subagent",
+            };
+            let content = if row.tool_use_count > 0 {
+                format!("{} +{} tool uses", row.content, row.tool_use_count)
+            } else {
+                row.content.clone()
+            };
+            table.add_row(vec![
+                format_local_or_empty(row.timestamp),
+                role_str.to_string(),
+                row.tokens.map_or_else(|| "—".to_string(), format_tokens),
+                format_cost_breakdown(row.cost),
+                format_tokens(row.cumulative_tokens),
+                format_cost_opt(row.cumulative_cost),
+                truncate_title(&content, SHOW_CONTENT_MAX_CHARS),
+            ]);
+            rows_shown += 1;
         }
     }
 
@@ -653,52 +447,49 @@ fn coverage_half(label: &str, tier: &TierCoverage) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
-
     use super::*;
-    use crate::domain::{Role, Turn, TurnOrigin, Usage};
+    use crate::aggregation::PreparedRow;
+    use crate::domain::TurnOrigin;
 
     // --- test helpers ---
 
-    fn show_user_turn(content: &str, ts: &str) -> Turn {
-        Turn {
-            timestamp: Some(ts.parse().unwrap()),
-            role: Role::User,
-            model: None,
-            message_id: None,
-            request_id: None,
-            usage: None,
-            content: Some(Value::String(content.to_string())),
-            cwd: None,
-            origin: TurnOrigin::default(),
+    fn test_row(
+        role: PreparedRowRole,
+        tokens: Option<u64>,
+        cum_tokens: u64,
+        cum_cost: Option<f64>,
+        content: &str,
+    ) -> PreparedRow {
+        PreparedRow {
+            timestamp: None,
+            role,
+            tokens,
+            cost: None,
+            cumulative_tokens: cum_tokens,
+            cumulative_cost: cum_cost,
+            content: content.to_string(),
+            tool_use_count: 0,
         }
     }
 
-    fn show_assistant_turn(
-        content: Value,
-        input: u64,
-        output: u64,
-        cache_creation: u64,
-        ts: &str,
-    ) -> Turn {
-        Turn {
-            timestamp: Some(ts.parse().unwrap()),
-            role: Role::Assistant,
-            model: Some("claude-opus-4-7".to_string()),
-            message_id: None,
-            request_id: None,
-            usage: Some(Usage {
-                input,
-                output,
-                cache_creation: CacheCreation {
-                    ephemeral_5m: cache_creation,
-                    ephemeral_1h: 0,
-                },
-                cache_read: 0,
-            }),
-            content: Some(content),
-            cwd: None,
-            origin: TurnOrigin::default(),
+    fn parent_exchange(rows: Vec<PreparedRow>) -> PreparedExchange {
+        PreparedExchange {
+            origin: TurnOrigin::Parent,
+            rows,
+        }
+    }
+
+    fn subagent_exchange(
+        agent_type: &str,
+        description: Option<&str>,
+        rows: Vec<PreparedRow>,
+    ) -> PreparedExchange {
+        PreparedExchange {
+            origin: TurnOrigin::Subagent {
+                agent_type: agent_type.to_string(),
+                description: description.map(str::to_string),
+            },
+            rows,
         }
     }
 
@@ -1001,8 +792,7 @@ mod tests {
 
     #[test]
     fn render_session_header_includes_all_seven_columns() {
-        let (out, rows_shown) =
-            render_session(&[], &PricingCatalog::empty(), ThresholdsFilter::default());
+        let (out, rows_shown) = render_session(&[]);
         assert_eq!(rows_shown, 0);
         assert!(out.contains("datetime"));
         assert!(out.contains("role"));
@@ -1015,32 +805,20 @@ mod tests {
 
     #[test]
     fn render_session_orphan_user_shows_em_dash_and_preserves_cumulative() {
-        let u1 = show_user_turn("first", "2026-04-01T10:00:00Z");
-        let a1 = show_assistant_turn(
-            serde_json::json!([{ "type": "text", "text": "reply" }]),
-            12000,
-            345,
-            0,
-            "2026-04-01T10:01:00Z",
-        );
-        let u2 = show_user_turn("orphan", "2026-04-01T10:02:00Z");
-        // Assistant row tokens column = 345 (output), cumulative after it =
-        // 12000 + 345 = 12345.
         let exchanges = vec![
-            Exchange {
-                user: &u1,
-                assistants: vec![&a1],
-            },
-            Exchange {
-                user: &u2,
-                assistants: Vec::new(),
-            },
+            parent_exchange(vec![
+                test_row(PreparedRowRole::User, Some(12000), 12000, None, "first"),
+                test_row(PreparedRowRole::Assistant, Some(345), 12345, None, "reply"),
+            ]),
+            parent_exchange(vec![test_row(
+                PreparedRowRole::User,
+                None,
+                12345,
+                None,
+                "orphan",
+            )]),
         ];
-        let (out, _) = render_session(
-            &exchanges,
-            &PricingCatalog::empty(),
-            ThresholdsFilter::default(),
-        );
+        let (out, _) = render_session(&exchanges);
         let lines: Vec<&str> = out.lines().collect();
         let assistant_line = lines
             .iter()
@@ -1051,16 +829,9 @@ mod tests {
             .find(|l| l.contains("orphan"))
             .expect("orphan row missing");
 
-        // Orphan row's tokens column shows the em-dash and cumulative is
-        // preserved from the prior row.
         assert!(orphan_line.contains('—'));
         assert!(orphan_line.contains(&format_tokens(12345)));
 
-        // Strip the trailing content column AND the cum_cost column so
-        // the cumulative column sits at the new right edge. Both rows
-        // here use an empty catalog, so every cum_cost cell renders `—`.
-        // Pop content first (variable text), then pop the trailing `—`,
-        // then we can pin on the numeric `cumulative` value.
         let strip_to_cumulative = |l: &str, content_marker: &str| {
             let trimmed = l.trim_end();
             let cut = trimmed
@@ -1069,7 +840,7 @@ mod tests {
             let after_content = trimmed[..cut].trim_end();
             after_content
                 .strip_suffix('—')
-                .expect("cum_cost should be em-dash for unknown-model session")
+                .expect("cum_cost should be em-dash")
                 .trim_end()
                 .to_string()
         };
@@ -1077,48 +848,22 @@ mod tests {
         let o_cols = strip_to_cumulative(orphan_line, "orphan");
         assert!(a_cols.ends_with(&format_tokens(12345)), "got: {a_cols}");
         assert!(o_cols.ends_with(&format_tokens(12345)), "got: {o_cols}");
-        // Right-aligned: the trailing cumulative columns end at the same
-        // character position, so the preceding lines (through tokens + spaces +
-        // cumulative) have the same scalar count. Compare by chars, not bytes,
-        // because `—` is 1 scalar but 3 UTF-8 bytes — `.len()` would report a
-        // spurious 2-byte difference even when columns are visually aligned.
         assert_eq!(a_cols.chars().count(), o_cols.chars().count());
     }
 
     #[test]
     fn render_session_cumulative_reaches_sum_of_billable() {
-        let u1 = show_user_turn("q1", "2026-04-01T10:00:00Z");
-        let a1 = show_assistant_turn(
-            serde_json::json!([{ "type": "text", "text": "r1" }]),
-            100,
-            50,
-            200,
-            "2026-04-01T10:01:00Z",
-        );
-        let u2 = show_user_turn("q2", "2026-04-01T10:02:00Z");
-        let a2 = show_assistant_turn(
-            serde_json::json!([{ "type": "text", "text": "r2" }]),
-            10,
-            20,
-            0,
-            "2026-04-01T10:03:00Z",
-        );
         let exchanges = vec![
-            Exchange {
-                user: &u1,
-                assistants: vec![&a1],
-            },
-            Exchange {
-                user: &u2,
-                assistants: vec![&a2],
-            },
+            parent_exchange(vec![
+                test_row(PreparedRowRole::User, Some(300), 300, None, "q1"),
+                test_row(PreparedRowRole::Assistant, Some(50), 350, None, "r1"),
+            ]),
+            parent_exchange(vec![
+                test_row(PreparedRowRole::User, Some(10), 360, None, "q2"),
+                test_row(PreparedRowRole::Assistant, Some(20), 380, None, "r2"),
+            ]),
         ];
-        // Expected billable total = (100+50+200) + (10+20+0) = 380.
-        let (out, _) = render_session(
-            &exchanges,
-            &PricingCatalog::empty(),
-            ThresholdsFilter::default(),
-        );
+        let (out, _) = render_session(&exchanges);
         let last_line = out
             .lines()
             .rfind(|l| l.contains("r2"))
@@ -1131,42 +876,23 @@ mod tests {
 
     #[test]
     fn render_session_right_aligns_numeric_columns() {
-        let u1 = show_user_turn("small", "2026-04-01T10:00:00Z");
-        let a1 = show_assistant_turn(
-            serde_json::json!([{ "type": "text", "text": "s" }]),
-            0,
-            9,
-            0,
-            "2026-04-01T10:01:00Z",
-        );
-        let u2 = show_user_turn("big", "2026-04-01T10:02:00Z");
-        let a2 = show_assistant_turn(
-            serde_json::json!([{ "type": "text", "text": "b" }]),
-            0,
-            123_456,
-            0,
-            "2026-04-01T10:03:00Z",
-        );
         let exchanges = vec![
-            Exchange {
-                user: &u1,
-                assistants: vec![&a1],
-            },
-            Exchange {
-                user: &u2,
-                assistants: vec![&a2],
-            },
+            parent_exchange(vec![
+                test_row(PreparedRowRole::User, Some(0), 0, None, "small"),
+                test_row(PreparedRowRole::Assistant, Some(9), 9, None, "s"),
+            ]),
+            parent_exchange(vec![
+                test_row(PreparedRowRole::User, Some(0), 9, None, "big"),
+                test_row(
+                    PreparedRowRole::Assistant,
+                    Some(123_456),
+                    123_465,
+                    None,
+                    "b",
+                ),
+            ]),
         ];
-        let (out, _) = render_session(
-            &exchanges,
-            &PricingCatalog::empty(),
-            ThresholdsFilter::default(),
-        );
-        // After Phase 3 the column order is:
-        //   datetime | role | tokens | cost | cumulative | cum_cost | content
-        // With an empty catalog, both `cost` and `cum_cost` render as
-        // `—`. Strip content, then the trailing `—` (cum_cost) so the
-        // cumulative column sits at the right edge.
+        let (out, _) = render_session(&exchanges);
         let a_small = out
             .lines()
             .find(|l| l.trim_end().ends_with(" s"))
@@ -1179,15 +905,12 @@ mod tests {
             let after_content = l.trim_end().strip_suffix(tail).unwrap_or(l).trim_end();
             after_content
                 .strip_suffix('—')
-                .expect("cum_cost should be em-dash with empty catalog")
+                .expect("cum_cost should be em-dash")
                 .trim_end()
                 .to_string()
         };
         let small_cols = strip_to_cumulative(a_small, "s");
         let big_cols = strip_to_cumulative(a_big, "b");
-        // Cumulative column values: 9 for small row, 9 + 123456 = 123465 for
-        // big row. Widths of tokens + cost + cumulative parts must
-        // match (all three are right-aligned to the same boundaries).
         assert!(small_cols.ends_with(&format_tokens(9)), "got: {small_cols}");
         assert!(
             big_cols.ends_with(&format_tokens(123_465)),
@@ -1198,27 +921,13 @@ mod tests {
 
     #[test]
     fn render_session_tool_use_suffix_appears_on_assistant_row() {
-        let u = show_user_turn("q", "2026-04-01T10:00:00Z");
-        let a = show_assistant_turn(
-            serde_json::json!([
-                { "type": "text", "text": "reading" },
-                { "type": "tool_use", "name": "Read", "id": "1", "input": {} },
-                { "type": "tool_use", "name": "Bash", "id": "2", "input": {} },
-            ]),
-            0,
-            1,
-            0,
-            "2026-04-01T10:01:00Z",
-        );
-        let exchanges = vec![Exchange {
-            user: &u,
-            assistants: vec![&a],
-        }];
-        let (out, _) = render_session(
-            &exchanges,
-            &PricingCatalog::empty(),
-            ThresholdsFilter::default(),
-        );
+        let mut row = test_row(PreparedRowRole::Assistant, Some(1), 1, None, "reading");
+        row.tool_use_count = 2;
+        let exchanges = vec![parent_exchange(vec![
+            test_row(PreparedRowRole::User, Some(0), 0, None, "q"),
+            row,
+        ])];
+        let (out, _) = render_session(&exchanges);
         assert!(
             out.contains("reading +2 tool uses"),
             "expected tool-use suffix; got:\n{out}",
@@ -1227,245 +936,115 @@ mod tests {
 
     // --- subagent rendering ---
 
-    fn subagent_assistant_turn(
-        agent_type: &str,
-        description: Option<&str>,
-        text: &str,
-        input: u64,
-        output: u64,
-        cache_creation: u64,
-        ts: &str,
-    ) -> Turn {
-        Turn {
-            timestamp: Some(ts.parse().unwrap()),
-            role: Role::Assistant,
-            model: Some("claude-opus-4-7".to_string()),
-            message_id: None,
-            request_id: None,
-            usage: Some(Usage {
-                input,
-                output,
-                cache_creation: CacheCreation {
-                    ephemeral_5m: cache_creation,
-                    ephemeral_1h: 0,
-                },
-                cache_read: 0,
-            }),
-            content: Some(serde_json::json!([{ "type": "text", "text": text }])),
-            cwd: None,
-            origin: TurnOrigin::Subagent {
-                agent_type: agent_type.to_string(),
-                description: description.map(str::to_string),
-            },
-        }
-    }
-
-    fn subagent_user_turn(
-        agent_type: &str,
-        description: Option<&str>,
-        content: &str,
-        ts: &str,
-    ) -> Turn {
-        Turn {
-            timestamp: Some(ts.parse().unwrap()),
-            role: Role::User,
-            model: None,
-            message_id: None,
-            request_id: None,
-            usage: None,
-            content: Some(Value::String(content.to_string())),
-            cwd: None,
-            origin: TurnOrigin::Subagent {
-                agent_type: agent_type.to_string(),
-                description: description.map(str::to_string),
-            },
-        }
-    }
-
     #[test]
     fn render_session_renders_subagent_exchange_as_single_row_with_description() {
-        let user = subagent_user_turn(
+        let exchanges = vec![subagent_exchange(
             "tw-code-reviewer",
             Some("Review auth changes"),
-            "review please",
-            "2026-04-01T10:00:00Z",
-        );
-        let asst = subagent_assistant_turn(
-            "tw-code-reviewer",
-            Some("Review auth changes"),
-            "found 2 issues",
-            10,
-            20,
-            0,
-            "2026-04-01T10:00:30Z",
-        );
-        let exchanges = vec![Exchange {
-            user: &user,
-            assistants: vec![&asst],
-        }];
-        let (out, rows) = render_session(
-            &exchanges,
-            &PricingCatalog::empty(),
-            ThresholdsFilter::default(),
-        );
+            vec![test_row(
+                PreparedRowRole::Subagent,
+                Some(30),
+                30,
+                None,
+                "(tw-code-reviewer · \"Review auth changes\") found 2 issues",
+            )],
+        )];
+        let (out, rows) = render_session(&exchanges);
         assert_eq!(rows, 1, "subagent exchange must render exactly one row");
-        assert!(
-            out.contains("subagent"),
-            "row label should be `subagent`; got:\n{out}",
-        );
+        assert!(out.contains("subagent"));
         assert!(
             out.contains("(tw-code-reviewer · \"Review auth changes\") found 2 issues"),
-            "content cell should carry agent_type, description, and response; got:\n{out}",
-        );
-        // Suppression: the user-prompt content should NOT appear as a
-        // separate row.
-        assert!(
-            !out.contains("review please"),
-            "subagent user-prompt content should be suppressed in output; got:\n{out}",
+            "got:\n{out}",
         );
     }
 
     #[test]
     fn render_session_renders_subagent_without_description() {
-        let user = subagent_user_turn(
+        let exchanges = vec![subagent_exchange(
             "tw-code-reviewer",
             None,
-            "review please",
-            "2026-04-01T10:00:00Z",
-        );
-        let asst = subagent_assistant_turn(
-            "tw-code-reviewer",
-            None,
-            "all good",
-            10,
-            20,
-            0,
-            "2026-04-01T10:00:30Z",
-        );
-        let exchanges = vec![Exchange {
-            user: &user,
-            assistants: vec![&asst],
-        }];
-        let (out, _) = render_session(
-            &exchanges,
-            &PricingCatalog::empty(),
-            ThresholdsFilter::default(),
-        );
-        assert!(
-            out.contains("(tw-code-reviewer) all good"),
-            "no-description form should be `(<agent_type>) <response>`; got:\n{out}",
-        );
-        assert!(
-            !out.contains('·'),
-            "no-description form must not contain the description separator; got:\n{out}",
-        );
+            vec![test_row(
+                PreparedRowRole::Subagent,
+                Some(30),
+                30,
+                None,
+                "(tw-code-reviewer) all good",
+            )],
+        )];
+        let (out, _) = render_session(&exchanges);
+        assert!(out.contains("(tw-code-reviewer) all good"), "got:\n{out}");
+        assert!(!out.contains('·'));
     }
 
     #[test]
     fn render_session_subagent_row_contributes_to_cumulative() {
-        // Parent contributes 100 + 50 + 50 = 200 billable on its
-        // assistant cluster; subagent contributes 30 + 60 + 0 = 90.
-        // Cumulative-at-bottom should be 290.
-        let pu = show_user_turn("ask", "2026-04-01T10:00:00Z");
-        let pa = show_assistant_turn(
-            serde_json::json!([{ "type": "text", "text": "thinking" }]),
-            100,
-            50,
-            50,
-            "2026-04-01T10:00:30Z",
-        );
-        let su = subagent_user_turn("agent", None, "internal", "2026-04-01T10:01:00Z");
-        let sa = subagent_assistant_turn("agent", None, "done", 30, 60, 0, "2026-04-01T10:01:30Z");
         let exchanges = vec![
-            Exchange {
-                user: &pu,
-                assistants: vec![&pa],
-            },
-            Exchange {
-                user: &su,
-                assistants: vec![&sa],
-            },
+            parent_exchange(vec![
+                test_row(PreparedRowRole::User, Some(200), 200, None, "ask"),
+                test_row(PreparedRowRole::Assistant, Some(50), 200, None, "thinking"),
+            ]),
+            subagent_exchange(
+                "agent",
+                None,
+                vec![test_row(
+                    PreparedRowRole::Subagent,
+                    Some(90),
+                    290,
+                    None,
+                    "(agent) done",
+                )],
+            ),
         ];
-        let (out, _) = render_session(
-            &exchanges,
-            &PricingCatalog::empty(),
-            ThresholdsFilter::default(),
-        );
+        let (out, _) = render_session(&exchanges);
         let last_data_line = out
             .lines()
             .rfind(|l| l.contains("done"))
             .expect("subagent row missing");
         assert!(
             last_data_line.contains(" 0.29k "),
-            "cumulative-at-bottom should equal parent + subagent total (0.29k); got: {last_data_line}",
+            "cumulative-at-bottom should be 0.29k; got: {last_data_line}",
         );
     }
 
     #[test]
     fn render_session_empty_subagent_cluster_renders_no_response_marker() {
-        let user = subagent_user_turn(
+        let exchanges = vec![subagent_exchange(
             "tw-code-reviewer",
             Some("Empty case"),
-            "review",
-            "2026-04-01T10:00:00Z",
-        );
-        let exchanges = vec![Exchange {
-            user: &user,
-            assistants: Vec::new(),
-        }];
-        let (out, rows) = render_session(
-            &exchanges,
-            &PricingCatalog::empty(),
-            ThresholdsFilter::default(),
-        );
+            vec![test_row(
+                PreparedRowRole::Subagent,
+                None,
+                0,
+                Some(0.0),
+                "(tw-code-reviewer · \"Empty case\") — (no response)",
+            )],
+        )];
+        let (out, rows) = render_session(&exchanges);
         assert_eq!(rows, 1);
-        assert!(
-            out.contains("— (no response)"),
-            "empty cluster should render the no-response marker; got:\n{out}",
-        );
-        // Empty cluster matches the parent-orphan branch: tokens
-        // and cost both render as `—`. Cumulative columns reflect
-        // the (zero) contribution.
+        assert!(out.contains("— (no response)"), "got:\n{out}");
         let row = out
             .lines()
             .find(|l| l.contains("subagent"))
             .expect("subagent row missing");
-        // Two `—` cells (tokens + cost). The content cell also contains
-        // a `—` (from `— (no response)`), so look for at least three.
         let dash_count = row.matches('—').count();
         assert!(
             dash_count >= 3,
-            "empty cluster should have `—` tokens + `—` cost + `—` in content marker; got: {row}",
+            "expected `—` in tokens + cost + content; got: {row}",
         );
     }
 
     #[test]
     fn render_session_truncates_show_content_at_max_chars() {
-        // Build a content cell that exceeds SHOW_CONTENT_MAX_CHARS so
-        // the truncation path fires for parent rows too.
         let long_text = "x".repeat(SHOW_CONTENT_MAX_CHARS + 50);
-        let u = show_user_turn(&long_text, "2026-04-01T10:00:00Z");
-        let a = show_assistant_turn(
-            serde_json::json!([{ "type": "text", "text": "ok" }]),
-            10,
-            5,
-            0,
-            "2026-04-01T10:01:00Z",
-        );
-        let exchanges = vec![Exchange {
-            user: &u,
-            assistants: vec![&a],
-        }];
-        let (out, _) = render_session(
-            &exchanges,
-            &PricingCatalog::empty(),
-            ThresholdsFilter::default(),
-        );
+        let exchanges = vec![parent_exchange(vec![
+            test_row(PreparedRowRole::User, Some(10), 10, None, &long_text),
+            test_row(PreparedRowRole::Assistant, Some(5), 15, None, "ok"),
+        ])];
+        let (out, _) = render_session(&exchanges);
         assert!(
             out.contains('…'),
             "truncated content should end with ellipsis; got:\n{out}",
         );
-        // Full long string must NOT appear.
         assert!(!out.contains(&long_text));
     }
 

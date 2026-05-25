@@ -3,7 +3,9 @@ mod cli;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use cclens::aggregation::{aggregate, dedup_assistant_turns, group_into_exchanges};
+use cclens::aggregation::{
+    aggregate, dedup_assistant_turns, group_into_exchanges, prepare_exchanges,
+};
 use cclens::attribution::{
     InputsFilter, SessionKind, SessionMeta, compute_coverage, compute_rows,
     extend_inventory_for_session, session_meta_from_turns,
@@ -448,10 +450,10 @@ fn run_show(
             .timestamp
             .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
     });
-    let (rendered, rows_shown) =
-        render_session(&all_exchanges, &catalog, thresholds.thresholds_filter());
+    let prepared = prepare_exchanges(&all_exchanges, &catalog, thresholds.thresholds_filter());
+    let (rendered, _rows_shown) = render_session(&prepared);
     println!("{rendered}");
-    if rows_shown == 0 {
+    if prepared.is_empty() {
         // `cclens show` deliberately excludes scope flags (its required
         // <session-id> argument already pins a single session), so the
         // default `SessionFilterArgs` reports `any_active() == false`
