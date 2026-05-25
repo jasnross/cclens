@@ -27,23 +27,23 @@
 //! Show-view content cells (every row, parent and subagent) are
 //! truncated to `SHOW_CONTENT_MAX_CHARS` so a long subagent prefix
 //! (or any other oversized content) cannot break the
-//! one-line-per-row invariant. The fallback path of
-//! `assistant_cluster_preview` renders `Task` `tool_use` blocks as
-//! `Task[<agent_type>]` when the input carries a `subagent_type`,
-//! pointing the parent's tool-loop row at the matching subagent.
+//! one-line-per-row invariant.
 //!
 //! All formatter helpers (`format_cost_opt`, `format_rate_mtok`,
-//! `truncate_title`, `format_local`, `format_local_or_empty`) and
-//! the cumulative-fold helpers are module-private.
+//! `truncate_title`, `format_local`, `format_local_or_empty`) are
+//! module-private. Content-preview and cumulative-fold helpers live
+//! in `aggregation`.
 
 use chrono::{DateTime, Utc};
 use comfy_table::presets::NOTHING;
 use comfy_table::{Cell, CellAlignment, Table};
-use serde_json::Value;
 
-use crate::aggregation::{Exchange, exchange_filter_totals, user_display_string};
+use crate::aggregation::{
+    Exchange, assistant_cluster_preview, count_tool_uses, exchange_filter_totals, fold_cum_cost,
+    strict_fold_assistant_cost, subagent_content_preview, user_content_preview,
+};
 use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
-use crate::domain::{CacheCreation, CostBreakdown, Session, Turn, TurnOrigin, Usage};
+use crate::domain::{CacheCreation, CostBreakdown, Session, TurnOrigin};
 use crate::filter::ThresholdsFilter;
 use crate::inventory::ContextFileKind;
 use crate::pricing::{ClaudePricing, PricingCatalog};
@@ -221,154 +221,6 @@ fn add_totals_row(table: &mut Table, sessions: &[Session]) {
         Cell::new(format_cost_opt(total_cost)),
         Cell::new(""),
     ]);
-}
-
-fn user_content_preview(turn: &Turn) -> String {
-    // The grouper guarantees the turn is substantive, so `None` is unreachable
-    // in practice; `unwrap_or_default` keeps the renderer infallible without
-    // requiring `.unwrap()`.
-    turn.content
-        .as_ref()
-        .and_then(user_display_string)
-        .unwrap_or_default()
-}
-
-fn assistant_cluster_preview(assistants: &[&Turn]) -> String {
-    // First non-empty text block across the cluster.
-    for a in assistants {
-        let Some(Value::Array(blocks)) = a.content.as_ref() else {
-            continue;
-        };
-        for block in blocks {
-            if block.get("type").and_then(Value::as_str) != Some("text") {
-                continue;
-            }
-            if let Some(text) = block.get("text").and_then(Value::as_str)
-                && !text.is_empty()
-            {
-                return text.to_string();
-            }
-        }
-    }
-
-    // Fallback: deduped tool-use entries, in order of first appearance.
-    // For `Task` tool_use blocks, attach the `subagent_type` from the
-    // input as a bracket annotation so the parent row points at *which*
-    // subagent it dispatched (e.g. `Task[tw-code-reviewer]`). Other
-    // tool_use blocks dedup by bare name.
-    let mut entries: Vec<String> = Vec::new();
-    for a in assistants {
-        let Some(Value::Array(blocks)) = a.content.as_ref() else {
-            continue;
-        };
-        for block in blocks {
-            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-                continue;
-            }
-            let Some(name) = block.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let entry = if name == "Task" {
-                match block
-                    .get("input")
-                    .and_then(|v| v.get("subagent_type"))
-                    .and_then(Value::as_str)
-                {
-                    Some(at) => format!("Task[{at}]"),
-                    None => "Task".to_string(),
-                }
-            } else {
-                name.to_string()
-            };
-            if !entries.iter().any(|n| n == &entry) {
-                entries.push(entry);
-            }
-        }
-    }
-    entries.join(", ")
-}
-
-/// Build the content cell for a subagent row. Format depends on whether
-/// the sidecar carried a `description` and whether the cluster has any
-/// assistant turns to summarize:
-/// - description present, non-empty cluster:
-///   `(<agent_type> · "<description>") <response-preview>`
-/// - description absent, non-empty cluster: `(<agent_type>) <response-preview>`
-/// - empty cluster (subagent invocation with no responses — not seen
-///   in observed data, but possible in principle): append
-///   ` — (no response)` to the prefix so the empty-row case is visible.
-///
-/// `description` is rendered via debug-format (`{:?}`) so embedded
-/// quotes / backslashes are escaped rather than producing a visually
-/// broken cell. Real-world descriptions are short human strings and
-/// won't contain such characters in practice; the escape is defense
-/// against pathological future data.
-fn subagent_content_preview(
-    agent_type: &str,
-    description: Option<&str>,
-    assistants: &[&Turn],
-) -> String {
-    let prefix = match description {
-        Some(d) => format!("({agent_type} · {d:?})"),
-        None => format!("({agent_type})"),
-    };
-    if assistants.is_empty() {
-        format!("{prefix} — (no response)")
-    } else {
-        format!("{prefix} {}", assistant_cluster_preview(assistants))
-    }
-}
-
-/// Sum costs across an assistant cluster with strict `None`
-/// propagation. The closure picks which token components count for
-/// this row (e.g. `(input, 0, cache_creation, cache_read)` for the
-/// user row, `(0, output, CacheCreation::default(), 0)` for the
-/// assistant row). Any single turn the catalog can't price collapses
-/// the whole sum to `None`, matching the session-level rule.
-fn strict_fold_assistant_cost(
-    assistants: &[&Turn],
-    catalog: &PricingCatalog,
-    pick: impl Fn(&Usage) -> (u64, u64, CacheCreation, u64),
-) -> Option<CostBreakdown> {
-    let mut sum = CostBreakdown::default();
-    for turn in assistants {
-        let Some(usage) = turn.usage.as_ref() else {
-            continue;
-        };
-        let (input, output, cache_creation, cache_read) = pick(usage);
-        let breakdown = catalog.cost_for_components(
-            input,
-            output,
-            cache_creation,
-            cache_read,
-            turn.model.as_deref(),
-        )?;
-        sum += breakdown;
-    }
-    Some(sum)
-}
-
-fn count_tool_uses(assistants: &[&Turn]) -> u64 {
-    let mut n: u64 = 0;
-    for a in assistants {
-        let Some(Value::Array(blocks)) = a.content.as_ref() else {
-            continue;
-        };
-        for block in blocks {
-            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                n += 1;
-            }
-        }
-    }
-    n
-}
-
-/// Strict-fold the running cost: both `Some` → sum; either `None` →
-/// stays `None` for this row and every subsequent row. Callers retain
-/// the previous accumulator value so a `None` "latches" through every
-/// later row, matching the unknown-model propagation contract.
-fn fold_cum_cost(prev: Option<f64>, delta: Option<f64>) -> Option<f64> {
-    prev.zip(delta).map(|(a, b)| a + b)
 }
 
 /// Render a parent exchange as the canonical two-row pair (user row +
@@ -801,51 +653,12 @@ fn coverage_half(label: &str, tier: &TierCoverage) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::*;
-    use crate::domain::{Role, TurnOrigin};
+    use crate::domain::{Role, Turn, TurnOrigin, Usage};
 
     // --- test helpers ---
-
-    fn user_array_turn(content: Value) -> Turn {
-        Turn {
-            timestamp: None,
-            role: Role::User,
-            model: None,
-            message_id: None,
-            request_id: None,
-            usage: None,
-            content: Some(content),
-            cwd: None,
-            origin: TurnOrigin::default(),
-        }
-    }
-
-    fn assistant_turn_with_content(
-        content: Value,
-        input: u64,
-        output: u64,
-        cache_creation: u64,
-    ) -> Turn {
-        Turn {
-            timestamp: Some("2026-04-22T09:00:00Z".parse().unwrap()),
-            role: Role::Assistant,
-            model: Some("claude-opus-4-7".to_string()),
-            message_id: None,
-            request_id: None,
-            usage: Some(Usage {
-                input,
-                output,
-                cache_creation: CacheCreation {
-                    ephemeral_5m: cache_creation,
-                    ephemeral_1h: 0,
-                },
-                cache_read: 0,
-            }),
-            content: Some(content),
-            cwd: None,
-            origin: TurnOrigin::default(),
-        }
-    }
 
     fn show_user_turn(content: &str, ts: &str) -> Turn {
         Turn {
@@ -1182,99 +995,6 @@ mod tests {
             !out.contains("total"),
             "empty input must produce header-only output (no totals row); got:\n{out}"
         );
-    }
-
-    // --- user_content_preview ---
-
-    #[test]
-    fn user_content_preview_delegates_to_user_display_string() {
-        let content = serde_json::json!([
-            { "type": "tool_result", "content": "..." },
-            { "type": "text", "text": "hello" },
-        ]);
-        let turn = user_array_turn(content);
-        assert_eq!(user_content_preview(&turn), "hello");
-    }
-
-    #[test]
-    fn user_content_preview_returns_empty_string_on_unreachable_none() {
-        let turn = Turn {
-            timestamp: None,
-            role: Role::User,
-            model: None,
-            message_id: None,
-            request_id: None,
-            usage: None,
-            content: Some(Value::Null),
-            cwd: None,
-            origin: TurnOrigin::default(),
-        };
-        assert_eq!(user_content_preview(&turn), "");
-    }
-
-    // --- assistant_cluster_preview ---
-
-    #[test]
-    fn assistant_cluster_preview_first_text_block() {
-        // First assistant has only a tool_use; second opens with a text block.
-        let tu = serde_json::json!([
-            { "type": "tool_use", "name": "Read", "id": "x", "input": {} },
-        ]);
-        let tx = serde_json::json!([
-            { "type": "text", "text": "found it" },
-        ]);
-        let a1 = assistant_turn_with_content(tu, 0, 0, 0);
-        let a2 = assistant_turn_with_content(tx, 0, 0, 0);
-        let cluster: Vec<&Turn> = vec![&a1, &a2];
-        assert_eq!(assistant_cluster_preview(&cluster), "found it");
-    }
-
-    #[test]
-    fn assistant_cluster_preview_falls_back_to_deduped_tool_names() {
-        let tu_a = serde_json::json!([
-            { "type": "tool_use", "name": "Read", "id": "1", "input": {} },
-            { "type": "tool_use", "name": "Bash", "id": "2", "input": {} },
-        ]);
-        let tu_b = serde_json::json!([
-            { "type": "tool_use", "name": "Read", "id": "3", "input": {} },
-            { "type": "tool_use", "name": "Edit", "id": "4", "input": {} },
-        ]);
-        let a1 = assistant_turn_with_content(tu_a, 0, 0, 0);
-        let a2 = assistant_turn_with_content(tu_b, 0, 0, 0);
-        let cluster: Vec<&Turn> = vec![&a1, &a2];
-        assert_eq!(assistant_cluster_preview(&cluster), "Read, Bash, Edit");
-    }
-
-    #[test]
-    fn assistant_cluster_preview_empty_cluster_returns_empty_string() {
-        let cluster: Vec<&Turn> = Vec::new();
-        assert_eq!(assistant_cluster_preview(&cluster), "");
-    }
-
-    // --- count_tool_uses ---
-
-    #[test]
-    fn count_tool_uses_counts_across_cluster() {
-        let a_content = serde_json::json!([
-            { "type": "tool_use", "name": "Read", "id": "1", "input": {} },
-        ]);
-        let b_content = serde_json::json!([
-            { "type": "text", "text": "..." },
-            { "type": "tool_use", "name": "Bash", "id": "2", "input": {} },
-            { "type": "tool_use", "name": "Edit", "id": "3", "input": {} },
-        ]);
-        let a1 = assistant_turn_with_content(a_content, 0, 0, 0);
-        let a2 = assistant_turn_with_content(b_content, 0, 0, 0);
-        let cluster: Vec<&Turn> = vec![&a1, &a2];
-        assert_eq!(count_tool_uses(&cluster), 3);
-    }
-
-    #[test]
-    fn count_tool_uses_zero_for_text_only_cluster() {
-        let tx = serde_json::json!([{ "type": "text", "text": "hi" }]);
-        let a = assistant_turn_with_content(tx, 0, 0, 0);
-        let cluster: Vec<&Turn> = vec![&a];
-        assert_eq!(count_tool_uses(&cluster), 0);
     }
 
     // --- render_session ---
@@ -1747,45 +1467,6 @@ mod tests {
         );
         // Full long string must NOT appear.
         assert!(!out.contains(&long_text));
-    }
-
-    // --- assistant_cluster_preview Task[<agent_type>] annotation ---
-
-    #[test]
-    fn assistant_cluster_preview_extracts_task_subagent_type() {
-        let tu = serde_json::json!([
-            { "type": "tool_use", "name": "Task", "id": "1", "input": {"subagent_type": "tw-code-reviewer", "description": "review", "prompt": "..."} },
-        ]);
-        let a = assistant_turn_with_content(tu, 0, 0, 0);
-        let cluster: Vec<&Turn> = vec![&a];
-        assert_eq!(
-            assistant_cluster_preview(&cluster),
-            "Task[tw-code-reviewer]",
-        );
-    }
-
-    #[test]
-    fn assistant_cluster_preview_falls_back_for_task_without_subagent_type() {
-        let tu = serde_json::json!([
-            { "type": "tool_use", "name": "Task", "id": "1", "input": {} },
-        ]);
-        let a = assistant_turn_with_content(tu, 0, 0, 0);
-        let cluster: Vec<&Turn> = vec![&a];
-        assert_eq!(assistant_cluster_preview(&cluster), "Task");
-    }
-
-    #[test]
-    fn assistant_cluster_preview_renders_multiple_task_targets() {
-        let tu = serde_json::json!([
-            { "type": "tool_use", "name": "Task", "id": "1", "input": {"subagent_type": "tw-code-reviewer"} },
-            { "type": "tool_use", "name": "Task", "id": "2", "input": {"subagent_type": "tw-plan-reviewer"} },
-        ]);
-        let a = assistant_turn_with_content(tu, 0, 0, 0);
-        let cluster: Vec<&Turn> = vec![&a];
-        assert_eq!(
-            assistant_cluster_preview(&cluster),
-            "Task[tw-code-reviewer], Task[tw-plan-reviewer]",
-        );
     }
 
     // --- render_inputs ---
