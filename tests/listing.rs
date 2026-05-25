@@ -280,47 +280,49 @@ fn show_renders_per_exchange_table_with_tool_loop_collapse_and_orphan_user() {
     //   T3: in=100 out=50 cc=200 cr=50
     //   T5: in=10  out=150 cc=0 cr=0
     //   T7: in=5   out=80  cc=0 cr=0
-    //   user-row cost = (115*15 + 200*18.75 + 50*1.5) * 1e-6
-    //                 = 0.001725 + 0.00375 + 0.000075
-    //                 = 0.00555 → "$0.0056"
-    //   asst-row cost = (50+150+80) * 75e-6 = 280 * 0.000075
-    //                 = 0.021 → "$0.0210"
-    //   running cum_cost (with f64 accumulation):
+    //   user-row breakdown: in:$0.0017 c5m:$0.0038 cr:$0.0001
+    //     (115*15e-6=0.001725, 200*18.75e-6=0.00375, 50*1.5e-6=0.000075)
+    //   asst-row breakdown: out:$0.0210
+    //     (280*75e-6=0.021)
+    //   running cum_cost (scalar, with f64 accumulation):
     //     0.00555  (user row)              → "$0.0056"
     //     0.02655  (asst row)              → "$0.0265"
     //     0.028725 (exchange 2 user row)   → "$0.0287"
     //     0.033225 (exchange 2 asst row)   → "$0.0332"
     //     0.033225 (orphan row, +Some(0))  → "$0.0332"
     //
-    // Some `:.4` outputs end in *4 / *5 rather than the rational
-    // half-even result because of f64 representation: e.g. 0.02655
-    // is stored as 0.026549999..., which rounds to 0.0265.
-    //
     // Exchange 2 (follow-up question) has 1 assistant turn:
     //   T9: in=20 out=60 cc=100 cr=0
-    //   user-row cost = (20*15 + 100*18.75 + 0) * 1e-6
-    //                 = 0.0003 + 0.001875 = 0.002175 → "$0.0022"
-    //   asst-row cost = 60*75e-6 = 0.0045 → "$0.0045"
+    //   user-row breakdown: in:$0.0003 c5m:$0.0019
+    //     (20*15e-6=0.0003, 100*18.75e-6=0.001875)
+    //   asst-row breakdown: out:$0.0045
+    //     (60*75e-6=0.0045)
     //
     // Exchange 3 (third question, orphan): tokens=`—` cost=`—`
     //   user_cost_delta = Some(0.0) so cum_cost stays at 0.033225.
     let expected = [
-        ("/test-cmd demo", " 0.32k ", "$0.0056", "0.32k", "$0.0056"),
+        (
+            "/test-cmd demo",
+            " 0.32k ",
+            "in:$0.0017",
+            "0.32k",
+            "$0.0056",
+        ),
         (
             "reading the file +2 tool uses",
             " 0.28k ",
-            "$0.0210",
+            "out:$0.0210",
             "0.59k",
             "$0.0265",
         ),
         (
             "follow-up question",
             " 0.12k ",
-            "$0.0022",
+            "c5m:$0.0019",
             "0.71k",
             "$0.0287",
         ),
-        (" answer ", " 0.06k ", "$0.0045", "0.78k", "$0.0332"),
+        (" answer ", " 0.06k ", "out:$0.0045", "0.78k", "$0.0332"),
         (
             "third question with no response",
             "—",

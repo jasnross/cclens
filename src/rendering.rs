@@ -99,6 +99,31 @@ fn format_cost_opt(c: Option<f64>) -> String {
     c.map_or_else(|| "—".to_string(), |n| format!("${n:.4}"))
 }
 
+/// Format a decomposed cost breakdown showing non-zero components.
+/// `None` renders as `—`; all-zero renders as `$0.0000`; otherwise
+/// space-separated `label:$X.XXXX` for each non-zero component.
+fn format_cost_breakdown(breakdown: Option<CostBreakdown>) -> String {
+    let Some(b) = breakdown else {
+        return "—".to_string();
+    };
+    let parts: Vec<String> = [
+        ("in", b.input),
+        ("out", b.output),
+        ("c5m", b.cache_creation_5m),
+        ("c1h", b.cache_creation_1h),
+        ("cr", b.cache_read),
+    ]
+    .into_iter()
+    .filter(|(_, v)| *v > 0.0)
+    .map(|(label, v)| format!("{label}:${v:.4}"))
+    .collect();
+    if parts.is_empty() {
+        "$0.0000".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
 fn format_rate_mtok(per_token_rate: f64) -> String {
     format!("${:.2}", per_token_rate * 1_000_000.0)
 }
@@ -387,14 +412,13 @@ fn render_parent_exchange(
     // For non-empty clusters they're equal: any unknown-model turn
     // collapses both to `None`, latching cum_cost through the rest
     // of the session.
-    let (user_cost_display, user_cost_delta) = if exchange.assistants.is_empty() {
+    let (user_cost_breakdown, user_cost_delta) = if exchange.assistants.is_empty() {
         (None, Some(0.0))
     } else {
         let breakdown = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
             (usage.input, 0, usage.cache_creation, usage.cache_read)
         });
-        let scalar = breakdown.map(|b| b.total());
-        (scalar, scalar)
+        (breakdown, breakdown.map(|b| b.total()))
     };
 
     *cumulative += user_tokens_opt.unwrap_or(0);
@@ -404,7 +428,7 @@ fn render_parent_exchange(
             format_local_or_empty(exchange.user.timestamp),
             "user".to_string(),
             user_tokens_opt.map_or_else(|| "—".to_string(), format_tokens),
-            format_cost_opt(user_cost_display),
+            format_cost_breakdown(user_cost_breakdown),
             format_tokens(cumulative.to_owned()),
             format_cost_opt(*cum_cost),
             truncate_title(&user_content_preview(exchange.user), SHOW_CONTENT_MAX_CHARS),
@@ -413,12 +437,12 @@ fn render_parent_exchange(
     }
 
     if let Some(first_assistant) = exchange.assistants.first() {
-        let assistant_cost = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
-            (0, usage.output, CacheCreation::default(), 0)
-        })
-        .map(|b| b.total());
+        let assistant_breakdown =
+            strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+                (0, usage.output, CacheCreation::default(), 0)
+            });
         *cumulative += output_tokens;
-        *cum_cost = fold_cum_cost(*cum_cost, assistant_cost);
+        *cum_cost = fold_cum_cost(*cum_cost, assistant_breakdown.map(|b| b.total()));
 
         if visible {
             let preview = assistant_cluster_preview(&exchange.assistants);
@@ -432,7 +456,7 @@ fn render_parent_exchange(
                 format_local_or_empty(first_assistant.timestamp),
                 "assistant".to_string(),
                 format_tokens(output_tokens),
-                format_cost_opt(assistant_cost),
+                format_cost_breakdown(assistant_breakdown),
                 format_tokens(cumulative.to_owned()),
                 format_cost_opt(*cum_cost),
                 truncate_title(&content, SHOW_CONTENT_MAX_CHARS),
@@ -468,7 +492,7 @@ fn render_subagent_exchange(
         .filter_map(|t| t.usage.as_ref())
         .map(|u| u.input + u.output + u.cache_creation.total())
         .sum();
-    let (row_cost_display, row_cost_delta) = if exchange.assistants.is_empty() {
+    let (row_cost_breakdown, row_cost_delta) = if exchange.assistants.is_empty() {
         (None, Some(0.0))
     } else {
         let breakdown = strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
@@ -479,8 +503,7 @@ fn render_subagent_exchange(
                 usage.cache_read,
             )
         });
-        let scalar = breakdown.map(|b| b.total());
-        (scalar, scalar)
+        (breakdown, breakdown.map(|b| b.total()))
     };
 
     *cumulative += row_tokens;
@@ -509,7 +532,7 @@ fn render_subagent_exchange(
             format_local_or_empty(ts),
             "subagent".to_string(),
             tokens_cell,
-            format_cost_opt(row_cost_display),
+            format_cost_breakdown(row_cost_breakdown),
             format_tokens(cumulative.to_owned()),
             format_cost_opt(*cum_cost),
             truncate_title(&content, SHOW_CONTENT_MAX_CHARS),
