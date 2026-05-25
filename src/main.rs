@@ -15,6 +15,7 @@ use cclens::discovery::{
     ProjectSessions, SessionPaths, SubagentPaths, discover, read_subagent_meta,
 };
 use cclens::domain::{Turn, TurnOrigin};
+use cclens::filter::ThresholdsFilter;
 use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
@@ -371,33 +372,14 @@ fn run_pricing(action: PricingAction) -> anyhow::Result<()> {
     }
 }
 
-/// Render one session's per-exchange table.
-///
-/// Walks the parent JSONL (with the same per-project cross-file dedup
-/// pass `run_list` runs) plus every subagent transcript discovered
-/// under `<stem>/subagents/`. Subagent transcripts are parsed via
-/// `build_subagent_turns`, which tags each turn with
-/// `TurnOrigin::Subagent`. The renderer dispatches on origin to render
-/// subagent exchanges as single rows (role `subagent`) inline with the
-/// parent's exchanges, sorted by user-turn timestamp. The body's
-/// `cumulative` column at the bottom equals what `cclens list` reports
-/// for the same session — list/show consistency by construction.
-fn run_show(
+fn load_show_detail(
     projects_dir: &Path,
     session_id: &str,
-    thresholds: ThresholdsFilterArgs,
-) -> anyhow::Result<()> {
-    let session_id = session_id.trim();
-    if session_id.is_empty() {
-        anyhow::bail!("session id must not be empty");
-    }
+    catalog: &pricing::PricingCatalog,
+    thresholds: ThresholdsFilter,
+) -> anyhow::Result<Vec<cclens::aggregation::PreparedExchange>> {
     let project_entries = discover(projects_dir)?;
 
-    // Locate the project that owns this session. A stem collision
-    // *across* projects is unlikely (Claude Code uses fresh UUIDs)
-    // but we keep the "multiple sessions match id …" error for
-    // global ambiguity. Filenames within a single project directory
-    // are unique, so per-project ambiguity isn't possible here.
     let mut matched_project: Option<(PathBuf, Vec<SessionPaths>)> = None;
     for ProjectSessions {
         project_dir,
@@ -418,11 +400,6 @@ fn run_show(
         anyhow::bail!("no session matches id {session_id}");
     };
 
-    // Walk the project's files in mtime-ascending order, threading the
-    // same per-project dedup state used by `run_list`. Stop as soon as
-    // we've processed the target file: files later in mtime order
-    // can't affect the target's filtered turns.
-    let catalog = pricing::load_catalog();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut target: Option<(Vec<Turn>, Vec<SubagentPaths>)> = None;
     for SessionPaths { jsonl, subagents } in session_paths {
@@ -437,9 +414,6 @@ fn run_show(
     }
     let (parent_turns, subagent_paths) =
         target.ok_or_else(|| anyhow::anyhow!("no session matches id {session_id}"))?;
-    // Bind the per-transcript `Vec<Turn>` lists to outer-scope locals
-    // so every `Exchange<'a>` borrows from the same lifetime; the
-    // merged exchange list then lives across all of them.
     let subagent_turn_lists: Vec<Vec<Turn>> = subagent_paths
         .iter()
         .filter_map(build_subagent_turns)
@@ -448,24 +422,44 @@ fn run_show(
     for sub_turns in &subagent_turn_lists {
         all_exchanges.extend(group_into_exchanges(sub_turns));
     }
-    // Sort exchanges by user-turn timestamp. `unwrap_or(UNIX_EPOCH)`
-    // mirrors `discovery::sort_by_mtime_asc`'s defensive default — in
-    // observed Claude Code data substantive user turns always carry a
-    // timestamp, but the fallback keeps the sort total and keeps the
-    // renderer free of `.unwrap()` (banned by the `unwrap_used` lint).
     all_exchanges.sort_by_key(|ex| {
         ex.user
             .timestamp
             .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
     });
-    let prepared = prepare_exchanges(&all_exchanges, &catalog, thresholds.thresholds_filter());
+    Ok(prepare_exchanges(&all_exchanges, catalog, thresholds))
+}
+
+/// Render one session's per-exchange table.
+///
+/// Walks the parent JSONL (with the same per-project cross-file dedup
+/// pass `run_list` runs) plus every subagent transcript discovered
+/// under `<stem>/subagents/`. Subagent transcripts are parsed via
+/// `build_subagent_turns`, which tags each turn with
+/// `TurnOrigin::Subagent`. The renderer dispatches on origin to render
+/// subagent exchanges as single rows (role `subagent`) inline with the
+/// parent's exchanges, sorted by user-turn timestamp. The body's
+/// `cumulative` column at the bottom equals what `cclens list` reports
+/// for the same session — list/show consistency by construction.
+fn run_show(
+    projects_dir: &Path,
+    session_id: &str,
+    thresholds: ThresholdsFilterArgs,
+) -> anyhow::Result<()> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        anyhow::bail!("session id must not be empty");
+    }
+    let catalog = pricing::load_catalog();
+    let prepared = load_show_detail(
+        projects_dir,
+        session_id,
+        &catalog,
+        thresholds.thresholds_filter(),
+    )?;
     let (rendered, _rows_shown) = render_session(&prepared);
     println!("{rendered}");
     if prepared.is_empty() {
-        // `cclens show` deliberately excludes scope flags (its required
-        // <session-id> argument already pins a single session), so the
-        // default `SessionFilterArgs` reports `any_active() == false`
-        // and the hint suppression path is preserved exactly.
         emit_empty_result_hint(&SessionFilterArgs::default(), &thresholds);
     }
     Ok(())
