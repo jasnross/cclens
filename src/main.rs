@@ -8,14 +8,14 @@ use cclens::aggregation::{
     aggregate, dedup_assistant_turns, group_into_exchanges, prepare_exchanges,
 };
 use cclens::attribution::{
-    InputsFilter, SessionKind, SessionMeta, compute_coverage, compute_rows,
-    extend_inventory_for_session, session_meta_from_turns,
+    AttributionRow, CoverageStats, InputsFilter, SessionKind, SessionMeta, compute_coverage,
+    compute_rows, extend_inventory_for_session, session_meta_from_turns,
 };
 use cclens::discovery::{
     ProjectSessions, SessionPaths, SubagentPaths, discover, read_subagent_meta,
 };
-use cclens::domain::{Turn, TurnOrigin};
-use cclens::filter::ThresholdsFilter;
+use cclens::domain::{Session, Turn, TurnOrigin};
+use cclens::filter::{SessionFilter, ThresholdsFilter};
 use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
@@ -51,35 +51,22 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn run_list(
+/// Returns sessions sorted by `started_at` (ascending).
+fn load_sessions_data(
     projects_dir: &Path,
-    scope: &SessionFilterArgs,
-    thresholds: ThresholdsFilterArgs,
-    tui: bool,
-) -> anyhow::Result<()> {
-    let catalog = pricing::load_catalog();
+    session_filter: &SessionFilter,
+    thresholds_filter: &ThresholdsFilter,
+    catalog: &pricing::PricingCatalog,
+) -> anyhow::Result<Vec<Session>> {
     let project_entries = discover(projects_dir)?;
-    let session_filter = scope.session_filter();
-    let thresholds_filter = thresholds.thresholds_filter();
     let mut sessions = Vec::new();
     for ProjectSessions {
         project_dir,
         sessions: session_paths,
     } in project_entries
     {
-        // Cross-file dedup state, scoped to one project. Resumed
-        // sessions replay prior assistant turns verbatim; this set
-        // ensures any `(message.id, requestId)` pair contributes cost
-        // exactly once across the project's `.jsonl` files. `discover`
-        // already returned `sessions` in mtime-ascending order, so
-        // the earliest file containing a given key wins. Subagent
-        // JSONLs are folded into each parent session's totals via
-        // `build_subagent_turns`; they are not subject to cross-file
-        // dedup (each subagent transcript is single-file and
-        // non-resumable, matching `build_subagent_meta`'s contract).
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for SessionPaths { jsonl, subagents } in session_paths {
-            // A single unreadable file should not abort the whole listing.
             let Ok(turns) = parse_jsonl(&jsonl) else {
                 continue;
             };
@@ -90,20 +77,12 @@ fn run_list(
                 .unwrap_or_default();
             let subagent_turn_lists: Vec<Vec<Turn>> =
                 subagents.iter().filter_map(build_subagent_turns).collect();
-            // Both filters sit *after* `aggregate`'s existing
-            // zero-billable pre-pass, so they compose additively
-            // rather than altering the "session is meaningful"
-            // contract. Scope check runs before thresholds for
-            // readability — both are cheap once `aggregate` has
-            // produced the session, and the ordering matches how
-            // the flags appear left-to-right in the user-facing
-            // CLI surface.
             if let Some(session) = aggregate(
                 &project_dir,
                 session_id,
                 turns,
                 &subagent_turn_lists,
-                &catalog,
+                catalog,
             ) && session_filter.accepts(&session.project_short_name, session.started_at)
                 && thresholds_filter.matches(
                     session.total_billable,
@@ -115,6 +94,19 @@ fn run_list(
         }
     }
     sessions.sort_by_key(|s| s.started_at);
+    Ok(sessions)
+}
+
+fn run_list(
+    projects_dir: &Path,
+    scope: &SessionFilterArgs,
+    thresholds: ThresholdsFilterArgs,
+    tui: bool,
+) -> anyhow::Result<()> {
+    let catalog = pricing::load_catalog();
+    let session_filter = scope.session_filter();
+    let thresholds_filter = thresholds.thresholds_filter();
+    let sessions = load_sessions_data(projects_dir, &session_filter, &thresholds_filter, &catalog)?;
     if tui && !sessions.is_empty() {
         run_list_tui(sessions, |session_id| {
             load_show_detail(
@@ -133,13 +125,11 @@ fn run_list(
     Ok(())
 }
 
-fn run_inputs(
+fn load_inputs_data(
     projects_dir: &Path,
-    scope: &SessionFilterArgs,
-    inputs: &InputsArgs,
-    thresholds: ThresholdsFilterArgs,
-) -> anyhow::Result<()> {
-    let catalog = pricing::load_catalog();
+    inputs_filter: &InputsFilter,
+    catalog: &pricing::PricingCatalog,
+) -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> {
     let inventory_config = InventoryConfig::default();
     let mut inventory = discover_inventory(&inventory_config);
     let mut seen_inventory_paths: HashSet<PathBuf> = HashSet::new();
@@ -148,17 +138,12 @@ fn run_inputs(
     }
 
     let project_entries = discover(projects_dir)?;
-    let inputs_filter = InputsFilter {
-        session_id: inputs.session_id(),
-        scope: scope.session_filter(),
-    };
     let mut session_metas: Vec<SessionMeta> = Vec::new();
     for ProjectSessions {
         project_dir,
         sessions: session_paths,
     } in project_entries
     {
-        // Same per-project cross-file dedup pattern as run_list/run_show.
         let mut seen_turn_keys: HashSet<(String, String)> = HashSet::new();
         for SessionPaths { jsonl, subagents } in session_paths {
             let Ok(turns) = parse_jsonl(&jsonl) else {
@@ -175,17 +160,8 @@ fn run_inputs(
                 continue;
             };
             if !inputs_filter.accepts(&parent_meta) {
-                // Whole session (parent + subagents) is filtered out
-                // — `--session foo` and `--project bar` apply to the
-                // parent session, and a subagent inherits its parent's
-                // identity. Skipping here keeps subagent attribution
-                // consistent with what the user asked for.
                 continue;
             }
-            // Extend the shared inventory with this session's
-            // ancestor + project-local context files. Path-keyed
-            // dedup means a shared CLAUDE.md across sibling cwds
-            // appears in the inventory exactly once.
             if let Some(cwd) = &parent_meta.cwd {
                 extend_inventory_for_session(
                     &mut inventory,
@@ -194,16 +170,6 @@ fn run_inputs(
                     &inventory_config,
                 );
             }
-
-            // Walk this parent's subagents via the per-subagent
-            // helper, which encapsulates the parse → meta → cwd
-            // fallback pipeline. v1 skips any subagent whose
-            // `.meta.json` is absent or unreadable.
-            //
-            // The clone of cwd + short-name is gated on
-            // `subagents.is_empty()` because the overwhelmingly
-            // common case (a session that never spawned a subagent)
-            // shouldn't pay for the parent-fallback machinery.
             if subagents.is_empty() {
                 session_metas.push(parent_meta);
                 continue;
@@ -220,9 +186,6 @@ fn run_inputs(
                 ) else {
                     continue;
                 };
-                // Extend the inventory for this subagent's cwd. Path-
-                // keyed dedup makes same-cwd subagents (the common
-                // case) free.
                 if let Some(cwd) = &sub_meta.cwd {
                     extend_inventory_for_session(
                         &mut inventory,
@@ -236,11 +199,24 @@ fn run_inputs(
         }
     }
 
-    let rows = compute_rows(inventory, &session_metas, &catalog);
+    let rows = compute_rows(inventory, &session_metas, catalog);
     let coverage = compute_coverage(&session_metas, &rows);
+    Ok((rows, coverage))
+}
+
+fn run_inputs(
+    projects_dir: &Path,
+    scope: &SessionFilterArgs,
+    inputs: &InputsArgs,
+    thresholds: ThresholdsFilterArgs,
+) -> anyhow::Result<()> {
+    let catalog = pricing::load_catalog();
+    let inputs_filter = InputsFilter {
+        session_id: inputs.session_id(),
+        scope: scope.session_filter(),
+    };
+    let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
     let thresholds_filter = thresholds.thresholds_filter();
-    // Apply --min-tokens / --min-cost as a presentation-only row filter:
-    // coverage stats reflect every session in scope, not just rows kept.
     let visible_rows: Vec<_> = rows
         .into_iter()
         .filter(|row| thresholds_filter.matches(row.estimated_tokens_billed, row.attributed_cost))
