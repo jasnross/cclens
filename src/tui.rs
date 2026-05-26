@@ -1,16 +1,18 @@
-//! Interactive TUI rendering for `cclens list` with drill-down to
-//! per-exchange session detail.
+//! Interactive TUI rendering for `cclens list` and `cclens inputs`
+//! with tabbed navigation and session drill-down.
 //!
 //! Public API:
-//! - `run_list_tui<F>(Vec<Session>, F) -> anyhow::Result<()>` where
-//!   `F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>>` — fullscreen
-//!   alternate-screen TUI with a scrollable session list. Pressing Enter
-//!   on a session invokes the closure to load detail, transitioning to a
-//!   show view with per-exchange rows and per-component cost columns.
-//!   Esc returns to the list; q quits.
+//! - `Tab` — `Sessions` | `Inputs` — the active tab.
+//! - `run_tui<F, G>(Vec<Session>, F, G, Tab) -> anyhow::Result<()>`
+//!   where `F: Fn(&str) -> Result<Vec<PreparedExchange>>` and
+//!   `G: Fn() -> Result<(Vec<AttributionRow>, CoverageStats)>` —
+//!   fullscreen TUI with tab switching (1/2 keys), scrollable tables,
+//!   session drill-down (Enter/Esc within Sessions tab), and
+//!   attribution table with coverage footer (Inputs tab).
 //!
-//! The plain-text path (`rendering::render_table` / `rendering::render_session`)
-//! remains the fallback for piped output, `--plain`, and `cclens show <id>`.
+//! The plain-text path (`rendering::render_table` / `rendering::render_session`
+//! / `rendering::render_inputs`) remains the fallback for piped output,
+//! `--plain`, and standalone `cclens show <id>`.
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -20,8 +22,38 @@ use ratatui::widgets::{Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::aggregation::{PreparedExchange, PreparedRow, PreparedRowRole, fold_cum_cost};
+use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::Session;
-use crate::formatting::{format_cost_opt, format_local, format_local_or_empty, format_tokens};
+use crate::formatting::{
+    coverage_line, display_path, format_cost_opt, format_local, format_local_or_empty,
+    format_tokens, kind_label,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Sessions,
+    Inputs,
+}
+
+struct InputsState {
+    rows: Vec<AttributionRow>,
+    coverage: CoverageStats,
+    table_state: TableState,
+}
+
+impl InputsState {
+    fn new(rows: Vec<AttributionRow>, coverage: CoverageStats) -> Self {
+        let mut table_state = TableState::default();
+        if !rows.is_empty() {
+            table_state.select_first();
+        }
+        Self {
+            rows,
+            coverage,
+            table_state,
+        }
+    }
+}
 
 enum View {
     List,
@@ -33,15 +65,17 @@ enum View {
 }
 
 struct App {
+    tab: Tab,
     sessions: Vec<Session>,
     list_state: TableState,
     total_tokens: u64,
     total_cost: Option<f64>,
     view: View,
+    inputs: Option<InputsState>,
 }
 
 impl App {
-    fn new(sessions: Vec<Session>) -> Self {
+    fn new(sessions: Vec<Session>, default_tab: Tab) -> Self {
         let total_tokens = sessions.iter().map(|s| s.total_billable).sum();
         let total_cost = sessions.iter().try_fold(0.0, |acc, s| {
             fold_cum_cost(Some(acc), s.cost_breakdown.map(|b| b.total()))
@@ -51,39 +85,63 @@ impl App {
             list_state.select_first();
         }
         Self {
+            tab: default_tab,
             sessions,
             list_state,
             total_tokens,
             total_cost,
             view: View::List,
+            inputs: None,
         }
     }
 }
 
 #[allow(clippy::missing_errors_doc)]
-pub fn run_list_tui<F>(sessions: Vec<Session>, load_show: F) -> anyhow::Result<()>
+pub fn run_tui<F, G>(
+    sessions: Vec<Session>,
+    load_show: F,
+    load_inputs: G,
+    default_tab: Tab,
+) -> anyhow::Result<()>
 where
     F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>>,
+    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
 {
     let mut terminal = ratatui::try_init()?;
-    let result = run_event_loop(&mut terminal, sessions, &load_show);
+    let result = run_event_loop(
+        &mut terminal,
+        sessions,
+        &load_show,
+        &load_inputs,
+        default_tab,
+    );
     ratatui::restore();
     result
 }
 
-fn run_event_loop<F>(
+fn run_event_loop<F, G>(
     terminal: &mut DefaultTerminal,
     sessions: Vec<Session>,
     load_show: &F,
+    load_inputs: &G,
+    default_tab: Tab,
 ) -> anyhow::Result<()>
 where
     F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>>,
+    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
 {
-    let mut app = App::new(sessions);
+    let mut app = App::new(sessions, default_tab);
+
+    if default_tab == Tab::Inputs
+        && let Ok((rows, coverage)) = load_inputs()
+    {
+        app.inputs = Some(InputsState::new(rows, coverage));
+    }
+
     loop {
         terminal.draw(|frame| render(&mut app, frame))?;
         if let Event::Key(key) = event::read()?
-            && handle_key_event(&mut app, key, load_show)
+            && handle_key_event(&mut app, key, load_show, load_inputs)
         {
             break;
         }
@@ -91,17 +149,60 @@ where
     Ok(())
 }
 
-fn handle_key_event<F>(app: &mut App, key: KeyEvent, load_show: &F) -> bool
+fn handle_key_event<F, G>(app: &mut App, key: KeyEvent, load_show: &F, load_inputs: &G) -> bool
 where
     F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>>,
+    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
 {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
-    if matches!(app.view, View::Show { .. }) {
-        handle_show_key(app, key)
-    } else {
-        handle_list_key(app, key, load_show)
+    match key.code {
+        KeyCode::Char('1') => {
+            app.tab = Tab::Sessions;
+            return false;
+        }
+        KeyCode::Char('2') => {
+            try_switch_to_inputs(app, load_inputs);
+            return false;
+        }
+        KeyCode::Backspace
+        | KeyCode::Enter
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::Esc
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => {}
+    }
+    match app.tab {
+        Tab::Sessions => {
+            if matches!(app.view, View::Show { .. }) {
+                handle_show_key(app, key)
+            } else {
+                handle_list_key(app, key, load_show)
+            }
+        }
+        Tab::Inputs => handle_inputs_key(app, key),
     }
 }
 
@@ -236,36 +337,138 @@ fn handle_show_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
-// ---- rendering ----
-
-fn render(app: &mut App, frame: &mut Frame) {
-    if matches!(app.view, View::Show { .. }) {
-        render_show(app, frame);
-    } else {
-        render_list(app, frame);
+fn try_switch_to_inputs<G>(app: &mut App, load_inputs: &G)
+where
+    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
+{
+    if app.inputs.is_none()
+        && let Ok((rows, coverage)) = load_inputs()
+    {
+        app.inputs = Some(InputsState::new(rows, coverage));
+    }
+    if app.inputs.is_some() {
+        app.tab = Tab::Inputs;
     }
 }
 
-fn render_list(app: &mut App, frame: &mut Frame) {
-    let [header_area, table_area, totals_area, footer_area] = Layout::vertical([
-        Constraint::Length(1),
+fn handle_inputs_key(app: &mut App, key: KeyEvent) -> bool {
+    let Some(inputs) = &mut app.inputs else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Down | KeyCode::Char('j') => {
+            inputs.table_state.select_next();
+            false
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            inputs.table_state.select_previous();
+            false
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            inputs.table_state.select_first();
+            false
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            inputs.table_state.select_last();
+            false
+        }
+        KeyCode::Enter
+        | KeyCode::Backspace
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => false,
+    }
+}
+
+// ---- rendering ----
+
+fn render(app: &mut App, frame: &mut Frame) {
+    let [header_area, content_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
+
+    render_tab_header(app, frame, header_area);
+
+    match app.tab {
+        Tab::Sessions => {
+            if matches!(app.view, View::Show { .. }) {
+                render_show_content(app, frame, content_area);
+            } else {
+                render_list_content(app, frame, content_area);
+            }
+        }
+        Tab::Inputs => render_inputs_content(app, frame, content_area),
+    }
+}
+
+fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let sessions_label = if app.tab == Tab::Sessions {
+        "[Sessions]"
+    } else {
+        " Sessions "
+    };
+    let inputs_label = if app.tab == Tab::Inputs {
+        "[Inputs]"
+    } else {
+        " Inputs "
+    };
+
+    let context = match app.tab {
+        Tab::Sessions => {
+            if let View::Show { header_label, .. } = &app.view {
+                header_label.clone()
+            } else {
+                let count = app.sessions.len();
+                let label = if count == 1 { "session" } else { "sessions" };
+                format!("{count} {label}")
+            }
+        }
+        Tab::Inputs => {
+            let count = app.inputs.as_ref().map_or(0, |i| i.rows.len());
+            let label = if count == 1 { "file" } else { "files" };
+            format!("{count} {label}")
+        }
+    };
+
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(area);
+
+    let left = Line::from(format!(" {sessions_label}  {inputs_label}")).bold();
+    let right = Line::from(format!("cclens — {context} "))
+        .bold()
+        .right_aligned();
+    frame.render_widget(Paragraph::new(left), left_area);
+    frame.render_widget(Paragraph::new(right), right_area);
+}
+
+fn render_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let [table_area, totals_area, footer_area] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
 
-    render_list_header(app, frame, header_area);
     render_sessions_table(app, frame, table_area);
     render_totals(app, frame, totals_area);
     render_list_footer(frame, footer_area);
-}
-
-fn render_list_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let count = app.sessions.len();
-    let label = if count == 1 { "session" } else { "sessions" };
-    let text = Line::from(format!(" cclens — {count} {label}")).bold();
-    frame.render_widget(Paragraph::new(text), area);
 }
 
 fn render_sessions_table(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -320,35 +523,28 @@ fn render_totals(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
 }
 
 fn render_list_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
-    let text = Line::from(" ↑↓ navigate  Enter open  q quit").dim();
+    let text = Line::from(" 1/2 tabs  ↑↓ navigate  Enter open  q quit").dim();
     frame.render_widget(Paragraph::new(text), area);
 }
 
 // ---- show view ----
 
-fn render_show(app: &mut App, frame: &mut Frame) {
+fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let View::Show {
-        header_label,
         prepared,
         table_state,
+        ..
     } = &mut app.view
     else {
         return;
     };
 
-    let [header_area, table_area, footer_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
-
-    let header = Line::from(format!(" cclens — {header_label}")).bold();
-    frame.render_widget(Paragraph::new(header), header_area);
+    let [table_area, footer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
 
     render_show_table(prepared, table_state, frame, table_area);
 
-    let footer = Line::from(" ↑↓ navigate  Esc back  q quit").dim();
+    let footer = Line::from(" 1/2 tabs  ↑↓ navigate  Esc back  q quit").dim();
     frame.render_widget(Paragraph::new(footer), footer_area);
 }
 
@@ -422,14 +618,86 @@ fn show_row(row: &PreparedRow, dim: bool) -> Row<'static> {
     if dim { r.dim() } else { r }
 }
 
+// ---- inputs view ----
+
+fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let Some(inputs) = &mut app.inputs else {
+        return;
+    };
+
+    let [table_area, coverage_area, footer_area] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    render_inputs_table(inputs, frame, table_area);
+    render_inputs_coverage(inputs, frame, coverage_area);
+    render_inputs_footer(frame, footer_area);
+}
+
+fn inputs_table_widths() -> [Constraint; 7] {
+    [
+        Constraint::Fill(2),   // file (responsive, 2/3 of flexible space)
+        Constraint::Fill(1),   // kind (responsive, 1/3 — handles long plugin names)
+        Constraint::Length(6), // tier
+        Constraint::Length(8), // tokens
+        Constraint::Length(6), // loads
+        Constraint::Length(8), // billed
+        Constraint::Length(9), // cost
+    ]
+}
+
+fn render_inputs_table(inputs: &mut InputsState, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let rows: Vec<Row> = inputs
+        .rows
+        .iter()
+        .map(|row| {
+            Row::new(vec![
+                Line::raw(display_path(&row.file.path)),
+                Line::raw(kind_label(&row.file.kind)),
+                Line::raw(row.tier_label().to_string()),
+                Line::raw(format_tokens(row.file.tokens)).right_aligned(),
+                Line::raw(row.total_loads().to_string()).right_aligned(),
+                Line::raw(format_tokens(row.estimated_tokens_billed)).right_aligned(),
+                Line::raw(format_cost_opt(row.attributed_cost)).right_aligned(),
+            ])
+        })
+        .collect();
+
+    let header = Row::new(["file", "kind", "tier", "tokens", "loads", "billed", "cost"])
+        .style(Style::new().bold());
+
+    let table = Table::new(rows, inputs_table_widths())
+        .header(header)
+        .row_highlight_style(Style::new().reversed());
+
+    frame.render_stateful_widget(table, area, &mut inputs.table_state);
+}
+
+fn render_inputs_coverage(inputs: &InputsState, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let text = Line::from(format!(" {}", coverage_line(&inputs.coverage)));
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+fn render_inputs_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
+    let text = Line::from(" 1/2 tabs  ↑↓ navigate  q quit").dim();
+    frame.render_widget(Paragraph::new(text), area);
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use chrono::{DateTime, Utc};
     use ratatui::backend::TestBackend;
 
     use super::*;
     use crate::aggregation::PreparedExchange;
+    use crate::attribution::TierCoverage;
     use crate::domain::{CostBreakdown, TurnOrigin};
+    use crate::inventory::{ContextFile, ContextFileKind, Scope};
 
     fn fixture_sessions() -> Vec<Session> {
         vec![
@@ -541,6 +809,10 @@ mod tests {
         |_| Ok(fixture_prepared_exchanges())
     }
 
+    fn noop_inputs_loader() -> impl Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> {
+        || anyhow::bail!("no loader")
+    }
+
     fn key_event(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
     }
@@ -549,19 +821,19 @@ mod tests {
 
     #[test]
     fn app_new_selects_first_when_non_empty() {
-        let app = App::new(fixture_sessions());
+        let app = App::new(fixture_sessions(), Tab::Sessions);
         assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]
     fn app_new_no_selection_when_empty() {
-        let app = App::new(vec![]);
+        let app = App::new(vec![], Tab::Sessions);
         assert_eq!(app.list_state.selected(), None);
     }
 
     #[test]
     fn app_new_computes_totals() {
-        let app = App::new(fixture_sessions());
+        let app = App::new(fixture_sessions(), Tab::Sessions);
         assert_eq!(app.total_tokens, 1500 + 2500 + 3000);
         let expected_cost = 0.01 + 0.02 + 0.03;
         assert!(
@@ -575,76 +847,84 @@ mod tests {
 
     #[test]
     fn app_starts_in_list_view() {
-        let app = App::new(fixture_sessions());
+        let app = App::new(fixture_sessions(), Tab::Sessions);
         assert!(matches!(app.view, View::List));
     }
 
     #[test]
     fn enter_transitions_to_show_view() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = fixture_loader();
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
     }
 
     #[test]
     fn enter_with_failed_closure_stays_on_list() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader =
             |_: &str| -> anyhow::Result<Vec<PreparedExchange>> { anyhow::bail!("load failed") };
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::List));
     }
 
     #[test]
     fn enter_with_no_selection_is_noop() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], Tab::Sessions);
         let loader = fixture_loader();
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::List));
     }
 
     #[test]
     fn esc_in_show_returns_to_list() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = fixture_loader();
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
-        handle_key_event(&mut app, key_event(KeyCode::Esc), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Esc), &loader, &il);
         assert!(matches!(app.view, View::List));
     }
 
     #[test]
     fn backspace_in_show_returns_to_list() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = fixture_loader();
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
-        handle_key_event(&mut app, key_event(KeyCode::Backspace), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Backspace), &loader, &il);
         assert!(matches!(app.view, View::List));
     }
 
     #[test]
     fn q_in_show_quits() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = fixture_loader();
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
         assert!(handle_key_event(
             &mut app,
             key_event(KeyCode::Char('q')),
-            &loader
+            &loader,
+            &il
         ));
     }
 
     #[test]
     fn list_selection_preserved_after_roundtrip() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = fixture_loader();
+        let il = noop_inputs_loader();
         app.list_state.select(Some(2));
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
-        handle_key_event(&mut app, key_event(KeyCode::Esc), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Esc), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(2));
     }
 
@@ -652,72 +932,86 @@ mod tests {
 
     #[test]
     fn handle_key_quit_on_q() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = noop_loader();
+        let il = noop_inputs_loader();
         assert!(handle_key_event(
             &mut app,
             key_event(KeyCode::Char('q')),
-            &loader
+            &loader,
+            &il
         ));
     }
 
     #[test]
     fn handle_key_quit_on_esc() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = noop_loader();
-        assert!(handle_key_event(&mut app, key_event(KeyCode::Esc), &loader));
+        let il = noop_inputs_loader();
+        assert!(handle_key_event(
+            &mut app,
+            key_event(KeyCode::Esc),
+            &loader,
+            &il
+        ));
     }
 
     #[test]
     fn handle_key_quit_on_ctrl_c() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = noop_loader();
+        let il = noop_inputs_loader();
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(handle_key_event(&mut app, key, &loader));
+        assert!(handle_key_event(&mut app, key, &loader, &il));
     }
 
     #[test]
     fn handle_key_down_advances_selection() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = noop_loader();
+        let il = noop_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
-        handle_key_event(&mut app, key_event(KeyCode::Down), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(1));
     }
 
     #[test]
     fn handle_key_up_retreats_selection() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = noop_loader();
+        let il = noop_inputs_loader();
         app.list_state.select(Some(1));
-        handle_key_event(&mut app, key_event(KeyCode::Up), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Up), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]
     fn handle_key_j_advances_like_down() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = noop_loader();
+        let il = noop_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
-        handle_key_event(&mut app, key_event(KeyCode::Char('j')), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Char('j')), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(1));
     }
 
     #[test]
     fn handle_key_k_retreats_like_up() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = noop_loader();
+        let il = noop_inputs_loader();
         app.list_state.select(Some(1));
-        handle_key_event(&mut app, key_event(KeyCode::Char('k')), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Char('k')), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]
     fn handle_key_home_selects_first() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = noop_loader();
+        let il = noop_inputs_loader();
         app.list_state.select(Some(2));
-        handle_key_event(&mut app, key_event(KeyCode::Home), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Home), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(0));
     }
 
@@ -725,20 +1019,22 @@ mod tests {
     fn handle_key_end_selects_last() {
         let sessions = fixture_sessions();
         let last = sessions.len() - 1;
-        let mut app = App::new(sessions);
+        let mut app = App::new(sessions, Tab::Sessions);
         let loader = noop_loader();
+        let il = noop_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
-        handle_key_event(&mut app, key_event(KeyCode::End), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::End), &loader, &il);
         render_app(&mut app, 80, 10);
         assert_eq!(app.list_state.selected(), Some(last));
     }
 
     #[test]
     fn handle_key_unknown_is_noop() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = noop_loader();
+        let il = noop_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
-        let quit = handle_key_event(&mut app, key_event(KeyCode::Char('x')), &loader);
+        let quit = handle_key_event(&mut app, key_event(KeyCode::Char('x')), &loader, &il);
         assert!(!quit);
         assert_eq!(app.list_state.selected(), Some(0));
     }
@@ -747,13 +1043,14 @@ mod tests {
 
     #[test]
     fn show_down_advances_selection() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = fixture_loader();
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         if let View::Show { table_state, .. } = &app.view {
             assert_eq!(table_state.selected(), Some(0));
         }
-        handle_key_event(&mut app, key_event(KeyCode::Down), &loader);
+        handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
         if let View::Show { table_state, .. } = &app.view {
             assert_eq!(table_state.selected(), Some(1));
         }
@@ -761,11 +1058,12 @@ mod tests {
 
     #[test]
     fn show_up_retreats_selection() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = fixture_loader();
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
-        handle_key_event(&mut app, key_event(KeyCode::Down), &loader);
-        handle_key_event(&mut app, key_event(KeyCode::Up), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
+        handle_key_event(&mut app, key_event(KeyCode::Up), &loader, &il);
         if let View::Show { table_state, .. } = &app.view {
             assert_eq!(table_state.selected(), Some(0));
         }
@@ -773,12 +1071,13 @@ mod tests {
 
     #[test]
     fn show_home_selects_first() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = fixture_loader();
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
-        handle_key_event(&mut app, key_event(KeyCode::Down), &loader);
-        handle_key_event(&mut app, key_event(KeyCode::Down), &loader);
-        handle_key_event(&mut app, key_event(KeyCode::Home), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
+        handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
+        handle_key_event(&mut app, key_event(KeyCode::Home), &loader, &il);
         if let View::Show { table_state, .. } = &app.view {
             assert_eq!(table_state.selected(), Some(0));
         }
@@ -786,10 +1085,11 @@ mod tests {
 
     #[test]
     fn show_end_selects_last() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let loader = fixture_loader();
-        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader);
-        handle_key_event(&mut app, key_event(KeyCode::End), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        handle_key_event(&mut app, key_event(KeyCode::End), &loader, &il);
         render_app(&mut app, 120, 20);
         if let View::Show { table_state, .. } = &app.view {
             assert_eq!(table_state.selected(), Some(2));
@@ -807,7 +1107,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_header_with_session_count() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let first_line = output.lines().next().unwrap();
         assert!(
@@ -818,7 +1118,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_table_header_columns() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let second_line = output.lines().nth(1).unwrap();
         for col in ["datetime", "project", "title", "tokens", "cost"] {
@@ -831,7 +1131,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_footer_key_hints() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
@@ -842,7 +1142,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_totals_when_multiple_sessions() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let lines: Vec<&str> = output.lines().collect();
         let totals_line = lines[lines.len() - 2];
@@ -858,7 +1158,7 @@ mod tests {
 
     #[test]
     fn list_tui_omits_totals_for_single_session() {
-        let mut app = App::new(vec![fixture_sessions().remove(0)]);
+        let mut app = App::new(vec![fixture_sessions().remove(0)], Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let lines: Vec<&str> = output.lines().collect();
         let totals_line = lines[lines.len() - 2];
@@ -870,7 +1170,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_session_data_in_rows() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let data_line = output.lines().nth(2).unwrap();
         assert!(
@@ -885,7 +1185,7 @@ mod tests {
 
     #[test]
     fn list_footer_shows_enter_hint() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
@@ -898,12 +1198,13 @@ mod tests {
 
     fn enter_show_view(app: &mut App) {
         let loader = fixture_loader();
-        handle_key_event(app, key_event(KeyCode::Enter), &loader);
+        let il = noop_inputs_loader();
+        handle_key_event(app, key_event(KeyCode::Enter), &loader, &il);
     }
 
     #[test]
     fn show_tui_renders_header_with_session_info() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 120, 20);
         let first_line = output.lines().next().unwrap();
@@ -919,7 +1220,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_column_headers() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         let second_line = output.lines().nth(1).unwrap();
@@ -936,7 +1237,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_footer_with_back_hint() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 120, 20);
         let last_line = output.lines().last().unwrap();
@@ -948,7 +1249,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_exchange_rows() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         assert!(
@@ -967,7 +1268,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_per_component_costs() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         assert!(
@@ -982,7 +1283,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_dash_for_none_cost() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         let subagent_line = output.lines().find(|l| l.contains("subagent")).unwrap();
@@ -994,7 +1295,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_tool_use_count_in_content() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 160, 20);
         assert!(
@@ -1005,7 +1306,7 @@ mod tests {
 
     #[test]
     fn show_tui_dims_odd_exchange_rows() {
-        let mut app = App::new(fixture_sessions());
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
         enter_show_view(&mut app);
         let backend = TestBackend::new(140, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1039,5 +1340,368 @@ mod tests {
                 "second exchange (idx 1) should be dimmed",
             );
         }
+    }
+
+    // --- Inputs fixtures ---
+
+    fn fixture_attribution_rows() -> Vec<AttributionRow> {
+        vec![
+            AttributionRow {
+                file: ContextFile {
+                    path: PathBuf::from("/home/user/.claude/CLAUDE.md"),
+                    kind: ContextFileKind::GlobalClaudeMd,
+                    tokens: 500,
+                    scope: Scope::Global,
+                },
+                loads_1h: 5,
+                loads_5m: 0,
+                estimated_tokens_billed: 2500,
+                attributed_cost: Some(0.003),
+            },
+            AttributionRow {
+                file: ContextFile {
+                    path: PathBuf::from("/home/user/.claude/skills/foo/SKILL.md"),
+                    kind: ContextFileKind::UserSkill,
+                    tokens: 1200,
+                    scope: Scope::Global,
+                },
+                loads_1h: 0,
+                loads_5m: 3,
+                estimated_tokens_billed: 3600,
+                attributed_cost: Some(0.005),
+            },
+            AttributionRow {
+                file: ContextFile {
+                    path: PathBuf::from("/home/user/project/CLAUDE.md"),
+                    kind: ContextFileKind::ProjectClaudeMd,
+                    tokens: 800,
+                    scope: Scope::Global,
+                },
+                loads_1h: 2,
+                loads_5m: 1,
+                estimated_tokens_billed: 2400,
+                attributed_cost: None,
+            },
+        ]
+    }
+
+    fn fixture_coverage_stats() -> CoverageStats {
+        CoverageStats {
+            long_1h: TierCoverage {
+                observed_tokens: 5000,
+                attributed_tokens: 4000,
+                ratio: Some(0.8),
+            },
+            short_5m: TierCoverage {
+                observed_tokens: 2000,
+                attributed_tokens: 1500,
+                ratio: Some(0.75),
+            },
+        }
+    }
+
+    fn fixture_inputs_loader() -> impl Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>
+    {
+        || Ok((fixture_attribution_rows(), fixture_coverage_stats()))
+    }
+
+    // --- Tab switching tests ---
+
+    #[test]
+    fn app_starts_on_specified_tab() {
+        let app = App::new(fixture_sessions(), Tab::Inputs);
+        assert_eq!(app.tab, Tab::Inputs);
+    }
+
+    #[test]
+    fn key_1_switches_to_sessions() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        let loader = noop_loader();
+        let il = fixture_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('1')), &loader, &il);
+        assert_eq!(app.tab, Tab::Sessions);
+    }
+
+    #[test]
+    fn key_2_switches_to_inputs_loading_data() {
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = fixture_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
+        assert_eq!(app.tab, Tab::Inputs);
+        assert!(app.inputs.is_some());
+    }
+
+    #[test]
+    fn key_2_with_failed_loader_stays_on_sessions() {
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
+        assert_eq!(app.tab, Tab::Sessions);
+    }
+
+    #[test]
+    fn key_2_reuses_cached_inputs() {
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = fixture_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
+        assert!(app.inputs.is_some());
+        handle_key_event(&mut app, key_event(KeyCode::Char('1')), &loader, &il);
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
+        assert!(app.inputs.is_some());
+    }
+
+    #[test]
+    fn tab_switch_from_show_view() {
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let loader = fixture_loader();
+        let il = fixture_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        assert!(matches!(app.view, View::Show { .. }));
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
+        assert_eq!(app.tab, Tab::Inputs);
+        handle_key_event(&mut app, key_event(KeyCode::Char('1')), &loader, &il);
+        assert_eq!(app.tab, Tab::Sessions);
+        assert!(matches!(app.view, View::Show { .. }));
+    }
+
+    // --- InputsState construction tests ---
+
+    #[test]
+    fn inputs_state_selects_first_when_non_empty() {
+        let state = InputsState::new(fixture_attribution_rows(), fixture_coverage_stats());
+        assert_eq!(state.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn inputs_state_no_selection_when_empty() {
+        let state = InputsState::new(vec![], fixture_coverage_stats());
+        assert_eq!(state.table_state.selected(), None);
+    }
+
+    // --- Inputs key handling tests ---
+
+    #[test]
+    fn inputs_key_quit_on_q() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        assert!(handle_key_event(
+            &mut app,
+            key_event(KeyCode::Char('q')),
+            &loader,
+            &il
+        ));
+    }
+
+    #[test]
+    fn inputs_key_quit_on_esc() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        assert!(handle_key_event(
+            &mut app,
+            key_event(KeyCode::Esc),
+            &loader,
+            &il
+        ));
+    }
+
+    #[test]
+    fn inputs_key_down_advances_selection() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        assert_eq!(app.inputs.as_ref().unwrap().table_state.selected(), Some(0));
+        handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
+        assert_eq!(app.inputs.as_ref().unwrap().table_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn inputs_key_up_retreats_selection() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
+        handle_key_event(&mut app, key_event(KeyCode::Up), &loader, &il);
+        assert_eq!(app.inputs.as_ref().unwrap().table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn inputs_key_unknown_is_noop() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        let quit = handle_key_event(&mut app, key_event(KeyCode::Char('x')), &loader, &il);
+        assert!(!quit);
+        assert_eq!(app.inputs.as_ref().unwrap().table_state.selected(), Some(0));
+    }
+
+    // --- Tab rendering tests ---
+
+    #[test]
+    fn tab_header_shows_sessions_active() {
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let output = render_app(&mut app, 80, 10);
+        let first_line = output.lines().next().unwrap();
+        assert!(
+            first_line.contains("[Sessions]"),
+            "header should show active Sessions tab; got: {first_line}",
+        );
+        assert!(
+            first_line.contains("Inputs") && !first_line.contains("[Inputs]"),
+            "Inputs should appear without brackets; got: {first_line}",
+        );
+    }
+
+    #[test]
+    fn tab_header_shows_inputs_active() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        app.tab = Tab::Inputs;
+        let output = render_app(&mut app, 80, 10);
+        let first_line = output.lines().next().unwrap();
+        assert!(
+            first_line.contains("[Inputs]"),
+            "header should show active Inputs tab; got: {first_line}",
+        );
+    }
+
+    #[test]
+    fn tab_header_shows_context_count() {
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let output = render_app(&mut app, 80, 10);
+        let first_line = output.lines().next().unwrap();
+        assert!(
+            first_line.contains("3 sessions"),
+            "header should show session count; got: {first_line}",
+        );
+    }
+
+    #[test]
+    fn inputs_tab_renders_table_columns() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        app.tab = Tab::Inputs;
+        let output = render_app(&mut app, 120, 10);
+        for col in ["file", "kind", "tier", "tokens", "loads", "billed", "cost"] {
+            assert!(
+                output.contains(col),
+                "inputs column `{col}` missing; got:\n{output}",
+            );
+        }
+    }
+
+    #[test]
+    fn inputs_tab_renders_coverage_line() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        app.tab = Tab::Inputs;
+        let output = render_app(&mut app, 120, 10);
+        assert!(
+            output.contains("coverage:"),
+            "should contain coverage line; got:\n{output}",
+        );
+        assert!(
+            output.contains("1h:") && output.contains("5m:"),
+            "should contain both tier labels; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn inputs_tab_renders_footer_with_tab_hint() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        app.tab = Tab::Inputs;
+        let output = render_app(&mut app, 120, 10);
+        let last_line = output.lines().last().unwrap();
+        assert!(
+            last_line.contains("1/2 tabs") && last_line.contains("q quit"),
+            "footer should contain tab hint and quit; got: {last_line}",
+        );
+    }
+
+    #[test]
+    fn inputs_tab_renders_kind_labels() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        app.tab = Tab::Inputs;
+        let output = render_app(&mut app, 120, 10);
+        assert!(
+            output.contains("global"),
+            "should contain 'global' kind label; got:\n{output}",
+        );
+        assert!(
+            output.contains("skill"),
+            "should contain 'skill' kind label; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn inputs_tab_renders_dash_for_unknown_cost() {
+        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        app.tab = Tab::Inputs;
+        let output = render_app(&mut app, 120, 10);
+        let project_line = output.lines().find(|l| l.contains("project"));
+        assert!(
+            project_line.is_some_and(|l| l.contains('—')),
+            "row with None cost should contain em-dash; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn list_footer_shows_tab_hint() {
+        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let output = render_app(&mut app, 80, 10);
+        let last_line = output.lines().last().unwrap();
+        assert!(
+            last_line.contains("1/2 tabs"),
+            "list footer should contain '1/2 tabs'; got: {last_line}",
+        );
     }
 }

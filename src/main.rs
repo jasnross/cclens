@@ -20,7 +20,7 @@ use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
 use cclens::rendering::{render_inputs, render_prices, render_session, render_table};
-use cclens::tui::run_list_tui;
+use cclens::tui::{Tab, run_tui};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::{
@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
             scope,
             inputs,
             thresholds,
-        } => run_inputs(&cli.projects_dir, &scope, &inputs, thresholds),
+        } => run_inputs(&cli.projects_dir, &scope, &inputs, thresholds, tui),
     }
 }
 
@@ -108,14 +108,23 @@ fn run_list(
     let thresholds_filter = thresholds.thresholds_filter();
     let sessions = load_sessions_data(projects_dir, &session_filter, &thresholds_filter, &catalog)?;
     if tui && !sessions.is_empty() {
-        run_list_tui(sessions, |session_id| {
-            load_show_detail(
-                projects_dir,
-                session_id,
-                &catalog,
-                ThresholdsFilter::default(),
-            )
-        })?;
+        let inputs_filter = InputsFilter {
+            session_id: None,
+            scope: session_filter,
+        };
+        run_tui(
+            sessions,
+            |session_id| {
+                load_show_detail(
+                    projects_dir,
+                    session_id,
+                    &catalog,
+                    ThresholdsFilter::default(),
+                )
+            },
+            || load_inputs_data(projects_dir, &inputs_filter, &catalog),
+            Tab::Sessions,
+        )?;
     } else {
         println!("{}", render_table(&sessions));
         if sessions.is_empty() {
@@ -209,21 +218,54 @@ fn run_inputs(
     scope: &SessionFilterArgs,
     inputs: &InputsArgs,
     thresholds: ThresholdsFilterArgs,
+    tui: bool,
 ) -> anyhow::Result<()> {
     let catalog = pricing::load_catalog();
     let inputs_filter = InputsFilter {
         session_id: inputs.session_id(),
         scope: scope.session_filter(),
     };
-    let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
     let thresholds_filter = thresholds.thresholds_filter();
-    let visible_rows: Vec<_> = rows
-        .into_iter()
-        .filter(|row| thresholds_filter.matches(row.estimated_tokens_billed, row.attributed_cost))
-        .collect();
-    println!("{}", render_inputs(&visible_rows, &coverage));
-    if visible_rows.is_empty() {
-        emit_inputs_empty_hint(scope, inputs, &thresholds);
+    if tui {
+        let session_filter = scope.session_filter();
+        let sessions = load_sessions_data(
+            projects_dir,
+            &session_filter,
+            &ThresholdsFilter::default(),
+            &catalog,
+        )?;
+        run_tui(
+            sessions,
+            |session_id| {
+                load_show_detail(
+                    projects_dir,
+                    session_id,
+                    &catalog,
+                    ThresholdsFilter::default(),
+                )
+            },
+            || {
+                let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
+                let visible: Vec<_> = rows
+                    .into_iter()
+                    .filter(|r| {
+                        thresholds_filter.matches(r.estimated_tokens_billed, r.attributed_cost)
+                    })
+                    .collect();
+                Ok((visible, coverage))
+            },
+            Tab::Inputs,
+        )?;
+    } else {
+        let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
+        let visible_rows: Vec<_> = rows
+            .into_iter()
+            .filter(|r| thresholds_filter.matches(r.estimated_tokens_billed, r.attributed_cost))
+            .collect();
+        println!("{}", render_inputs(&visible_rows, &coverage));
+        if visible_rows.is_empty() {
+            emit_inputs_empty_hint(scope, inputs, &thresholds);
+        }
     }
     Ok(())
 }
