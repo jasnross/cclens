@@ -36,10 +36,12 @@ use comfy_table::presets::NOTHING;
 use comfy_table::{Cell, CellAlignment, Table};
 
 use crate::aggregation::{PreparedExchange, PreparedRowRole, fold_cum_cost};
-use crate::attribution::{AttributionRow, CoverageStats, TierCoverage};
+use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::{CostBreakdown, Session};
-use crate::formatting::{format_cost_opt, format_local, format_local_or_empty, format_tokens};
-use crate::inventory::ContextFileKind;
+use crate::formatting::{
+    coverage_line, display_path, format_cost_opt, format_local, format_local_or_empty,
+    format_tokens, kind_label,
+};
 use crate::pricing::ClaudePricing;
 
 const TITLE_MAX_CHARS: usize = 80;
@@ -366,57 +368,8 @@ pub fn render_inputs(rows: &[AttributionRow], coverage: &CoverageStats) -> Strin
     format!("{table_str}\n{}", coverage_line(coverage))
 }
 
-/// Short label for a context-file kind. Enumerates every variant
-/// (no wildcard) so adding a new variant forces a label decision at
-/// compile time via `wildcard_enum_match_arm`.
-fn kind_label(kind: &ContextFileKind) -> String {
-    match kind {
-        ContextFileKind::GlobalClaudeMd => "global".to_string(),
-        ContextFileKind::UserRule => "rule".to_string(),
-        ContextFileKind::UserSkill => "skill".to_string(),
-        ContextFileKind::UserAgent => "agent".to_string(),
-        ContextFileKind::PluginSkill { plugin, .. } => format!("plugin:{plugin}:skill"),
-        ContextFileKind::PluginRule { plugin, .. } => format!("plugin:{plugin}:rule"),
-        ContextFileKind::PluginAgent { plugin, .. } => format!("plugin:{plugin}:agent"),
-        ContextFileKind::ProjectClaudeMd => "project".to_string(),
-        ContextFileKind::ProjectLocalSkill => "project:skill".to_string(),
-        ContextFileKind::ProjectLocalCommand => "project:command".to_string(),
-        ContextFileKind::ProjectLocalRule => "project:rule".to_string(),
-        ContextFileKind::ProjectLocalAgent => "project:agent".to_string(),
-    }
-}
-
-/// Convert an absolute path to its `~/...` form when it lives under
-/// the user's home directory, then truncate scalar-aware to
-/// `INPUTS_PATH_MAX_CHARS` to keep the column readable.
 fn pretty_path(path: &std::path::Path) -> String {
-    let display: String = if let Some(home) = dirs::home_dir()
-        && let Ok(rel) = path.strip_prefix(&home)
-    {
-        format!("~/{}", rel.display())
-    } else {
-        path.display().to_string()
-    };
-    truncate_title(&display, INPUTS_PATH_MAX_CHARS)
-}
-
-fn coverage_line(coverage: &CoverageStats) -> String {
-    let one_h = coverage_half("1h", &coverage.long_1h);
-    let five_m = coverage_half("5m", &coverage.short_5m);
-    format!("coverage: {one_h} | {five_m}")
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn coverage_half(label: &str, tier: &TierCoverage) -> String {
-    match tier.ratio {
-        None => format!("{label}: n/a"),
-        Some(r) => format!(
-            "{label}: {pct:.1}% ({attributed} / {observed} {label}-tokens)",
-            pct = r * 100.0,
-            attributed = tier.attributed_tokens,
-            observed = tier.observed_tokens,
-        ),
-    }
+    truncate_title(&display_path(path), INPUTS_PATH_MAX_CHARS)
 }
 
 #[cfg(test)]
