@@ -12,9 +12,9 @@
 //! `attribution` folds inventory + per-session metadata + pricing into
 //! ranked rows for the `inputs` subcommand.
 //!
-//! `formatting` provides shared format helpers consumed by both
-//! `rendering` (comfy-table plain-text path) and `tui` (ratatui
-//! interactive path).
+//! `formatting` provides shared per-value format helpers.
+//! `views` provides shared per-row view builders; `tui` consumes
+//! them today, `rendering` will follow.
 
 pub mod aggregation;
 pub mod attribution;
@@ -27,3 +27,4 @@ pub mod parsing;
 pub mod pricing;
 pub mod rendering;
 pub mod tui;
+pub mod views;

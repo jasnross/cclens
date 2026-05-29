@@ -25,14 +25,14 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::aggregation::{PreparedExchange, PreparedRow, PreparedRowRole, fold_cum_cost};
+use crate::aggregation::{PreparedExchange, PreparedRow};
 use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::Session;
-use crate::formatting::{
-    coverage_line, display_path, format_cost_opt, format_local, format_local_or_empty,
-    format_rate_mtok, format_tokens, kind_label, tiers_differ,
-};
+use crate::formatting::{coverage_line, format_cost_opt, format_tokens, tiers_differ};
 use crate::pricing::{CacheInfo, ClaudePricing};
+use crate::views::{
+    inputs_cells, pricing_view_rows, session_cells, session_totals, show_row_cells,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -92,10 +92,8 @@ struct App {
 
 impl App {
     fn new(sessions: Vec<Session>, pricing: PricingData, default_tab: Tab) -> Self {
-        let total_tokens = sessions.iter().map(|s| s.total_billable).sum();
-        let total_cost = sessions.iter().try_fold(0.0, |acc, s| {
-            fold_cum_cost(Some(acc), s.cost_breakdown.map(|b| b.total()))
-        });
+        let (total_tokens, total_cost) =
+            session_totals(&sessions).map_or((0, None), |t| (t.total_tokens, t.total_cost));
         let mut list_state = TableState::default();
         if !sessions.is_empty() {
             list_state.select_first();
@@ -539,12 +537,13 @@ fn render_sessions_table(app: &mut App, frame: &mut Frame, area: ratatui::layout
         .sessions
         .iter()
         .map(|s| {
+            let cells = session_cells(s);
             Row::new(vec![
-                format_local(s.started_at),
-                s.project_short_name.clone(),
-                s.title.clone(),
-                format_tokens(s.total_billable),
-                format_cost_opt(s.cost_breakdown.map(|b| b.total())),
+                cells.datetime,
+                cells.project,
+                cells.title,
+                cells.tokens,
+                cells.cost,
             ])
         })
         .collect();
@@ -655,28 +654,19 @@ fn render_show_table(
 }
 
 fn show_row(row: &PreparedRow, dim: bool) -> Row<'static> {
-    let role_str = match row.role {
-        PreparedRowRole::User => "user",
-        PreparedRowRole::Assistant => "assistant",
-        PreparedRowRole::Subagent => "subagent",
-    };
-    let content = if row.tool_use_count > 0 {
-        format!("{} +{} tool uses", row.content, row.tool_use_count)
-    } else {
-        row.content.clone()
-    };
+    let cells = show_row_cells(row);
     let r = Row::new(vec![
-        Line::raw(format_local_or_empty(row.timestamp)),
-        Line::raw(role_str.to_string()),
-        Line::raw(row.tokens.map_or_else(|| "—".to_string(), format_tokens)).right_aligned(),
-        Line::raw(format_cost_opt(row.cost.map(|b| b.input))).right_aligned(),
-        Line::raw(format_cost_opt(row.cost.map(|b| b.output))).right_aligned(),
-        Line::raw(format_cost_opt(row.cost.map(|b| b.cache_creation_5m))).right_aligned(),
-        Line::raw(format_cost_opt(row.cost.map(|b| b.cache_creation_1h))).right_aligned(),
-        Line::raw(format_cost_opt(row.cost.map(|b| b.cache_read))).right_aligned(),
-        Line::raw(format_tokens(row.cumulative_tokens)).right_aligned(),
-        Line::raw(format_cost_opt(row.cumulative_cost)).right_aligned(),
-        Line::raw(content),
+        Line::raw(cells.datetime),
+        Line::raw(cells.role),
+        Line::raw(cells.tokens).right_aligned(),
+        Line::raw(format_cost_opt(cells.cost.map(|b| b.input))).right_aligned(),
+        Line::raw(format_cost_opt(cells.cost.map(|b| b.output))).right_aligned(),
+        Line::raw(format_cost_opt(cells.cost.map(|b| b.cache_creation_5m))).right_aligned(),
+        Line::raw(format_cost_opt(cells.cost.map(|b| b.cache_creation_1h))).right_aligned(),
+        Line::raw(format_cost_opt(cells.cost.map(|b| b.cache_read))).right_aligned(),
+        Line::raw(cells.cumulative_tokens).right_aligned(),
+        Line::raw(cells.cumulative_cost).right_aligned(),
+        Line::raw(cells.content),
     ]);
     if dim { r.dim() } else { r }
 }
@@ -717,14 +707,15 @@ fn render_inputs_table(inputs: &mut InputsState, frame: &mut Frame, area: ratatu
         .rows
         .iter()
         .map(|row| {
+            let cells = inputs_cells(row);
             Row::new(vec![
-                Line::raw(display_path(&row.file.path)),
-                Line::raw(kind_label(&row.file.kind)),
-                Line::raw(row.tier_label().to_string()),
-                Line::raw(format_tokens(row.file.tokens)).right_aligned(),
-                Line::raw(row.total_loads().to_string()).right_aligned(),
-                Line::raw(format_tokens(row.estimated_tokens_billed)).right_aligned(),
-                Line::raw(format_cost_opt(row.attributed_cost)).right_aligned(),
+                Line::raw(cells.file_path),
+                Line::raw(cells.kind),
+                Line::raw(cells.tier),
+                Line::raw(cells.tokens).right_aligned(),
+                Line::raw(cells.loads).right_aligned(),
+                Line::raw(cells.billed).right_aligned(),
+                Line::raw(cells.cost).right_aligned(),
             ])
         })
         .collect();
@@ -775,35 +766,8 @@ fn render_pricing_overlay(app: &App, frame: &mut Frame) {
 
     let mut rows = Vec::new();
     for (model, pricing) in &app.pricing.entries {
-        if tiers_differ(pricing) {
-            rows.push(Row::new(vec![
-                model.clone(),
-                "\u{2264}200k".to_string(),
-                format_rate_mtok(pricing.input.first_200k_rate),
-                format_rate_mtok(pricing.output.first_200k_rate),
-                format_rate_mtok(pricing.cache_read.first_200k_rate),
-                format_rate_mtok(pricing.cache_creation_5m.first_200k_rate),
-                format_rate_mtok(pricing.cache_creation_1h.first_200k_rate),
-            ]));
-            rows.push(Row::new(vec![
-                String::new(),
-                ">200k".to_string(),
-                format_rate_mtok(pricing.input.above_200k_rate),
-                format_rate_mtok(pricing.output.above_200k_rate),
-                format_rate_mtok(pricing.cache_read.above_200k_rate),
-                format_rate_mtok(pricing.cache_creation_5m.above_200k_rate),
-                format_rate_mtok(pricing.cache_creation_1h.above_200k_rate),
-            ]));
-        } else {
-            rows.push(Row::new(vec![
-                model.clone(),
-                String::new(),
-                format_rate_mtok(pricing.input.first_200k_rate),
-                format_rate_mtok(pricing.output.first_200k_rate),
-                format_rate_mtok(pricing.cache_read.first_200k_rate),
-                format_rate_mtok(pricing.cache_creation_5m.first_200k_rate),
-                format_rate_mtok(pricing.cache_creation_1h.first_200k_rate),
-            ]));
+        for cells in pricing_view_rows(model, pricing) {
+            rows.push(Row::new(cells));
         }
     }
 
@@ -861,7 +825,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::aggregation::PreparedExchange;
+    use crate::aggregation::{PreparedExchange, PreparedRowRole};
     use crate::attribution::TierCoverage;
     use crate::domain::{CostBreakdown, TurnOrigin};
     use crate::inventory::{ContextFile, ContextFileKind, Scope};
