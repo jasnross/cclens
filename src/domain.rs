@@ -66,6 +66,7 @@ pub struct Turn {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
@@ -82,6 +83,7 @@ pub enum Role {
 /// which the show renderer uses to disambiguate multiple
 /// invocations of the same agent type.
 #[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnOrigin {
     #[default]
     Parent,

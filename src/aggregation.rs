@@ -360,7 +360,41 @@ pub fn group_into_exchanges(turns: &[Turn]) -> Vec<Exchange<'_>> {
 
 // ---- prepared exchanges ----
 
+/// Summary projection of a `Session` for the list view's JSON output.
+///
+/// Unlike `Session`, this omits the `turns: Vec<Turn>` field —
+/// serializing hundreds of raw turns would produce massive JSON for
+/// the list view. `total_cost` is a computed field derived from
+/// `cost_breakdown.map(|b| b.total())`.
+#[derive(Debug, Serialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub project_short_name: String,
+    pub started_at: DateTime<Utc>,
+    pub last_activity: DateTime<Utc>,
+    pub title: String,
+    pub total_billable: u64,
+    pub cost_breakdown: Option<CostBreakdown>,
+    pub total_cost: Option<f64>,
+}
+
+impl From<&Session> for SessionSummary {
+    fn from(s: &Session) -> Self {
+        Self {
+            id: s.id.clone(),
+            project_short_name: s.project_short_name.clone(),
+            started_at: s.started_at,
+            last_activity: s.last_activity,
+            title: s.title.clone(),
+            total_billable: s.total_billable,
+            cost_breakdown: s.cost_breakdown,
+            total_cost: s.cost_breakdown.map(|b| b.total()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PreparedRowRole {
     User,
     Assistant,

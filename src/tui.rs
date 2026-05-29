@@ -855,11 +855,10 @@ fn format_cache_staleness(info: &CacheInfo) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::SystemTime;
 
     use chrono::{DateTime, Utc};
     use ratatui::backend::TestBackend;
-
-    use std::time::SystemTime;
 
     use super::*;
     use crate::aggregation::PreparedExchange;

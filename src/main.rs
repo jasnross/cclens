@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use cclens::aggregation::{
-    aggregate, dedup_assistant_turns, group_into_exchanges, prepare_exchanges,
+    SessionSummary, aggregate, dedup_assistant_turns, group_into_exchanges, prepare_exchanges,
 };
 use cclens::attribution::{
     AttributionRow, CoverageStats, InputsFilter, SessionKind, SessionMeta, compute_coverage,
@@ -24,30 +24,67 @@ use cclens::tui::{PricingData, Tab, run_tui};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::{
-    Cli, Command, InputsArgs, PricingAction, SessionFilterArgs, ThresholdsFilterArgs,
+    Cli, Command, InputsArgs, OutputFormat, PricingAction, SessionFilterArgs, ThresholdsFilterArgs,
     emit_empty_result_hint, emit_inputs_empty_hint,
 };
+use serde::Serialize;
+
+/// Resolved output mode. Computed once from `OutputFormat` (CLI surface)
+/// and TTY detection; `Tui` is the auto-detected case when no `--format`
+/// is given and stdout is a terminal.
+#[derive(Clone, Copy)]
+enum RenderMode {
+    Tui,
+    Plain,
+    Json,
+}
+
+#[derive(Serialize)]
+struct ShowOutput<'a> {
+    session_id: &'a str,
+    exchanges: &'a [cclens::aggregation::PreparedExchange],
+}
+
+#[derive(Serialize)]
+struct InputsOutput<'a> {
+    rows: &'a [AttributionRow],
+    coverage: &'a CoverageStats,
+}
+
+#[derive(Serialize)]
+struct PricingListEntry<'a> {
+    model: &'a str,
+    #[serde(flatten)]
+    rates: &'a cclens::pricing::ClaudePricing,
+}
 
 fn main() -> anyhow::Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
-    let tui = !cli.plain && std::io::stdout().is_terminal();
+    let mode = match cli.format {
+        Some(OutputFormat::Json) => RenderMode::Json,
+        None if std::io::stdout().is_terminal() => RenderMode::Tui,
+        // Explicit --format plain, or no flag with non-TTY stdout.
+        Some(OutputFormat::Plain) | None => RenderMode::Plain,
+    };
     match cli.command.unwrap_or(Command::List {
         scope: SessionFilterArgs::default(),
         thresholds: ThresholdsFilterArgs::default(),
     }) {
-        Command::List { scope, thresholds } => run_list(&cli.projects_dir, &scope, thresholds, tui),
+        Command::List { scope, thresholds } => {
+            run_list(mode, &cli.projects_dir, &scope, thresholds)
+        }
         Command::Show {
             session_id,
             thresholds,
-        } => run_show(&cli.projects_dir, &session_id, thresholds),
-        Command::Pricing { action } => run_pricing(action),
+        } => run_show(mode, &cli.projects_dir, &session_id, thresholds),
+        Command::Pricing { action } => run_pricing(mode, action),
         Command::Inputs {
             scope,
             inputs,
             thresholds,
-        } => run_inputs(&cli.projects_dir, &scope, &inputs, thresholds, tui),
+        } => run_inputs(mode, &cli.projects_dir, &scope, &inputs, thresholds),
     }
 }
 
@@ -98,46 +135,54 @@ fn load_sessions_data(
 }
 
 fn run_list(
+    mode: RenderMode,
     projects_dir: &Path,
     scope: &SessionFilterArgs,
     thresholds: ThresholdsFilterArgs,
-    tui: bool,
 ) -> anyhow::Result<()> {
     let catalog = pricing::load_catalog();
     let session_filter = scope.session_filter();
     let thresholds_filter = thresholds.thresholds_filter();
     let sessions = load_sessions_data(projects_dir, &session_filter, &thresholds_filter, &catalog)?;
-    if tui && !sessions.is_empty() {
-        let inputs_filter = InputsFilter {
-            session_id: None,
-            scope: session_filter,
-        };
-        let pricing_data = PricingData {
-            entries: catalog
-                .sorted_entries(false)
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), *v))
-                .collect(),
-            cache_info: pricing::cache_info(),
-        };
-        run_tui(
-            sessions,
-            |session_id| {
-                load_show_detail(
-                    projects_dir,
-                    session_id,
-                    &catalog,
-                    ThresholdsFilter::default(),
-                )
-            },
-            || load_inputs_data(projects_dir, &inputs_filter, &catalog),
-            pricing_data,
-            Tab::Sessions,
-        )?;
-    } else {
-        println!("{}", render_table(&sessions));
-        if sessions.is_empty() {
-            emit_empty_result_hint(scope, &thresholds);
+    match mode {
+        RenderMode::Tui if !sessions.is_empty() => {
+            let inputs_filter = InputsFilter {
+                session_id: None,
+                scope: session_filter,
+            };
+            let pricing_data = PricingData {
+                entries: catalog
+                    .sorted_entries(false)
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), *v))
+                    .collect(),
+                cache_info: pricing::cache_info(),
+            };
+            run_tui(
+                sessions,
+                |session_id| {
+                    load_show_detail(
+                        projects_dir,
+                        session_id,
+                        &catalog,
+                        ThresholdsFilter::default(),
+                    )
+                },
+                || load_inputs_data(projects_dir, &inputs_filter, &catalog),
+                pricing_data,
+                Tab::Sessions,
+            )?;
+        }
+        RenderMode::Json => {
+            let summaries: Vec<SessionSummary> =
+                sessions.iter().map(SessionSummary::from).collect();
+            println!("{}", serde_json::to_string_pretty(&summaries)?);
+        }
+        RenderMode::Tui | RenderMode::Plain => {
+            println!("{}", render_table(&sessions));
+            if sessions.is_empty() {
+                emit_empty_result_hint(scope, &thresholds);
+            }
         }
     }
     Ok(())
@@ -223,11 +268,11 @@ fn load_inputs_data(
 }
 
 fn run_inputs(
+    mode: RenderMode,
     projects_dir: &Path,
     scope: &SessionFilterArgs,
     inputs: &InputsArgs,
     thresholds: ThresholdsFilterArgs,
-    tui: bool,
 ) -> anyhow::Result<()> {
     let catalog = pricing::load_catalog();
     let inputs_filter = InputsFilter {
@@ -235,54 +280,70 @@ fn run_inputs(
         scope: scope.session_filter(),
     };
     let thresholds_filter = thresholds.thresholds_filter();
-    if tui {
-        let session_filter = scope.session_filter();
-        let sessions = load_sessions_data(
-            projects_dir,
-            &session_filter,
-            &ThresholdsFilter::default(),
-            &catalog,
-        )?;
-        let pricing_data = PricingData {
-            entries: catalog
-                .sorted_entries(false)
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), *v))
-                .collect(),
-            cache_info: pricing::cache_info(),
-        };
-        run_tui(
-            sessions,
-            |session_id| {
-                load_show_detail(
-                    projects_dir,
-                    session_id,
-                    &catalog,
-                    ThresholdsFilter::default(),
-                )
-            },
-            || {
-                let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
-                let visible: Vec<_> = rows
+    match mode {
+        RenderMode::Tui => {
+            let session_filter = scope.session_filter();
+            let sessions = load_sessions_data(
+                projects_dir,
+                &session_filter,
+                &ThresholdsFilter::default(),
+                &catalog,
+            )?;
+            let pricing_data = PricingData {
+                entries: catalog
+                    .sorted_entries(false)
                     .into_iter()
-                    .filter(|r| {
-                        thresholds_filter.matches(r.estimated_tokens_billed, r.attributed_cost)
-                    })
-                    .collect();
-                Ok((visible, coverage))
-            },
-            pricing_data,
-            Tab::Inputs,
-        )?;
-    } else {
-        let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
-        let visible_rows: Vec<_> = rows
-            .into_iter()
-            .filter(|r| thresholds_filter.matches(r.estimated_tokens_billed, r.attributed_cost))
-            .collect();
-        println!("{}", render_inputs(&visible_rows, &coverage));
-        if visible_rows.is_empty() {
-            emit_inputs_empty_hint(scope, inputs, &thresholds);
+                    .map(|(k, v)| (k.to_owned(), *v))
+                    .collect(),
+                cache_info: pricing::cache_info(),
+            };
+            run_tui(
+                sessions,
+                |session_id| {
+                    load_show_detail(
+                        projects_dir,
+                        session_id,
+                        &catalog,
+                        ThresholdsFilter::default(),
+                    )
+                },
+                || {
+                    let (rows, coverage) =
+                        load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
+                    let visible: Vec<_> = rows
+                        .into_iter()
+                        .filter(|r| {
+                            thresholds_filter.matches(r.estimated_tokens_billed, r.attributed_cost)
+                        })
+                        .collect();
+                    Ok((visible, coverage))
+                },
+                pricing_data,
+                Tab::Inputs,
+            )?;
+        }
+        RenderMode::Json => {
+            let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
+            let visible_rows: Vec<_> = rows
+                .into_iter()
+                .filter(|r| thresholds_filter.matches(r.estimated_tokens_billed, r.attributed_cost))
+                .collect();
+            let output = InputsOutput {
+                rows: &visible_rows,
+                coverage: &coverage,
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        RenderMode::Plain => {
+            let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
+            let visible_rows: Vec<_> = rows
+                .into_iter()
+                .filter(|r| thresholds_filter.matches(r.estimated_tokens_billed, r.attributed_cost))
+                .collect();
+            println!("{}", render_inputs(&visible_rows, &coverage));
+            if visible_rows.is_empty() {
+                emit_inputs_empty_hint(scope, inputs, &thresholds);
+            }
         }
     }
     Ok(())
@@ -368,7 +429,7 @@ fn build_subagent_meta(
     Some(sub_meta)
 }
 
-fn run_pricing(action: PricingAction) -> anyhow::Result<()> {
+fn run_pricing(mode: RenderMode, action: PricingAction) -> anyhow::Result<()> {
     match action {
         PricingAction::Refresh => {
             let report = pricing::refresh_catalog()?;
@@ -383,10 +444,21 @@ fn run_pricing(action: PricingAction) -> anyhow::Result<()> {
         PricingAction::List { all } => {
             let catalog = pricing::load_catalog();
             let entries = catalog.sorted_entries(all);
-            if entries.is_empty() {
-                eprintln!("note: pricing catalog is empty — try `cclens pricing refresh`");
-            } else {
-                println!("{}", render_prices(&entries));
+            match mode {
+                RenderMode::Json => {
+                    let json_entries: Vec<PricingListEntry<'_>> = entries
+                        .iter()
+                        .map(|(model, rates)| PricingListEntry { model, rates })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&json_entries)?);
+                }
+                RenderMode::Tui | RenderMode::Plain => {
+                    if entries.is_empty() {
+                        eprintln!("note: pricing catalog is empty — try `cclens pricing refresh`");
+                    } else {
+                        println!("{}", render_prices(&entries));
+                    }
+                }
             }
             Ok(())
         }
@@ -485,6 +557,7 @@ fn load_show_detail(
 /// `cumulative` column at the bottom equals what `cclens list` reports
 /// for the same session — list/show consistency by construction.
 fn run_show(
+    mode: RenderMode,
     projects_dir: &Path,
     session_id: &str,
     thresholds: ThresholdsFilterArgs,
@@ -500,10 +573,21 @@ fn run_show(
         &catalog,
         thresholds.thresholds_filter(),
     )?;
-    let (rendered, _rows_shown) = render_session(&prepared);
-    println!("{rendered}");
-    if prepared.is_empty() {
-        emit_empty_result_hint(&SessionFilterArgs::default(), &thresholds);
+    match mode {
+        RenderMode::Json => {
+            let output = ShowOutput {
+                session_id,
+                exchanges: &prepared,
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        RenderMode::Tui | RenderMode::Plain => {
+            let (rendered, _rows_shown) = render_session(&prepared);
+            println!("{rendered}");
+            if prepared.is_empty() {
+                emit_empty_result_hint(&SessionFilterArgs::default(), &thresholds);
+            }
+        }
     }
     Ok(())
 }

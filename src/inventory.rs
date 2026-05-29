@@ -23,7 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ---- core types ----
 
@@ -42,7 +42,8 @@ use serde::Deserialize;
 /// need to re-run a fixture loop get `.clone()` for free without
 /// production sites silently allocating.
 #[cfg_attr(test, derive(Clone))]
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContextFileKind {
     GlobalClaudeMd,
     UserRule,
@@ -78,7 +79,8 @@ pub enum ContextFileKind {
 /// `OnDemandLoad::tier` carry the tier per session / per load. A
 /// single file (e.g. CLAUDE.md) can attribute at 1h in one session
 /// and 5m in another (parent session uses 1h, subagent uses 5m).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheTier {
     /// System-prompt region tier — billed at the 1h cache-creation
     /// rate. Always-loaded content (`CLAUDE.md`, rules) and matched
@@ -100,7 +102,8 @@ pub enum CacheTier {
 /// module use the local `clone_scope` helper to make per-row
 /// duplications visible.
 #[cfg_attr(test, derive(Clone))]
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Scope {
     /// In scope for every session.
     Global,
@@ -132,7 +135,7 @@ impl Scope {
 /// `Clone` is `cfg(test)`-only — production code consumes
 /// `ContextFile` exactly once via `compute_rows`.
 #[cfg_attr(test, derive(Clone))]
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct ContextFile {
     pub path: PathBuf,
     pub kind: ContextFileKind,

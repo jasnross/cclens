@@ -64,6 +64,7 @@ use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::domain::{CacheCreation, Role, Turn};
@@ -184,7 +185,7 @@ pub enum OnDemandKind {
 /// tier parent session plus a 5m-tier subagent) reports both > 0.
 /// `attributed_cost` is the sum of per-tier costs:
 /// `loads_1h × tokens × rate_1h + loads_5m × tokens × rate_5m`.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct AttributionRow {
     pub file: ContextFile,
     pub loads_1h: u64,
@@ -219,7 +220,7 @@ impl AttributionRow {
 ///
 /// `ratio` is `None` when `observed_tokens == 0` (avoids
 /// divide-by-zero, renders as `n/a`).
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct TierCoverage {
     pub observed_tokens: u64,
     pub attributed_tokens: u64,
@@ -229,7 +230,7 @@ pub struct TierCoverage {
 /// Both tiers reported independently so the user can see "I have good
 /// coverage of my 1h system-prompt cost but the 5m skill cost is
 /// mostly unattributable" or vice versa.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct CoverageStats {
     pub long_1h: TierCoverage,
     pub short_5m: TierCoverage,

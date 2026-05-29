@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::SystemTime;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{CacheCreation, CostBreakdown, Usage};
@@ -92,7 +92,7 @@ struct RawPricingEntry {
 /// inherits `first_200k_rate`. If the base is also missing it's 0.0 —
 /// which renders as `$0.0000` (effectively "free" for that token type
 /// on this model).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub(crate) struct TieredRate {
     pub(crate) first_200k_rate: f64,
     pub(crate) above_200k_rate: f64,
@@ -107,7 +107,7 @@ pub(crate) struct TieredRate {
 /// shape stays symmetric. The 1h-above-200k field is published by
 /// `LiteLLM` today only for two Bedrock-routed Sonnet 3.5 entries; for
 /// other models the `tier_from_raw` fallback inherits the 1h base rate.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ClaudePricing {
     pub(crate) input: TieredRate,
     pub(crate) output: TieredRate,

@@ -26,7 +26,13 @@ use std::path::PathBuf;
 
 use cclens::filter::{SessionFilter, ThresholdsFilter};
 use chrono::{DateTime, Utc};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(super) enum OutputFormat {
+    Plain,
+    Json,
+}
 
 #[derive(Parser)]
 #[command(
@@ -39,10 +45,11 @@ pub(super) struct Cli {
     #[arg(long, default_value_os_t = default_projects_dir())]
     pub(super) projects_dir: PathBuf,
 
-    /// Disable the interactive TUI and print plain-text tables (the
-    /// default when stdout is not a terminal).
-    #[arg(long, global = true)]
-    pub(super) plain: bool,
+    /// Output format: `plain` for plain-text tables, `json` for
+    /// machine-readable JSON. When omitted, the TUI is used if stdout
+    /// is a terminal, otherwise `plain`.
+    #[arg(long, global = true, value_enum)]
+    pub(super) format: Option<OutputFormat>,
 
     #[command(subcommand)]
     pub(super) command: Option<Command>,
@@ -504,21 +511,46 @@ mod tests {
     }
 
     #[test]
-    fn plain_flag_parses_before_subcommand() {
-        let cli = Cli::try_parse_from(["cclens", "--plain", "list"]).unwrap();
-        assert!(cli.plain);
+    fn format_json_parses_before_subcommand() {
+        let cli = Cli::try_parse_from(["cclens", "--format", "json", "list"]).unwrap();
+        assert!(matches!(cli.format, Some(OutputFormat::Json)));
     }
 
     #[test]
-    fn plain_flag_parses_after_subcommand() {
-        let cli = Cli::try_parse_from(["cclens", "list", "--plain"]).unwrap();
-        assert!(cli.plain);
+    fn format_json_parses_after_subcommand() {
+        let cli = Cli::try_parse_from(["cclens", "list", "--format", "json"]).unwrap();
+        assert!(matches!(cli.format, Some(OutputFormat::Json)));
     }
 
     #[test]
-    fn plain_flag_defaults_to_false() {
+    fn format_plain_parses() {
+        let cli = Cli::try_parse_from(["cclens", "--format", "plain"]).unwrap();
+        assert!(matches!(cli.format, Some(OutputFormat::Plain)));
+    }
+
+    #[test]
+    fn format_defaults_to_none() {
         let cli = Cli::try_parse_from(["cclens"]).unwrap();
-        assert!(!cli.plain);
+        assert!(cli.format.is_none());
+    }
+
+    #[test]
+    fn old_plain_flag_is_rejected() {
+        let result = Cli::try_parse_from(["cclens", "--plain"]);
+        assert!(result.is_err(), "--plain should no longer be accepted");
+    }
+
+    #[test]
+    fn output_format_variants_round_trip_through_value_enum() {
+        use clap::ValueEnum;
+        let variants = OutputFormat::value_variants();
+        assert_eq!(variants.len(), 2);
+        for v in variants {
+            let s = v.to_possible_value().unwrap();
+            let parsed =
+                OutputFormat::from_str(s.get_name(), true).expect("round-trip must succeed");
+            assert_eq!(std::mem::discriminant(&parsed), std::mem::discriminant(v),);
+        }
     }
 
     #[test]
