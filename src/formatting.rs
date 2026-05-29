@@ -11,10 +11,14 @@
 //!   in the system's local timezone
 //! - `format_local_or_empty(Option<DateTime<Utc>>) -> String` —
 //!   delegates to `format_local` or returns the empty string on `None`
+//! - `format_rate_mtok(f64) -> String` — per-token rate to `$/MTok`
+//!   display string
 //! - `format_tokens(u64) -> String` — compact `0.12k` / `999.99k`
 //!   token count
 //! - `kind_label(&ContextFileKind) -> String` — context-file kind to
 //!   display label
+//! - `tiers_differ(&ClaudePricing) -> bool` — whether any rate's
+//!   first-200k and above-200k tiers differ
 //!
 //! These helpers are consumed by both `rendering` (comfy-table
 //! stop-gap) and `tui` (ratatui interactive renderer).
@@ -25,6 +29,7 @@ use chrono::{DateTime, Utc};
 
 use crate::attribution::{CoverageStats, TierCoverage};
 use crate::inventory::ContextFileKind;
+use crate::pricing::ClaudePricing;
 
 #[must_use]
 pub fn format_cost_opt(c: Option<f64>) -> String {
@@ -99,5 +104,90 @@ pub fn coverage_half(label: &str, tier: &TierCoverage) -> String {
             attributed = tier.attributed_tokens,
             observed = tier.observed_tokens,
         ),
+    }
+}
+
+#[must_use]
+pub fn format_rate_mtok(per_token_rate: f64) -> String {
+    format!("${:.2}", per_token_rate * 1_000_000.0)
+}
+
+#[allow(clippy::float_cmp)]
+#[must_use]
+pub fn tiers_differ(pricing: &ClaudePricing) -> bool {
+    let rates = [
+        &pricing.input,
+        &pricing.output,
+        &pricing.cache_read,
+        &pricing.cache_creation_5m,
+        &pricing.cache_creation_1h,
+    ];
+    rates.iter().any(|r| r.first_200k_rate != r.above_200k_rate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pricing::TieredRate;
+
+    fn uniform_pricing(rate: f64) -> ClaudePricing {
+        let tier = TieredRate {
+            first_200k_rate: rate,
+            above_200k_rate: rate,
+        };
+        ClaudePricing {
+            input: tier,
+            output: tier,
+            cache_creation_5m: tier,
+            cache_creation_1h: tier,
+            cache_read: tier,
+        }
+    }
+
+    fn split_pricing() -> ClaudePricing {
+        ClaudePricing {
+            input: TieredRate {
+                first_200k_rate: 3e-6,
+                above_200k_rate: 6e-6,
+            },
+            output: TieredRate {
+                first_200k_rate: 15e-6,
+                above_200k_rate: 22.5e-6,
+            },
+            cache_read: TieredRate {
+                first_200k_rate: 0.3e-6,
+                above_200k_rate: 0.6e-6,
+            },
+            cache_creation_5m: TieredRate {
+                first_200k_rate: 3.75e-6,
+                above_200k_rate: 7.5e-6,
+            },
+            cache_creation_1h: TieredRate {
+                first_200k_rate: 3e-6,
+                above_200k_rate: 6e-6,
+            },
+        }
+    }
+
+    #[test]
+    fn format_rate_mtok_converts_per_token_to_dollars_per_million() {
+        assert_eq!(format_rate_mtok(3e-6), "$3.00");
+        assert_eq!(format_rate_mtok(15e-6), "$15.00");
+        assert_eq!(format_rate_mtok(0.3e-6), "$0.30");
+        assert_eq!(format_rate_mtok(3.75e-6), "$3.75");
+        assert_eq!(format_rate_mtok(0.0), "$0.00");
+    }
+
+    #[test]
+    fn tiers_differ_returns_false_for_uniform_rates() {
+        assert!(!tiers_differ(&uniform_pricing(3e-6)));
+    }
+
+    #[test]
+    fn tiers_differ_returns_true_when_any_rate_differs() {
+        assert!(tiers_differ(&split_pricing()));
+        let mut only_output_differs = uniform_pricing(3e-6);
+        only_output_differs.output.above_200k_rate = 6e-6;
+        assert!(tiers_differ(&only_output_differs));
     }
 }

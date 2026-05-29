@@ -40,7 +40,7 @@ use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::{CostBreakdown, Session};
 use crate::formatting::{
     coverage_line, display_path, format_cost_opt, format_local, format_local_or_empty,
-    format_tokens, kind_label,
+    format_rate_mtok, format_tokens, kind_label, tiers_differ,
 };
 use crate::pricing::ClaudePricing;
 
@@ -112,10 +112,6 @@ fn format_cost_breakdown(breakdown: Option<CostBreakdown>) -> String {
     } else {
         parts.join(" ")
     }
-}
-
-fn format_rate_mtok(per_token_rate: f64) -> String {
-    format!("${:.2}", per_token_rate * 1_000_000.0)
 }
 
 fn truncate_title(s: &str, max: usize) -> String {
@@ -254,18 +250,6 @@ pub fn render_session(prepared: &[PreparedExchange]) -> (String, usize) {
 }
 
 // ---- pricing list view ----
-
-#[allow(clippy::float_cmp)]
-fn tiers_differ(pricing: &ClaudePricing) -> bool {
-    let rates = [
-        &pricing.input,
-        &pricing.output,
-        &pricing.cache_read,
-        &pricing.cache_creation_5m,
-        &pricing.cache_creation_1h,
-    ];
-    rates.iter().any(|r| r.first_200k_rate != r.above_200k_rate)
-}
 
 #[must_use]
 pub fn render_prices(entries: &[(&str, &ClaudePricing)]) -> String {
@@ -1293,28 +1277,6 @@ mod tests {
                 above_200k_rate: 6e-6,
             },
         }
-    }
-
-    #[test]
-    fn tiers_differ_returns_false_for_uniform_rates() {
-        assert!(!tiers_differ(&uniform_pricing(3e-6)));
-    }
-
-    #[test]
-    fn tiers_differ_returns_true_when_any_rate_differs() {
-        assert!(tiers_differ(&split_pricing()));
-        let mut only_output_differs = uniform_pricing(3e-6);
-        only_output_differs.output.above_200k_rate = 6e-6;
-        assert!(tiers_differ(&only_output_differs));
-    }
-
-    #[test]
-    fn format_rate_mtok_converts_per_token_to_dollars_per_million() {
-        assert_eq!(format_rate_mtok(3e-6), "$3.00");
-        assert_eq!(format_rate_mtok(15e-6), "$15.00");
-        assert_eq!(format_rate_mtok(0.3e-6), "$0.30");
-        assert_eq!(format_rate_mtok(3.75e-6), "$3.75");
-        assert_eq!(format_rate_mtok(0.0), "$0.00");
     }
 
     #[test]
