@@ -1,48 +1,31 @@
-//! Comfy-table rendering for the `list`, `show`, `inputs`, and
-//! `pricing list` subcommands.
+//! Comfy-table assembly for the `list`, `show`, `inputs`, and
+//! `pricing list` plain-text views.
+//!
+//! Row cell data comes from `views` (shared with `tui`); this module
+//! handles comfy-table table construction, column alignment, and
+//! plain-text-specific formatting (`truncate_title`,
+//! `format_cost_breakdown`).
 //!
 //! Public API:
-//! - `render_table(&[Session]) -> String` — the `list` view; appends a
-//!   totals row beneath the per-session rows when 2+ sessions are
-//!   visible. The totals row's `title` cell carries a right-aligned
-//!   `total` label flush against the tokens column; its numeric cells
-//!   use the same formatters as data rows. Cost follows the same
-//!   strict-`None` propagation as `Session.cost_breakdown` — any
-//!   visible session with `cost_breakdown: None` collapses the totals
-//!   cost cell to `—`.
+//! - `render_table(&[Session]) -> String` — the `list` view.
 //! - `render_session(&[PreparedExchange]) -> (String, usize)` — the
-//!   `show` view; receives pre-computed exchanges and does pure layout.
-//!   Each `PreparedExchange` expands its nested `PreparedRow`s into
-//!   table rows. Domain computation (cost, cumulatives, filtering)
-//!   lives in `aggregation::prepare_exchanges`.
+//!   `show` view.
 //! - `render_inputs(&[AttributionRow], &CoverageStats) -> String` —
-//!   the `inputs` view; returns the table plus a per-tier coverage
-//!   line below it.
+//!   the `inputs` view.
 //! - `render_prices(&[(&str, &ClaudePricing)]) -> String` — the
-//!   `pricing list` view; renders per-model rates in `$/MTok` with
-//!   conditional sub-rows for models whose above-200k rates differ.
-//!
-//! Show-view content cells (every row, parent and subagent) are
-//! truncated to `SHOW_CONTENT_MAX_CHARS` so a long subagent prefix
-//! (or any other oversized content) cannot break the
-//! one-line-per-row invariant.
-//!
-//! Format helpers (`format_cost_opt`, `format_local`, `format_tokens`)
-//! live in `formatting` — shared with the `tui` module for visual
-//! consistency. Content-preview and cumulative-fold helpers live in
-//! `aggregation`.
+//!   `pricing list` view.
 
 use comfy_table::presets::NOTHING;
 use comfy_table::{Cell, CellAlignment, Table};
 
-use crate::aggregation::{PreparedExchange, PreparedRowRole, fold_cum_cost};
+use crate::aggregation::PreparedExchange;
 use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::{CostBreakdown, Session};
-use crate::formatting::{
-    coverage_line, display_path, format_cost_opt, format_local, format_local_or_empty,
-    format_rate_mtok, format_tokens, kind_label, tiers_differ,
-};
+use crate::formatting::{coverage_line, format_cost_opt, format_tokens};
 use crate::pricing::ClaudePricing;
+use crate::views::{
+    inputs_cells, pricing_view_rows, session_cells, session_totals, show_row_cells,
+};
 
 const TITLE_MAX_CHARS: usize = 80;
 
@@ -136,21 +119,26 @@ pub fn render_table(sessions: &[Session]) -> String {
     table.load_preset(NOTHING);
     table.set_header(vec!["datetime", "project", "title", "tokens", "cost", "id"]);
     for session in sessions {
+        let cells = session_cells(session);
         table.add_row(vec![
-            format_local(session.started_at),
-            session.project_short_name.clone(),
-            truncate_title(&session.title, TITLE_MAX_CHARS),
-            format_tokens(session.total_billable),
-            format_cost_opt(session.cost_breakdown.map(|b| b.total())),
+            cells.datetime,
+            cells.project,
+            truncate_title(&cells.title, TITLE_MAX_CHARS),
+            cells.tokens,
+            cells.cost,
             session.id.clone(),
         ]);
     }
-    add_totals_row(&mut table, sessions);
-    // column_mut returns Option; the columns are guaranteed present because
-    // the header above defines them at the indices. The totals row's
-    // numeric cells inherit this column-level right alignment; its `total`
-    // label cell carries a per-cell right-alignment override set inside
-    // `add_totals_row` so it stays flush against the tokens column.
+    if let Some(totals) = session_totals(sessions) {
+        table.add_row(vec![
+            Cell::new(""),
+            Cell::new(""),
+            Cell::new("total").set_alignment(CellAlignment::Right),
+            Cell::new(format_tokens(totals.total_tokens)),
+            Cell::new(format_cost_opt(totals.total_cost)),
+            Cell::new(""),
+        ]);
+    }
     if let Some(col) = table.column_mut(TOKENS_COL_INDEX) {
         col.set_cell_alignment(CellAlignment::Right);
     }
@@ -158,35 +146,6 @@ pub fn render_table(sessions: &[Session]) -> String {
         col.set_cell_alignment(CellAlignment::Right);
     }
     format!("{table}")
-}
-
-/// Append a totals row when 2+ sessions are visible. The `title` cell
-/// carries a right-aligned `total` label flush against the tokens
-/// column; numeric cells use the same formatters as data rows and
-/// inherit the column-level right alignment applied by `render_table`
-/// after this call. Cost follows strict-`None` propagation via
-/// `fold_cum_cost`: any visible session with `total_cost: None`
-/// collapses the totals cost cell to `—`.
-fn add_totals_row(table: &mut Table, sessions: &[Session]) {
-    if sessions.len() < 2 {
-        return;
-    }
-    let total_tokens: u64 = sessions.iter().map(|s| s.total_billable).sum();
-    // `try_fold` short-circuits on the first `None`, matching the
-    // strict-`None` contract that `fold_cum_cost` enforces in the
-    // show view's `cum_cost` column. Reusing `fold_cum_cost` keeps
-    // the propagation rule single-sourced.
-    let total_cost: Option<f64> = sessions.iter().try_fold(0.0, |acc, s| {
-        fold_cum_cost(Some(acc), s.cost_breakdown.map(|b| b.total()))
-    });
-    table.add_row(vec![
-        Cell::new(""),
-        Cell::new(""),
-        Cell::new("total").set_alignment(CellAlignment::Right),
-        Cell::new(format_tokens(total_tokens)),
-        Cell::new(format_cost_opt(total_cost)),
-        Cell::new(""),
-    ]);
 }
 
 /// Render pre-computed exchanges into the `show` view table.
@@ -211,24 +170,15 @@ pub fn render_session(prepared: &[PreparedExchange]) -> (String, usize) {
 
     for exchange in prepared {
         for row in &exchange.rows {
-            let role_str = match row.role {
-                PreparedRowRole::User => "user",
-                PreparedRowRole::Assistant => "assistant",
-                PreparedRowRole::Subagent => "subagent",
-            };
-            let content = if row.tool_use_count > 0 {
-                format!("{} +{} tool uses", row.content, row.tool_use_count)
-            } else {
-                row.content.clone()
-            };
+            let cells = show_row_cells(row);
             table.add_row(vec![
-                format_local_or_empty(row.timestamp),
-                role_str.to_string(),
-                row.tokens.map_or_else(|| "—".to_string(), format_tokens),
-                format_cost_breakdown(row.cost),
-                format_tokens(row.cumulative_tokens),
-                format_cost_opt(row.cumulative_cost),
-                truncate_title(&content, SHOW_CONTENT_MAX_CHARS),
+                cells.datetime,
+                cells.role,
+                cells.tokens,
+                format_cost_breakdown(cells.cost),
+                cells.cumulative_tokens,
+                cells.cumulative_cost,
+                truncate_title(&cells.content, SHOW_CONTENT_MAX_CHARS),
             ]);
             rows_shown += 1;
         }
@@ -259,35 +209,8 @@ pub fn render_prices(entries: &[(&str, &ClaudePricing)]) -> String {
         "model", "tier", "input", "output", "cache_rd", "cache_5m", "cache_1h",
     ]);
     for &(model, pricing) in entries {
-        if tiers_differ(pricing) {
-            table.add_row(vec![
-                model.to_string(),
-                "\u{2264}200k".to_string(),
-                format_rate_mtok(pricing.input.first_200k_rate),
-                format_rate_mtok(pricing.output.first_200k_rate),
-                format_rate_mtok(pricing.cache_read.first_200k_rate),
-                format_rate_mtok(pricing.cache_creation_5m.first_200k_rate),
-                format_rate_mtok(pricing.cache_creation_1h.first_200k_rate),
-            ]);
-            table.add_row(vec![
-                String::new(),
-                ">200k".to_string(),
-                format_rate_mtok(pricing.input.above_200k_rate),
-                format_rate_mtok(pricing.output.above_200k_rate),
-                format_rate_mtok(pricing.cache_read.above_200k_rate),
-                format_rate_mtok(pricing.cache_creation_5m.above_200k_rate),
-                format_rate_mtok(pricing.cache_creation_1h.above_200k_rate),
-            ]);
-        } else {
-            table.add_row(vec![
-                model.to_string(),
-                String::new(),
-                format_rate_mtok(pricing.input.first_200k_rate),
-                format_rate_mtok(pricing.output.first_200k_rate),
-                format_rate_mtok(pricing.cache_read.first_200k_rate),
-                format_rate_mtok(pricing.cache_creation_5m.first_200k_rate),
-                format_rate_mtok(pricing.cache_creation_1h.first_200k_rate),
-            ]);
+        for row_cells in pricing_view_rows(model, pricing) {
+            table.add_row(row_cells);
         }
     }
     for idx in [
@@ -328,14 +251,15 @@ pub fn render_inputs(rows: &[AttributionRow], coverage: &CoverageStats) -> Strin
         "attributed_cost",
     ]);
     for row in rows {
+        let cells = inputs_cells(row);
         table.add_row(vec![
-            pretty_path(&row.file.path),
-            kind_label(&row.file.kind),
-            row.tier_label().to_string(),
-            format_tokens(row.file.tokens),
-            row.total_loads().to_string(),
-            format_tokens(row.estimated_tokens_billed),
-            format_cost_opt(row.attributed_cost),
+            truncate_title(&cells.file_path, INPUTS_PATH_MAX_CHARS),
+            cells.kind,
+            cells.tier,
+            cells.tokens,
+            cells.loads,
+            cells.billed,
+            cells.cost,
         ]);
     }
     for idx in [
@@ -352,17 +276,14 @@ pub fn render_inputs(rows: &[AttributionRow], coverage: &CoverageStats) -> Strin
     format!("{table_str}\n{}", coverage_line(coverage))
 }
 
-fn pretty_path(path: &std::path::Path) -> String {
-    truncate_title(&display_path(path), INPUTS_PATH_MAX_CHARS)
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
-    use crate::aggregation::PreparedRow;
+    use crate::aggregation::{PreparedRow, PreparedRowRole};
     use crate::domain::TurnOrigin;
+    use crate::formatting::{format_local, kind_label};
 
     // --- test helpers ---
 
@@ -1337,26 +1258,5 @@ mod tests {
         ] {
             assert!(out.contains(col), "header column `{col}` missing");
         }
-    }
-
-    // --- pretty_path ---
-
-    #[test]
-    fn pretty_path_replaces_home_with_tilde() {
-        let Some(home) = dirs::home_dir() else {
-            return; // Hermetic skip on platforms without a home dir.
-        };
-        let under_home = home.join("foo/bar");
-        let displayed = pretty_path(&under_home);
-        assert!(
-            displayed.starts_with("~/"),
-            "expected ~/ prefix, got: {displayed}",
-        );
-        let elsewhere = StdPathBuf::from("/var/tmp/elsewhere.md");
-        let displayed = pretty_path(&elsewhere);
-        assert!(
-            displayed.starts_with('/'),
-            "non-home path should render absolute, got: {displayed}",
-        );
     }
 }

@@ -20,8 +20,9 @@
 //! - `tiers_differ(&ClaudePricing) -> bool` — whether any rate's
 //!   first-200k and above-200k tiers differ
 //!
-//! These helpers are consumed by both `rendering` (comfy-table
-//! stop-gap) and `tui` (ratatui interactive renderer).
+//! These helpers are consumed primarily by `views` (shared
+//! view builders), with `rendering` and `tui` importing
+//! directly for presentation-specific needs.
 
 use std::path::Path;
 
@@ -189,5 +190,28 @@ mod tests {
         let mut only_output_differs = uniform_pricing(3e-6);
         only_output_differs.output.above_200k_rate = 6e-6;
         assert!(tiers_differ(&only_output_differs));
+    }
+
+    // --- display_path ---
+
+    #[test]
+    fn display_path_replaces_home_with_tilde() {
+        use std::path::PathBuf;
+
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let under_home = home.join("foo/bar");
+        let displayed = display_path(&under_home);
+        assert!(
+            displayed.starts_with("~/"),
+            "expected ~/ prefix, got: {displayed}",
+        );
+        let elsewhere = PathBuf::from("/var/tmp/elsewhere.md");
+        let displayed = display_path(&elsewhere);
+        assert!(
+            displayed.starts_with('/'),
+            "non-home path should render absolute, got: {displayed}",
+        );
     }
 }

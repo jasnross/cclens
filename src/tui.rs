@@ -1,22 +1,19 @@
 //! Interactive TUI rendering for `cclens list` and `cclens inputs`
 //! with tabbed navigation, session drill-down, and pricing overlay.
 //!
+//! Cell data comes from `views` (shared with `rendering`); this
+//! module handles ratatui widget construction, styling, layout
+//! constraints, and the event loop.
+//!
 //! Public API:
 //! - `Tab` — `Sessions` | `Inputs` — the active tab.
 //! - `PricingData` — owned pricing entries + cache staleness info,
 //!   constructed once before entering the TUI.
 //! - `run_tui<F, G>(Vec<Session>, F, G, PricingData, Tab)
-//!   -> anyhow::Result<()>` where
-//!   `F: Fn(&str) -> Result<Vec<PreparedExchange>>` and
-//!   `G: Fn() -> Result<(Vec<AttributionRow>, CoverageStats)>` —
-//!   fullscreen TUI with tab switching (1/2 keys), scrollable tables,
-//!   session drill-down (Enter/Esc within Sessions tab), attribution
-//!   table with coverage footer (Inputs tab), and pricing overlay
-//!   (`p` toggles from any view, Esc/q closes).
-//!
-//! The plain-text path (`rendering::render_table` / `rendering::render_session`
-//! / `rendering::render_inputs`) remains the fallback for piped output,
-//! `--plain`, and standalone `cclens show <id>`.
+//!   -> anyhow::Result<()>` — fullscreen TUI with tab switching
+//!   (1/2 keys), scrollable tables, session drill-down (Enter/Esc
+//!   within Sessions tab), attribution table with coverage footer
+//!   (Inputs tab), and pricing overlay (`p` toggles, Esc/q closes).
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};

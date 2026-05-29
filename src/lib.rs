@@ -13,8 +13,8 @@
 //! ranked rows for the `inputs` subcommand.
 //!
 //! `formatting` provides shared per-value format helpers.
-//! `views` provides shared per-row view builders; `tui` consumes
-//! them today, `rendering` will follow.
+//! `views` provides shared per-row view builders consumed by both
+//! `rendering` and `tui`.
 
 pub mod aggregation;
 pub mod attribution;

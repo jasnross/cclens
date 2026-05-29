@@ -1,18 +1,18 @@
 //! Shared view builders consumed by both `rendering` (comfy-table
 //! plain-text path) and `tui` (ratatui interactive path).
 //!
-//! Each builder maps domain types to display-ready cell values. The
-//! two rendering consumers import these builders and adapt the cell
-//! data to their respective table frameworks — `rendering` applies
-//! truncation and comfy-table alignment, `tui` wraps cells in ratatui
-//! `Row`/`Line` widgets with styling and constraints.
+//! Each builder maps domain types to cell values. The two rendering
+//! consumers adapt the results to their table frameworks —
+//! `rendering` applies `truncate_title` and comfy-table alignment,
+//! `tui` wraps cells in ratatui `Row`/`Line` widgets with styling
+//! and constraints.
 //!
 //! Public API:
 //! - `SessionCells` / `session_cells(&Session)` — list-view row cells.
 //! - `ShowRowCells` / `show_row_cells(&PreparedRow)` — show-view row
-//!   cells. Returns raw `Option<CostBreakdown>` so each consumer can
-//!   format cost differently (TUI decomposes into 5 columns, plain
-//!   calls `format_cost_breakdown`).
+//!   cells. Cost is raw `Option<CostBreakdown>` so each consumer can
+//!   format differently (TUI decomposes into 5 columns, plain merges
+//!   via `format_cost_breakdown`).
 //! - `InputsCells` / `inputs_cells(&AttributionRow)` — inputs-view
 //!   row cells.
 //! - `pricing_view_rows(&str, &ClaudePricing) -> Vec<Vec<String>>` —
