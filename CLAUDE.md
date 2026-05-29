@@ -173,6 +173,12 @@ Place helpers in the section that calls them, not in a generic `util` bucket. If
 
 `truncate_title` is scalar-aware (`s.chars().count()`) because session titles are user-authored text and frequently contain multi-byte characters. Any new truncation or width logic must operate on `chars()` (or a grapheme iterator where stricter correctness is needed), never on byte slices.
 
+### Prioritize correctness, then consistency, then clarity, then conciseness
+
+When multiple valid approaches exist for the same concern (error handling, state management, data loading), prefer the approach already established in the codebase. Introducing a second pattern for the same concern creates two things to maintain and reason about. If the existing pattern is inadequate, refactor it everywhere — don't add a parallel approach.
+
+When in tension: correct code that's inconsistent beats consistent code that's wrong, but inconsistent-and-correct is a signal to unify the pattern, not to leave it.
+
 ### Snapshot tests are reviewable assertions, not contracts
 
 `tests/snapshots.rs` locks byte-for-byte rendering of `list` and `show` via `insta` so that any change to output is visible in review. When output changes intentionally — a new column, a tweaked label, a different default sort — accept the new baseline with `cargo insta review` rather than contorting code to preserve the old bytes. While cclens is pre-1.0 (see Project Status), a failing snapshot is a prompt to confirm intent, not a regression to avoid.
