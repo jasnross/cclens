@@ -1,14 +1,18 @@
 //! Interactive TUI rendering for `cclens list` and `cclens inputs`
-//! with tabbed navigation and session drill-down.
+//! with tabbed navigation, session drill-down, and pricing overlay.
 //!
 //! Public API:
 //! - `Tab` — `Sessions` | `Inputs` — the active tab.
-//! - `run_tui<F, G>(Vec<Session>, F, G, Tab) -> anyhow::Result<()>`
-//!   where `F: Fn(&str) -> Result<Vec<PreparedExchange>>` and
+//! - `PricingData` — owned pricing entries + cache staleness info,
+//!   constructed once before entering the TUI.
+//! - `run_tui<F, G>(Vec<Session>, F, G, PricingData, Tab)
+//!   -> anyhow::Result<()>` where
+//!   `F: Fn(&str) -> Result<Vec<PreparedExchange>>` and
 //!   `G: Fn() -> Result<(Vec<AttributionRow>, CoverageStats)>` —
 //!   fullscreen TUI with tab switching (1/2 keys), scrollable tables,
-//!   session drill-down (Enter/Esc within Sessions tab), and
-//!   attribution table with coverage footer (Inputs tab).
+//!   session drill-down (Enter/Esc within Sessions tab), attribution
+//!   table with coverage footer (Inputs tab), and pricing overlay
+//!   (`p` toggles from any view, Esc/q closes).
 //!
 //! The plain-text path (`rendering::render_table` / `rendering::render_session`
 //! / `rendering::render_inputs`) remains the fallback for piped output,
@@ -18,7 +22,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::aggregation::{PreparedExchange, PreparedRow, PreparedRowRole, fold_cum_cost};
@@ -26,13 +30,19 @@ use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::Session;
 use crate::formatting::{
     coverage_line, display_path, format_cost_opt, format_local, format_local_or_empty,
-    format_tokens, kind_label,
+    format_rate_mtok, format_tokens, kind_label, tiers_differ,
 };
+use crate::pricing::{CacheInfo, ClaudePricing};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Sessions,
     Inputs,
+}
+
+pub struct PricingData {
+    pub entries: Vec<(String, ClaudePricing)>,
+    pub cache_info: CacheInfo,
 }
 
 struct InputsState {
@@ -55,6 +65,10 @@ impl InputsState {
     }
 }
 
+enum Overlay {
+    Pricing,
+}
+
 enum View {
     List,
     Show {
@@ -72,10 +86,12 @@ struct App {
     total_cost: Option<f64>,
     view: View,
     inputs: Option<InputsState>,
+    overlay: Option<Overlay>,
+    pricing: PricingData,
 }
 
 impl App {
-    fn new(sessions: Vec<Session>, default_tab: Tab) -> Self {
+    fn new(sessions: Vec<Session>, pricing: PricingData, default_tab: Tab) -> Self {
         let total_tokens = sessions.iter().map(|s| s.total_billable).sum();
         let total_cost = sessions.iter().try_fold(0.0, |acc, s| {
             fold_cum_cost(Some(acc), s.cost_breakdown.map(|b| b.total()))
@@ -92,6 +108,8 @@ impl App {
             total_cost,
             view: View::List,
             inputs: None,
+            overlay: None,
+            pricing,
         }
     }
 }
@@ -101,6 +119,7 @@ pub fn run_tui<F, G>(
     sessions: Vec<Session>,
     load_show: F,
     load_inputs: G,
+    pricing: PricingData,
     default_tab: Tab,
 ) -> anyhow::Result<()>
 where
@@ -113,6 +132,7 @@ where
         sessions,
         &load_show,
         &load_inputs,
+        pricing,
         default_tab,
     );
     ratatui::restore();
@@ -124,13 +144,14 @@ fn run_event_loop<F, G>(
     sessions: Vec<Session>,
     load_show: &F,
     load_inputs: &G,
+    pricing: PricingData,
     default_tab: Tab,
 ) -> anyhow::Result<()>
 where
     F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>>,
     G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
 {
-    let mut app = App::new(sessions, default_tab);
+    let mut app = App::new(sessions, pricing, default_tab);
 
     if default_tab == Tab::Inputs
         && let Ok((rows, coverage)) = load_inputs()
@@ -157,6 +178,40 @@ where
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
+    if app.overlay.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('p' | 'q') => {
+                app.overlay = None;
+            }
+            KeyCode::Backspace
+            | KeyCode::Enter
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Delete
+            | KeyCode::Insert
+            | KeyCode::F(_)
+            | KeyCode::Char(_)
+            | KeyCode::Null
+            | KeyCode::CapsLock
+            | KeyCode::ScrollLock
+            | KeyCode::NumLock
+            | KeyCode::PrintScreen
+            | KeyCode::Pause
+            | KeyCode::Menu
+            | KeyCode::KeypadBegin
+            | KeyCode::Media(_)
+            | KeyCode::Modifier(_) => {}
+        }
+        return false;
+    }
     match key.code {
         KeyCode::Char('1') => {
             app.tab = Tab::Sessions;
@@ -164,6 +219,10 @@ where
         }
         KeyCode::Char('2') => {
             try_switch_to_inputs(app, load_inputs);
+            return false;
+        }
+        KeyCode::Char('p') => {
+            app.overlay = Some(Overlay::Pricing);
             return false;
         }
         KeyCode::Backspace
@@ -416,6 +475,10 @@ fn render(app: &mut App, frame: &mut Frame) {
         }
         Tab::Inputs => render_inputs_content(app, frame, content_area),
     }
+
+    if app.overlay.is_some() {
+        render_pricing_overlay(app, frame);
+    }
 }
 
 fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -523,7 +586,7 @@ fn render_totals(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
 }
 
 fn render_list_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
-    let text = Line::from(" 1/2 tabs  ↑↓ navigate  Enter open  q quit").dim();
+    let text = Line::from(" 1/2 tabs  ↑↓ navigate  Enter open  p pricing  q quit").dim();
     frame.render_widget(Paragraph::new(text), area);
 }
 
@@ -544,7 +607,7 @@ fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
 
     render_show_table(prepared, table_state, frame, table_area);
 
-    let footer = Line::from(" 1/2 tabs  ↑↓ navigate  Esc back  q quit").dim();
+    let footer = Line::from(" 1/2 tabs  ↑↓ navigate  Esc back  p pricing  q quit").dim();
     frame.render_widget(Paragraph::new(footer), footer_area);
 }
 
@@ -682,8 +745,111 @@ fn render_inputs_coverage(inputs: &InputsState, frame: &mut Frame, area: ratatui
 }
 
 fn render_inputs_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
-    let text = Line::from(" 1/2 tabs  ↑↓ navigate  q quit").dim();
+    let text = Line::from(" 1/2 tabs  ↑↓ navigate  p pricing  q quit").dim();
     frame.render_widget(Paragraph::new(text), area);
+}
+
+// ---- pricing overlay ----
+
+fn render_pricing_overlay(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+    let popup_width = 80.min(area.width);
+    #[allow(clippy::cast_possible_truncation)]
+    let row_count: u16 = app
+        .pricing
+        .entries
+        .iter()
+        .map(|(_, p)| if tiers_differ(p) { 2u16 } else { 1u16 })
+        .sum();
+    let popup_height = (row_count + 4).min(area.height);
+
+    let popup_area = centered_rect(popup_width, popup_height, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::bordered().title(" Pricing ($/MTok) ");
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let [table_area, footer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+
+    let mut rows = Vec::new();
+    for (model, pricing) in &app.pricing.entries {
+        if tiers_differ(pricing) {
+            rows.push(Row::new(vec![
+                model.clone(),
+                "\u{2264}200k".to_string(),
+                format_rate_mtok(pricing.input.first_200k_rate),
+                format_rate_mtok(pricing.output.first_200k_rate),
+                format_rate_mtok(pricing.cache_read.first_200k_rate),
+                format_rate_mtok(pricing.cache_creation_5m.first_200k_rate),
+                format_rate_mtok(pricing.cache_creation_1h.first_200k_rate),
+            ]));
+            rows.push(Row::new(vec![
+                String::new(),
+                ">200k".to_string(),
+                format_rate_mtok(pricing.input.above_200k_rate),
+                format_rate_mtok(pricing.output.above_200k_rate),
+                format_rate_mtok(pricing.cache_read.above_200k_rate),
+                format_rate_mtok(pricing.cache_creation_5m.above_200k_rate),
+                format_rate_mtok(pricing.cache_creation_1h.above_200k_rate),
+            ]));
+        } else {
+            rows.push(Row::new(vec![
+                model.clone(),
+                String::new(),
+                format_rate_mtok(pricing.input.first_200k_rate),
+                format_rate_mtok(pricing.output.first_200k_rate),
+                format_rate_mtok(pricing.cache_read.first_200k_rate),
+                format_rate_mtok(pricing.cache_creation_5m.first_200k_rate),
+                format_rate_mtok(pricing.cache_creation_1h.first_200k_rate),
+            ]));
+        }
+    }
+
+    let header = Row::new([
+        "model", "tier", "input", "output", "cache_rd", "cache_5m", "cache_1h",
+    ])
+    .style(Style::new().bold());
+    let widths = [
+        Constraint::Fill(1),   // model
+        Constraint::Length(6), // tier
+        Constraint::Length(8), // input
+        Constraint::Length(8), // output
+        Constraint::Length(8), // cache_rd
+        Constraint::Length(8), // cache_5m
+        Constraint::Length(8), // cache_1h
+    ];
+    let table = Table::new(rows, widths).header(header);
+    frame.render_widget(table, table_area);
+
+    let staleness = format_cache_staleness(&app.pricing.cache_info);
+    let footer = Line::from(format!(" {staleness}  Esc close")).dim();
+    frame.render_widget(Paragraph::new(footer), footer_area);
+}
+
+fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    ratatui::layout::Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
+fn format_cache_staleness(info: &CacheInfo) -> String {
+    match &info.last_modified {
+        Some(mtime) => {
+            let elapsed = mtime.elapsed().unwrap_or_default();
+            let hours = elapsed.as_secs() / 3600;
+            let days = hours / 24;
+            if days > 0 {
+                format!("catalog: {days}d ago")
+            } else if hours > 0 {
+                format!("catalog: {hours}h ago")
+            } else {
+                "catalog: <1h ago".to_string()
+            }
+        }
+        None => "catalog: unknown".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -693,11 +859,65 @@ mod tests {
     use chrono::{DateTime, Utc};
     use ratatui::backend::TestBackend;
 
+    use std::time::SystemTime;
+
     use super::*;
     use crate::aggregation::PreparedExchange;
     use crate::attribution::TierCoverage;
     use crate::domain::{CostBreakdown, TurnOrigin};
     use crate::inventory::{ContextFile, ContextFileKind, Scope};
+    use crate::pricing::TieredRate;
+
+    fn fixture_pricing_data() -> PricingData {
+        let uniform = |rate: f64| {
+            let tier = TieredRate {
+                first_200k_rate: rate,
+                above_200k_rate: rate,
+            };
+            ClaudePricing {
+                input: tier,
+                output: tier,
+                cache_creation_5m: tier,
+                cache_creation_1h: tier,
+                cache_read: tier,
+            }
+        };
+        let split = ClaudePricing {
+            input: TieredRate {
+                first_200k_rate: 3e-6,
+                above_200k_rate: 6e-6,
+            },
+            output: TieredRate {
+                first_200k_rate: 15e-6,
+                above_200k_rate: 22.5e-6,
+            },
+            cache_read: TieredRate {
+                first_200k_rate: 0.3e-6,
+                above_200k_rate: 0.6e-6,
+            },
+            cache_creation_5m: TieredRate {
+                first_200k_rate: 3.75e-6,
+                above_200k_rate: 7.5e-6,
+            },
+            cache_creation_1h: TieredRate {
+                first_200k_rate: 3e-6,
+                above_200k_rate: 6e-6,
+            },
+        };
+        PricingData {
+            entries: vec![
+                ("claude-haiku-4-5".to_string(), uniform(0.8e-6)),
+                ("claude-sonnet-4-5".to_string(), split),
+            ],
+            cache_info: CacheInfo {
+                path: None,
+                exists: true,
+                last_modified: Some(SystemTime::now()),
+                size: 1024,
+                entry_count: Some(2),
+            },
+        }
+    }
 
     fn fixture_sessions() -> Vec<Session> {
         vec![
@@ -821,19 +1041,19 @@ mod tests {
 
     #[test]
     fn app_new_selects_first_when_non_empty() {
-        let app = App::new(fixture_sessions(), Tab::Sessions);
+        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]
     fn app_new_no_selection_when_empty() {
-        let app = App::new(vec![], Tab::Sessions);
+        let app = App::new(vec![], fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.list_state.selected(), None);
     }
 
     #[test]
     fn app_new_computes_totals() {
-        let app = App::new(fixture_sessions(), Tab::Sessions);
+        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.total_tokens, 1500 + 2500 + 3000);
         let expected_cost = 0.01 + 0.02 + 0.03;
         assert!(
@@ -847,13 +1067,13 @@ mod tests {
 
     #[test]
     fn app_starts_in_list_view() {
-        let app = App::new(fixture_sessions(), Tab::Sessions);
+        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert!(matches!(app.view, View::List));
     }
 
     #[test]
     fn enter_transitions_to_show_view() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -862,7 +1082,7 @@ mod tests {
 
     #[test]
     fn enter_with_failed_closure_stays_on_list() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader =
             |_: &str| -> anyhow::Result<Vec<PreparedExchange>> { anyhow::bail!("load failed") };
         let il = noop_inputs_loader();
@@ -872,7 +1092,7 @@ mod tests {
 
     #[test]
     fn enter_with_no_selection_is_noop() {
-        let mut app = App::new(vec![], Tab::Sessions);
+        let mut app = App::new(vec![], fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -881,7 +1101,7 @@ mod tests {
 
     #[test]
     fn esc_in_show_returns_to_list() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -892,7 +1112,7 @@ mod tests {
 
     #[test]
     fn backspace_in_show_returns_to_list() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -903,7 +1123,7 @@ mod tests {
 
     #[test]
     fn q_in_show_quits() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -918,7 +1138,7 @@ mod tests {
 
     #[test]
     fn list_selection_preserved_after_roundtrip() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         app.list_state.select(Some(2));
@@ -932,7 +1152,7 @@ mod tests {
 
     #[test]
     fn handle_key_quit_on_q() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         assert!(handle_key_event(
@@ -945,7 +1165,7 @@ mod tests {
 
     #[test]
     fn handle_key_quit_on_esc() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         assert!(handle_key_event(
@@ -958,7 +1178,7 @@ mod tests {
 
     #[test]
     fn handle_key_quit_on_ctrl_c() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -967,7 +1187,7 @@ mod tests {
 
     #[test]
     fn handle_key_down_advances_selection() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
@@ -977,7 +1197,7 @@ mod tests {
 
     #[test]
     fn handle_key_up_retreats_selection() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         app.list_state.select(Some(1));
@@ -987,7 +1207,7 @@ mod tests {
 
     #[test]
     fn handle_key_j_advances_like_down() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
@@ -997,7 +1217,7 @@ mod tests {
 
     #[test]
     fn handle_key_k_retreats_like_up() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         app.list_state.select(Some(1));
@@ -1007,7 +1227,7 @@ mod tests {
 
     #[test]
     fn handle_key_home_selects_first() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         app.list_state.select(Some(2));
@@ -1019,7 +1239,7 @@ mod tests {
     fn handle_key_end_selects_last() {
         let sessions = fixture_sessions();
         let last = sessions.len() - 1;
-        let mut app = App::new(sessions, Tab::Sessions);
+        let mut app = App::new(sessions, fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
@@ -1030,7 +1250,7 @@ mod tests {
 
     #[test]
     fn handle_key_unknown_is_noop() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
@@ -1043,7 +1263,7 @@ mod tests {
 
     #[test]
     fn show_down_advances_selection() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -1058,7 +1278,7 @@ mod tests {
 
     #[test]
     fn show_up_retreats_selection() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -1071,7 +1291,7 @@ mod tests {
 
     #[test]
     fn show_home_selects_first() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -1085,7 +1305,7 @@ mod tests {
 
     #[test]
     fn show_end_selects_last() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -1107,7 +1327,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_header_with_session_count() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let first_line = output.lines().next().unwrap();
         assert!(
@@ -1118,7 +1338,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_table_header_columns() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let second_line = output.lines().nth(1).unwrap();
         for col in ["datetime", "project", "title", "tokens", "cost"] {
@@ -1131,7 +1351,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_footer_key_hints() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
@@ -1142,7 +1362,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_totals_when_multiple_sessions() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let lines: Vec<&str> = output.lines().collect();
         let totals_line = lines[lines.len() - 2];
@@ -1158,7 +1378,11 @@ mod tests {
 
     #[test]
     fn list_tui_omits_totals_for_single_session() {
-        let mut app = App::new(vec![fixture_sessions().remove(0)], Tab::Sessions);
+        let mut app = App::new(
+            vec![fixture_sessions().remove(0)],
+            fixture_pricing_data(),
+            Tab::Sessions,
+        );
         let output = render_app(&mut app, 80, 10);
         let lines: Vec<&str> = output.lines().collect();
         let totals_line = lines[lines.len() - 2];
@@ -1170,7 +1394,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_session_data_in_rows() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let data_line = output.lines().nth(2).unwrap();
         assert!(
@@ -1185,7 +1409,7 @@ mod tests {
 
     #[test]
     fn list_footer_shows_enter_hint() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
@@ -1204,7 +1428,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_header_with_session_info() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 120, 20);
         let first_line = output.lines().next().unwrap();
@@ -1220,7 +1444,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_column_headers() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         let second_line = output.lines().nth(1).unwrap();
@@ -1237,7 +1461,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_footer_with_back_hint() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 120, 20);
         let last_line = output.lines().last().unwrap();
@@ -1249,7 +1473,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_exchange_rows() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         assert!(
@@ -1268,7 +1492,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_per_component_costs() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         assert!(
@@ -1283,7 +1507,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_dash_for_none_cost() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         let subagent_line = output.lines().find(|l| l.contains("subagent")).unwrap();
@@ -1295,7 +1519,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_tool_use_count_in_content() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         enter_show_view(&mut app);
         let output = render_app(&mut app, 160, 20);
         assert!(
@@ -1306,7 +1530,7 @@ mod tests {
 
     #[test]
     fn show_tui_dims_odd_exchange_rows() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         enter_show_view(&mut app);
         let backend = TestBackend::new(140, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1409,13 +1633,13 @@ mod tests {
 
     #[test]
     fn app_starts_on_specified_tab() {
-        let app = App::new(fixture_sessions(), Tab::Inputs);
+        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         assert_eq!(app.tab, Tab::Inputs);
     }
 
     #[test]
     fn key_1_switches_to_sessions() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1428,7 +1652,7 @@ mod tests {
 
     #[test]
     fn key_2_switches_to_inputs_loading_data() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = fixture_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
@@ -1438,7 +1662,7 @@ mod tests {
 
     #[test]
     fn key_2_with_failed_loader_stays_on_sessions() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = noop_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
@@ -1447,7 +1671,7 @@ mod tests {
 
     #[test]
     fn key_2_reuses_cached_inputs() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
         let il = fixture_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
@@ -1459,7 +1683,7 @@ mod tests {
 
     #[test]
     fn tab_switch_from_show_view() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
         let il = fixture_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
@@ -1489,7 +1713,7 @@ mod tests {
 
     #[test]
     fn inputs_key_quit_on_q() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1506,7 +1730,7 @@ mod tests {
 
     #[test]
     fn inputs_key_quit_on_esc() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1523,7 +1747,7 @@ mod tests {
 
     #[test]
     fn inputs_key_down_advances_selection() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1537,7 +1761,7 @@ mod tests {
 
     #[test]
     fn inputs_key_up_retreats_selection() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1551,7 +1775,7 @@ mod tests {
 
     #[test]
     fn inputs_key_unknown_is_noop() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1567,7 +1791,7 @@ mod tests {
 
     #[test]
     fn tab_header_shows_sessions_active() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let first_line = output.lines().next().unwrap();
         assert!(
@@ -1582,7 +1806,7 @@ mod tests {
 
     #[test]
     fn tab_header_shows_inputs_active() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1598,7 +1822,7 @@ mod tests {
 
     #[test]
     fn tab_header_shows_context_count() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let first_line = output.lines().next().unwrap();
         assert!(
@@ -1609,7 +1833,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_table_columns() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1626,7 +1850,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_coverage_line() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1645,7 +1869,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_footer_with_tab_hint() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1661,7 +1885,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_kind_labels() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1680,7 +1904,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_dash_for_unknown_cost() {
-        let mut app = App::new(fixture_sessions(), Tab::Inputs);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -1696,12 +1920,178 @@ mod tests {
 
     #[test]
     fn list_footer_shows_tab_hint() {
-        let mut app = App::new(fixture_sessions(), Tab::Sessions);
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
             last_line.contains("1/2 tabs"),
             "list footer should contain '1/2 tabs'; got: {last_line}",
+        );
+    }
+
+    // --- Pricing overlay key routing tests ---
+
+    #[test]
+    fn p_opens_pricing_overlay() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        assert!(matches!(app.overlay, Some(Overlay::Pricing)));
+    }
+
+    #[test]
+    fn p_opens_overlay_from_show_view() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = fixture_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        assert!(matches!(app.view, View::Show { .. }));
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        assert!(matches!(app.overlay, Some(Overlay::Pricing)));
+    }
+
+    #[test]
+    fn p_opens_overlay_from_inputs_tab() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        ));
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        assert!(matches!(app.overlay, Some(Overlay::Pricing)));
+    }
+
+    #[test]
+    fn esc_closes_pricing_overlay() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        assert!(app.overlay.is_some());
+        handle_key_event(&mut app, key_event(KeyCode::Esc), &loader, &il);
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn p_toggles_pricing_overlay_closed() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        assert!(app.overlay.is_some());
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn q_closes_pricing_overlay() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        assert!(app.overlay.is_some());
+        let quit = handle_key_event(&mut app, key_event(KeyCode::Char('q')), &loader, &il);
+        assert!(app.overlay.is_none());
+        assert!(!quit);
+    }
+
+    #[test]
+    fn overlay_swallows_unhandled_keys() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        let original_tab = app.tab;
+        let original_selected = app.list_state.selected();
+        for code in [
+            KeyCode::Down,
+            KeyCode::Char('1'),
+            KeyCode::Char('2'),
+            KeyCode::Enter,
+        ] {
+            handle_key_event(&mut app, key_event(code), &loader, &il);
+        }
+        assert!(app.overlay.is_some());
+        assert_eq!(app.tab, original_tab);
+        assert_eq!(app.list_state.selected(), original_selected);
+        assert!(matches!(app.view, View::List));
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_with_overlay_open() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        assert!(app.overlay.is_some());
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_key_event(&mut app, key, &loader, &il));
+    }
+
+    #[test]
+    fn overlay_close_preserves_tab_and_view_state() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = fixture_loader();
+        let il = noop_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        assert!(matches!(app.view, View::Show { .. }));
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
+        assert!(app.overlay.is_some());
+        handle_key_event(&mut app, key_event(KeyCode::Esc), &loader, &il);
+        assert!(app.overlay.is_none());
+        assert!(matches!(app.view, View::Show { .. }));
+        assert_eq!(app.tab, Tab::Sessions);
+    }
+
+    // --- Pricing overlay rendering tests ---
+
+    #[test]
+    fn pricing_overlay_renders_model_rates() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.overlay = Some(Overlay::Pricing);
+        let output = render_app(&mut app, 100, 20);
+        assert!(
+            output.contains("claude-haiku-4-5"),
+            "overlay should contain model name; got:\n{output}",
+        );
+        assert!(
+            output.contains("$0.80"),
+            "overlay should contain rate value; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn pricing_overlay_renders_cache_staleness() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.overlay = Some(Overlay::Pricing);
+        let output = render_app(&mut app, 100, 20);
+        assert!(
+            output.contains("catalog:"),
+            "overlay footer should contain cache staleness; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn pricing_overlay_renders_block_border() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.overlay = Some(Overlay::Pricing);
+        let output = render_app(&mut app, 100, 20);
+        assert!(
+            output.contains("Pricing ($/MTok)"),
+            "overlay should contain block title; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn pricing_overlay_does_not_render_when_closed() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let output = render_app(&mut app, 100, 20);
+        assert!(
+            !output.contains("Pricing ($/MTok)"),
+            "overlay should not appear when closed; got:\n{output}",
         );
     }
 }

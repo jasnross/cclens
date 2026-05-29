@@ -20,7 +20,7 @@ use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
 use cclens::rendering::{render_inputs, render_prices, render_session, render_table};
-use cclens::tui::{Tab, run_tui};
+use cclens::tui::{PricingData, Tab, run_tui};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::{
@@ -112,6 +112,14 @@ fn run_list(
             session_id: None,
             scope: session_filter,
         };
+        let pricing_data = PricingData {
+            entries: catalog
+                .sorted_entries(false)
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), *v))
+                .collect(),
+            cache_info: pricing::cache_info(),
+        };
         run_tui(
             sessions,
             |session_id| {
@@ -123,6 +131,7 @@ fn run_list(
                 )
             },
             || load_inputs_data(projects_dir, &inputs_filter, &catalog),
+            pricing_data,
             Tab::Sessions,
         )?;
     } else {
@@ -234,6 +243,14 @@ fn run_inputs(
             &ThresholdsFilter::default(),
             &catalog,
         )?;
+        let pricing_data = PricingData {
+            entries: catalog
+                .sorted_entries(false)
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), *v))
+                .collect(),
+            cache_info: pricing::cache_info(),
+        };
         run_tui(
             sessions,
             |session_id| {
@@ -254,6 +271,7 @@ fn run_inputs(
                     .collect();
                 Ok((visible, coverage))
             },
+            pricing_data,
             Tab::Inputs,
         )?;
     } else {
