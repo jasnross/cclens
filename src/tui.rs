@@ -62,6 +62,11 @@ impl InputsState {
     }
 }
 
+enum InputsData {
+    Loaded(InputsState),
+    Error(String),
+}
+
 enum Overlay {
     Pricing,
 }
@@ -73,6 +78,11 @@ enum View {
         prepared: Vec<PreparedExchange>,
         table_state: TableState,
     },
+    ShowError {
+        session_id: String,
+        header_label: String,
+        message: String,
+    },
 }
 
 struct App {
@@ -82,7 +92,7 @@ struct App {
     total_tokens: u64,
     total_cost: Option<f64>,
     view: View,
-    inputs: Option<InputsState>,
+    inputs: Option<InputsData>,
     overlay: Option<Overlay>,
     pricing: PricingData,
 }
@@ -148,10 +158,15 @@ where
 {
     let mut app = App::new(sessions, pricing, default_tab);
 
-    if default_tab == Tab::Inputs
-        && let Ok((rows, coverage)) = load_inputs()
-    {
-        app.inputs = Some(InputsState::new(rows, coverage));
+    if default_tab == Tab::Inputs {
+        match load_inputs() {
+            Ok((rows, coverage)) => {
+                app.inputs = Some(InputsData::Loaded(InputsState::new(rows, coverage)));
+            }
+            Err(e) => {
+                app.inputs = Some(InputsData::Error(format!("{e}")));
+            }
+        }
     }
 
     loop {
@@ -252,11 +267,13 @@ where
         Tab::Sessions => {
             if matches!(app.view, View::Show { .. }) {
                 handle_show_key(app, key)
+            } else if matches!(app.view, View::ShowError { .. }) {
+                handle_show_error_key(app, key, load_show)
             } else {
                 handle_list_key(app, key, load_show)
             }
         }
-        Tab::Inputs => handle_inputs_key(app, key),
+        Tab::Inputs => handle_inputs_key(app, key, load_inputs),
     }
 }
 
@@ -322,18 +339,26 @@ where
         "\"{}\" ({})",
         app.sessions[idx].title, app.sessions[idx].project_short_name,
     );
-    let Ok(prepared) = load_show(&session_id) else {
-        return;
-    };
-    let mut table_state = TableState::default();
-    if !prepared.is_empty() {
-        table_state.select_first();
+    match load_show(&session_id) {
+        Ok(prepared) => {
+            let mut table_state = TableState::default();
+            if !prepared.is_empty() {
+                table_state.select_first();
+            }
+            app.view = View::Show {
+                header_label,
+                prepared,
+                table_state,
+            };
+        }
+        Err(e) => {
+            app.view = View::ShowError {
+                session_id,
+                header_label,
+                message: format!("{e}"),
+            };
+        }
     }
-    app.view = View::Show {
-        header_label,
-        prepared,
-        table_state,
-    };
 }
 
 fn handle_show_key(app: &mut App, key: KeyEvent) -> bool {
@@ -391,22 +416,132 @@ fn handle_show_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
+fn handle_show_error_key<F>(app: &mut App, key: KeyEvent, load_show: &F) -> bool
+where
+    F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>>,
+{
+    match key.code {
+        KeyCode::Char('q') => true,
+        KeyCode::Esc | KeyCode::Backspace => {
+            app.view = View::List;
+            false
+        }
+        KeyCode::Enter | KeyCode::Char('r') => {
+            let View::ShowError {
+                session_id,
+                header_label,
+                ..
+            } = &app.view
+            else {
+                return false;
+            };
+            let session_id = session_id.clone();
+            let header_label = header_label.clone();
+            match load_show(&session_id) {
+                Ok(prepared) => {
+                    let mut table_state = TableState::default();
+                    if !prepared.is_empty() {
+                        table_state.select_first();
+                    }
+                    app.view = View::Show {
+                        header_label,
+                        prepared,
+                        table_state,
+                    };
+                }
+                Err(e) => {
+                    app.view = View::ShowError {
+                        session_id,
+                        header_label,
+                        message: format!("{e}"),
+                    };
+                }
+            }
+            false
+        }
+        KeyCode::Down
+        | KeyCode::Up
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => false,
+    }
+}
+
 fn try_switch_to_inputs<G>(app: &mut App, load_inputs: &G)
 where
     G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
 {
-    if app.inputs.is_none()
-        && let Ok((rows, coverage)) = load_inputs()
-    {
-        app.inputs = Some(InputsState::new(rows, coverage));
+    if matches!(app.inputs, None | Some(InputsData::Error(_))) {
+        match load_inputs() {
+            Ok((rows, coverage)) => {
+                app.inputs = Some(InputsData::Loaded(InputsState::new(rows, coverage)));
+            }
+            Err(e) => {
+                app.inputs = Some(InputsData::Error(format!("{e}")));
+            }
+        }
     }
-    if app.inputs.is_some() {
-        app.tab = Tab::Inputs;
-    }
+    app.tab = Tab::Inputs;
 }
 
-fn handle_inputs_key(app: &mut App, key: KeyEvent) -> bool {
-    let Some(inputs) = &mut app.inputs else {
+fn handle_inputs_key<G>(app: &mut App, key: KeyEvent, load_inputs: &G) -> bool
+where
+    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
+{
+    if matches!(&app.inputs, Some(InputsData::Error(_))) {
+        return match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => true,
+            KeyCode::Enter | KeyCode::Char('r') => {
+                try_switch_to_inputs(app, load_inputs);
+                false
+            }
+            KeyCode::Backspace
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Delete
+            | KeyCode::Insert
+            | KeyCode::F(_)
+            | KeyCode::Char(_)
+            | KeyCode::Null
+            | KeyCode::CapsLock
+            | KeyCode::ScrollLock
+            | KeyCode::NumLock
+            | KeyCode::PrintScreen
+            | KeyCode::Pause
+            | KeyCode::Menu
+            | KeyCode::KeypadBegin
+            | KeyCode::Media(_)
+            | KeyCode::Modifier(_) => false,
+        };
+    }
+    let Some(InputsData::Loaded(inputs)) = &mut app.inputs else {
         return false;
     };
     match key.code {
@@ -462,7 +597,19 @@ fn render(app: &mut App, frame: &mut Frame) {
 
     match app.tab {
         Tab::Sessions => {
-            if matches!(app.view, View::Show { .. }) {
+            if let View::ShowError { message, .. } = &app.view {
+                render_feedback_content(
+                    frame,
+                    content_area,
+                    vec![
+                        Line::raw(""),
+                        Line::from(format!(" Error: {message}")),
+                        Line::raw(""),
+                        Line::from(" Press Enter or r to retry.").dim(),
+                    ],
+                    " 1/2 tabs  Enter retry  Esc back  q quit",
+                );
+            } else if matches!(app.view, View::Show { .. }) {
                 render_show_content(app, frame, content_area);
             } else {
                 render_list_content(app, frame, content_area);
@@ -489,20 +636,25 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
     };
 
     let context = match app.tab {
-        Tab::Sessions => {
-            if let View::Show { header_label, .. } = &app.view {
+        Tab::Sessions => match &app.view {
+            View::Show { header_label, .. } | View::ShowError { header_label, .. } => {
                 header_label.clone()
-            } else {
+            }
+            View::List => {
                 let count = app.sessions.len();
                 let label = if count == 1 { "session" } else { "sessions" };
                 format!("{count} {label}")
             }
-        }
-        Tab::Inputs => {
-            let count = app.inputs.as_ref().map_or(0, |i| i.rows.len());
-            let label = if count == 1 { "file" } else { "files" };
-            format!("{count} {label}")
-        }
+        },
+        Tab::Inputs => match &app.inputs {
+            Some(InputsData::Loaded(inputs)) => {
+                let count = inputs.rows.len();
+                let label = if count == 1 { "file" } else { "files" };
+                format!("{count} {label}")
+            }
+            Some(InputsData::Error(_)) => "!".to_string(),
+            None => "0 files".to_string(),
+        },
     };
 
     let [left_area, right_area] =
@@ -668,23 +820,52 @@ fn show_row(row: &PreparedRow, dim: bool) -> Row<'static> {
     if dim { r.dim() } else { r }
 }
 
+// ---- shared feedback rendering ----
+
+fn render_feedback_content(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    message_lines: Vec<Line<'static>>,
+    footer_text: &str,
+) {
+    let [content_area, footer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    frame.render_widget(Paragraph::new(message_lines), content_area);
+    let footer = Line::from(footer_text).dim();
+    frame.render_widget(Paragraph::new(footer), footer_area);
+}
+
 // ---- inputs view ----
 
 fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let Some(inputs) = &mut app.inputs else {
-        return;
-    };
+    match &mut app.inputs {
+        Some(InputsData::Loaded(inputs)) => {
+            let [table_area, coverage_area, footer_area] = Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
 
-    let [table_area, coverage_area, footer_area] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-
-    render_inputs_table(inputs, frame, table_area);
-    render_inputs_coverage(inputs, frame, coverage_area);
-    render_inputs_footer(frame, footer_area);
+            render_inputs_table(inputs, frame, table_area);
+            render_inputs_coverage(inputs, frame, coverage_area);
+            render_inputs_footer(frame, footer_area);
+        }
+        Some(InputsData::Error(msg)) => {
+            render_feedback_content(
+                frame,
+                area,
+                vec![
+                    Line::raw(""),
+                    Line::from(format!(" Error: {msg}")),
+                    Line::raw(""),
+                    Line::from(" Press Enter or r to retry.").dim(),
+                ],
+                " 1/2 tabs  Enter retry  q quit",
+            );
+        }
+        None => {}
+    }
 }
 
 fn inputs_table_widths() -> [Constraint; 7] {
@@ -989,12 +1170,20 @@ mod tests {
         |_| Ok(fixture_prepared_exchanges())
     }
 
-    fn noop_inputs_loader() -> impl Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> {
+    fn failing_inputs_loader() -> impl Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>
+    {
         || anyhow::bail!("no loader")
     }
 
     fn key_event(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn inputs_table_selected(app: &App) -> Option<usize> {
+        match &app.inputs {
+            Some(InputsData::Loaded(inputs)) => inputs.table_state.selected(),
+            _ => None,
+        }
     }
 
     // --- App construction tests ---
@@ -1035,26 +1224,26 @@ mod tests {
     fn enter_transitions_to_show_view() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
     }
 
     #[test]
-    fn enter_with_failed_closure_stays_on_list() {
+    fn enter_with_failed_closure_shows_error_view() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader =
             |_: &str| -> anyhow::Result<Vec<PreparedExchange>> { anyhow::bail!("load failed") };
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
-        assert!(matches!(app.view, View::List));
+        assert!(matches!(app.view, View::ShowError { .. }));
     }
 
     #[test]
     fn enter_with_no_selection_is_noop() {
         let mut app = App::new(vec![], fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::List));
     }
@@ -1063,7 +1252,7 @@ mod tests {
     fn esc_in_show_returns_to_list() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
         handle_key_event(&mut app, key_event(KeyCode::Esc), &loader, &il);
@@ -1074,7 +1263,7 @@ mod tests {
     fn backspace_in_show_returns_to_list() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
         handle_key_event(&mut app, key_event(KeyCode::Backspace), &loader, &il);
@@ -1085,7 +1274,7 @@ mod tests {
     fn q_in_show_quits() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
         assert!(handle_key_event(
@@ -1100,7 +1289,7 @@ mod tests {
     fn list_selection_preserved_after_roundtrip() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         app.list_state.select(Some(2));
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
@@ -1114,7 +1303,7 @@ mod tests {
     fn handle_key_quit_on_q() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         assert!(handle_key_event(
             &mut app,
             key_event(KeyCode::Char('q')),
@@ -1127,7 +1316,7 @@ mod tests {
     fn handle_key_quit_on_esc() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         assert!(handle_key_event(
             &mut app,
             key_event(KeyCode::Esc),
@@ -1140,7 +1329,7 @@ mod tests {
     fn handle_key_quit_on_ctrl_c() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(handle_key_event(&mut app, key, &loader, &il));
     }
@@ -1149,7 +1338,7 @@ mod tests {
     fn handle_key_down_advances_selection() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(1));
@@ -1159,7 +1348,7 @@ mod tests {
     fn handle_key_up_retreats_selection() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         app.list_state.select(Some(1));
         handle_key_event(&mut app, key_event(KeyCode::Up), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(0));
@@ -1169,7 +1358,7 @@ mod tests {
     fn handle_key_j_advances_like_down() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::Char('j')), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(1));
@@ -1179,7 +1368,7 @@ mod tests {
     fn handle_key_k_retreats_like_up() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         app.list_state.select(Some(1));
         handle_key_event(&mut app, key_event(KeyCode::Char('k')), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(0));
@@ -1189,7 +1378,7 @@ mod tests {
     fn handle_key_home_selects_first() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         app.list_state.select(Some(2));
         handle_key_event(&mut app, key_event(KeyCode::Home), &loader, &il);
         assert_eq!(app.list_state.selected(), Some(0));
@@ -1201,7 +1390,7 @@ mod tests {
         let last = sessions.len() - 1;
         let mut app = App::new(sessions, fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::End), &loader, &il);
         render_app(&mut app, 80, 10);
@@ -1212,7 +1401,7 @@ mod tests {
     fn handle_key_unknown_is_noop() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         assert_eq!(app.list_state.selected(), Some(0));
         let quit = handle_key_event(&mut app, key_event(KeyCode::Char('x')), &loader, &il);
         assert!(!quit);
@@ -1225,7 +1414,7 @@ mod tests {
     fn show_down_advances_selection() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         if let View::Show { table_state, .. } = &app.view {
             assert_eq!(table_state.selected(), Some(0));
@@ -1240,7 +1429,7 @@ mod tests {
     fn show_up_retreats_selection() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
         handle_key_event(&mut app, key_event(KeyCode::Up), &loader, &il);
@@ -1253,7 +1442,7 @@ mod tests {
     fn show_home_selects_first() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
         handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
@@ -1267,7 +1456,7 @@ mod tests {
     fn show_end_selects_last() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         handle_key_event(&mut app, key_event(KeyCode::End), &loader, &il);
         render_app(&mut app, 120, 20);
@@ -1382,7 +1571,7 @@ mod tests {
 
     fn enter_show_view(app: &mut App) {
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(app, key_event(KeyCode::Enter), &loader, &il);
     }
 
@@ -1600,10 +1789,10 @@ mod tests {
     #[test]
     fn key_1_switches_to_sessions() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         let loader = noop_loader();
         let il = fixture_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('1')), &loader, &il);
@@ -1617,16 +1806,17 @@ mod tests {
         let il = fixture_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
         assert_eq!(app.tab, Tab::Inputs);
-        assert!(app.inputs.is_some());
+        assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
     }
 
     #[test]
-    fn key_2_with_failed_loader_stays_on_sessions() {
+    fn key_2_with_failed_loader_shows_error_on_inputs_tab() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
-        assert_eq!(app.tab, Tab::Sessions);
+        assert_eq!(app.tab, Tab::Inputs);
+        assert!(matches!(app.inputs, Some(InputsData::Error(_))));
     }
 
     #[test]
@@ -1635,10 +1825,10 @@ mod tests {
         let loader = noop_loader();
         let il = fixture_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
-        assert!(app.inputs.is_some());
+        assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
         handle_key_event(&mut app, key_event(KeyCode::Char('1')), &loader, &il);
         handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
-        assert!(app.inputs.is_some());
+        assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
     }
 
     #[test]
@@ -1674,12 +1864,12 @@ mod tests {
     #[test]
     fn inputs_key_quit_on_q() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         assert!(handle_key_event(
             &mut app,
             key_event(KeyCode::Char('q')),
@@ -1691,12 +1881,12 @@ mod tests {
     #[test]
     fn inputs_key_quit_on_esc() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         assert!(handle_key_event(
             &mut app,
             key_event(KeyCode::Esc),
@@ -1708,43 +1898,43 @@ mod tests {
     #[test]
     fn inputs_key_down_advances_selection() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         let loader = noop_loader();
-        let il = noop_inputs_loader();
-        assert_eq!(app.inputs.as_ref().unwrap().table_state.selected(), Some(0));
+        let il = failing_inputs_loader();
+        assert_eq!(inputs_table_selected(&app), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
-        assert_eq!(app.inputs.as_ref().unwrap().table_state.selected(), Some(1));
+        assert_eq!(inputs_table_selected(&app), Some(1));
     }
 
     #[test]
     fn inputs_key_up_retreats_selection() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Down), &loader, &il);
         handle_key_event(&mut app, key_event(KeyCode::Up), &loader, &il);
-        assert_eq!(app.inputs.as_ref().unwrap().table_state.selected(), Some(0));
+        assert_eq!(inputs_table_selected(&app), Some(0));
     }
 
     #[test]
     fn inputs_key_unknown_is_noop() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         let quit = handle_key_event(&mut app, key_event(KeyCode::Char('x')), &loader, &il);
         assert!(!quit);
-        assert_eq!(app.inputs.as_ref().unwrap().table_state.selected(), Some(0));
+        assert_eq!(inputs_table_selected(&app), Some(0));
     }
 
     // --- Tab rendering tests ---
@@ -1767,10 +1957,10 @@ mod tests {
     #[test]
     fn tab_header_shows_inputs_active() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         app.tab = Tab::Inputs;
         let output = render_app(&mut app, 80, 10);
         let first_line = output.lines().next().unwrap();
@@ -1794,10 +1984,10 @@ mod tests {
     #[test]
     fn inputs_tab_renders_table_columns() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         app.tab = Tab::Inputs;
         let output = render_app(&mut app, 120, 10);
         for col in ["file", "kind", "tier", "tokens", "loads", "billed", "cost"] {
@@ -1811,10 +2001,10 @@ mod tests {
     #[test]
     fn inputs_tab_renders_coverage_line() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         app.tab = Tab::Inputs;
         let output = render_app(&mut app, 120, 10);
         assert!(
@@ -1830,10 +2020,10 @@ mod tests {
     #[test]
     fn inputs_tab_renders_footer_with_tab_hint() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         app.tab = Tab::Inputs;
         let output = render_app(&mut app, 120, 10);
         let last_line = output.lines().last().unwrap();
@@ -1846,10 +2036,10 @@ mod tests {
     #[test]
     fn inputs_tab_renders_kind_labels() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         app.tab = Tab::Inputs;
         let output = render_app(&mut app, 120, 10);
         assert!(
@@ -1865,10 +2055,10 @@ mod tests {
     #[test]
     fn inputs_tab_renders_dash_for_unknown_cost() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         app.tab = Tab::Inputs;
         let output = render_app(&mut app, 120, 10);
         let project_line = output.lines().find(|l| l.contains("project"));
@@ -1895,7 +2085,7 @@ mod tests {
     fn p_opens_pricing_overlay() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
         assert!(matches!(app.overlay, Some(Overlay::Pricing)));
     }
@@ -1904,7 +2094,7 @@ mod tests {
     fn p_opens_overlay_from_show_view() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
@@ -1914,12 +2104,12 @@ mod tests {
     #[test]
     fn p_opens_overlay_from_inputs_tab() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
-        app.inputs = Some(InputsState::new(
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
-        ));
+        )));
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
         assert!(matches!(app.overlay, Some(Overlay::Pricing)));
     }
@@ -1928,7 +2118,7 @@ mod tests {
     fn esc_closes_pricing_overlay() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
         assert!(app.overlay.is_some());
         handle_key_event(&mut app, key_event(KeyCode::Esc), &loader, &il);
@@ -1939,7 +2129,7 @@ mod tests {
     fn p_toggles_pricing_overlay_closed() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
         assert!(app.overlay.is_some());
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
@@ -1950,7 +2140,7 @@ mod tests {
     fn q_closes_pricing_overlay() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
         assert!(app.overlay.is_some());
         let quit = handle_key_event(&mut app, key_event(KeyCode::Char('q')), &loader, &il);
@@ -1962,7 +2152,7 @@ mod tests {
     fn overlay_swallows_unhandled_keys() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
         let original_tab = app.tab;
         let original_selected = app.list_state.selected();
@@ -1984,7 +2174,7 @@ mod tests {
     fn ctrl_c_quits_even_with_overlay_open() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = noop_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
         assert!(app.overlay.is_some());
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -1995,7 +2185,7 @@ mod tests {
     fn overlay_close_preserves_tab_and_view_state() {
         let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let loader = fixture_loader();
-        let il = noop_inputs_loader();
+        let il = failing_inputs_loader();
         handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
         assert!(matches!(app.view, View::Show { .. }));
         handle_key_event(&mut app, key_event(KeyCode::Char('p')), &loader, &il);
@@ -2052,6 +2242,162 @@ mod tests {
         assert!(
             !output.contains("Pricing ($/MTok)"),
             "overlay should not appear when closed; got:\n{output}",
+        );
+    }
+
+    // --- Error state tests ---
+
+    #[test]
+    fn inputs_error_retry_on_enter() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = failing_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
+        assert_eq!(app.tab, Tab::Inputs);
+        assert!(matches!(app.inputs, Some(InputsData::Error(_))));
+        let il = fixture_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
+    }
+
+    #[test]
+    fn inputs_error_retry_on_r() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = failing_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
+        assert_eq!(app.tab, Tab::Inputs);
+        assert!(matches!(app.inputs, Some(InputsData::Error(_))));
+        let il = fixture_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('r')), &loader, &il);
+        assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
+    }
+
+    #[test]
+    fn inputs_error_quit_on_q() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader = noop_loader();
+        let il = failing_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')), &loader, &il);
+        assert_eq!(app.tab, Tab::Inputs);
+        assert!(matches!(app.inputs, Some(InputsData::Error(_))));
+        assert!(handle_key_event(
+            &mut app,
+            key_event(KeyCode::Char('q')),
+            &loader,
+            &il
+        ));
+    }
+
+    #[test]
+    fn show_error_esc_returns_to_list() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader =
+            |_: &str| -> anyhow::Result<Vec<PreparedExchange>> { anyhow::bail!("load failed") };
+        let il = failing_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        assert!(matches!(app.view, View::ShowError { .. }));
+        handle_key_event(&mut app, key_event(KeyCode::Esc), &loader, &il);
+        assert!(matches!(app.view, View::List));
+    }
+
+    #[test]
+    fn show_error_backspace_returns_to_list() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let loader =
+            |_: &str| -> anyhow::Result<Vec<PreparedExchange>> { anyhow::bail!("load failed") };
+        let il = failing_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        assert!(matches!(app.view, View::ShowError { .. }));
+        handle_key_event(&mut app, key_event(KeyCode::Backspace), &loader, &il);
+        assert!(matches!(app.view, View::List));
+    }
+
+    #[test]
+    fn show_error_enter_retries() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let fail_loader =
+            |_: &str| -> anyhow::Result<Vec<PreparedExchange>> { anyhow::bail!("load failed") };
+        let il = failing_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &fail_loader, &il);
+        assert!(matches!(app.view, View::ShowError { .. }));
+        let loader = fixture_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &loader, &il);
+        assert!(matches!(app.view, View::Show { .. }));
+    }
+
+    #[test]
+    fn show_error_retry_on_r() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let fail_loader =
+            |_: &str| -> anyhow::Result<Vec<PreparedExchange>> { anyhow::bail!("load failed") };
+        let il = failing_inputs_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Enter), &fail_loader, &il);
+        assert!(matches!(app.view, View::ShowError { .. }));
+        let loader = fixture_loader();
+        handle_key_event(&mut app, key_event(KeyCode::Char('r')), &loader, &il);
+        assert!(matches!(app.view, View::Show { .. }));
+    }
+
+    #[test]
+    fn inputs_error_renders_error_message() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Error("test error".to_string()));
+        let output = render_app(&mut app, 80, 10);
+        assert!(
+            output.contains("Error:") && output.contains("test error"),
+            "should render error message; got:\n{output}",
+        );
+        assert!(
+            output.contains("retry"),
+            "should render retry hint; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn show_error_renders_error_message() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.view = View::ShowError {
+            session_id: "aaa".to_string(),
+            header_label: "\"First session\" (alpha)".to_string(),
+            message: "connection failed".to_string(),
+        };
+        let output = render_app(&mut app, 80, 10);
+        assert!(
+            output.contains("Error:") && output.contains("connection failed"),
+            "should render error message; got:\n{output}",
+        );
+        assert!(
+            output.contains("retry"),
+            "should render retry hint; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn inputs_error_header_shows_error_indicator() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Error("test error".to_string()));
+        let output = render_app(&mut app, 80, 10);
+        let first_line = output.lines().next().unwrap();
+        assert!(
+            first_line.contains("cclens — !"),
+            "header should show '!' indicator for error state; got: {first_line}",
+        );
+    }
+
+    #[test]
+    fn show_error_header_shows_session_context() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.view = View::ShowError {
+            session_id: "aaa".to_string(),
+            header_label: "\"First session\" (alpha)".to_string(),
+            message: "connection failed".to_string(),
+        };
+        let output = render_app(&mut app, 80, 10);
+        let first_line = output.lines().next().unwrap();
+        assert!(
+            first_line.contains("First session") && first_line.contains("alpha"),
+            "header should show session context; got: {first_line}",
         );
     }
 }
