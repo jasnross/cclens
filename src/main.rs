@@ -172,13 +172,16 @@ fn run_list(
                 let cat = Arc::clone(&catalog);
                 move || load_inputs_data(&pd, &inputs_filter, &cat)
             };
-            run_tui(
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_tui(
                 sessions,
                 show_loader,
                 inputs_loader,
                 pricing_data,
                 Tab::Sessions,
-            )?;
+            ))?;
         }
         RenderMode::Json => {
             let summaries: Vec<SessionSummary> =
@@ -326,13 +329,16 @@ fn run_inputs(
                     Ok((visible, coverage))
                 }
             };
-            run_tui(
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_tui(
                 sessions,
                 show_loader,
                 inputs_loader,
                 pricing_data,
                 Tab::Inputs,
-            )?;
+            ))?;
         }
         RenderMode::Json => {
             let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;

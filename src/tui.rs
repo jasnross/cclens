@@ -15,12 +15,17 @@
 //!   within Sessions tab), attribution table with coverage footer
 //!   (Inputs tab), and pricing overlay (`p` toggles, Esc/q closes).
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use std::sync::Arc;
+
+use crossterm::event::EventStream;
+use futures_util::StreamExt;
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
+use tokio::sync::mpsc;
 
 use crate::aggregation::{PreparedExchange, PreparedRow};
 use crate::attribution::{AttributionRow, CoverageStats};
@@ -30,6 +35,10 @@ use crate::pricing::{CacheInfo, ClaudePricing};
 use crate::views::{
     inputs_cells, pricing_view_rows, session_cells, session_totals, show_row_cells,
 };
+
+type ShowLoader = Arc<dyn Fn(&str) -> anyhow::Result<Vec<PreparedExchange>> + Send + Sync>;
+type InputsLoader =
+    Arc<dyn Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -144,7 +153,7 @@ impl App {
 }
 
 #[allow(clippy::missing_errors_doc)]
-pub fn run_tui<F, G>(
+pub async fn run_tui<F, G>(
     sessions: Vec<Session>,
     load_show: F,
     load_inputs: G,
@@ -159,20 +168,21 @@ where
     let result = run_event_loop(
         &mut terminal,
         sessions,
-        &load_show,
-        &load_inputs,
+        load_show,
+        load_inputs,
         pricing,
         default_tab,
-    );
+    )
+    .await;
     ratatui::restore();
     result
 }
 
-fn run_event_loop<F, G>(
+async fn run_event_loop<F, G>(
     terminal: &mut DefaultTerminal,
     sessions: Vec<Session>,
-    load_show: &F,
-    load_inputs: &G,
+    load_show: F,
+    load_inputs: G,
     pricing: PricingData,
     default_tab: Tab,
 ) -> anyhow::Result<()>
@@ -181,6 +191,11 @@ where
     G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync + 'static,
 {
     let mut app = App::new(sessions, pricing, default_tab);
+    let mut event_stream = EventStream::new();
+
+    let load_show: ShowLoader = Arc::new(load_show);
+    let load_inputs: InputsLoader = Arc::new(load_inputs);
+    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<LoadResult>();
 
     if default_tab == Tab::Inputs {
         app.inputs = Some(InputsData::Loading);
@@ -188,29 +203,64 @@ where
     }
 
     loop {
-        let requests: Vec<_> = app.pending_loads.drain(..).collect();
-        for request in requests {
-            let result = match request {
-                LoadRequest::ShowDetail {
-                    session_id,
-                    header_label,
-                } => LoadResult::ShowDetail {
-                    result: load_show(&session_id),
-                    session_id,
-                    header_label,
-                },
-                LoadRequest::InputsRefresh => LoadResult::InputsData(load_inputs()),
-            };
-            handle_load_result(&mut app, result);
-        }
+        drain_pending_loads(&mut app, &load_show, &load_inputs, &result_tx);
         terminal.draw(|frame| render(&mut app, frame))?;
-        if let Event::Key(key) = event::read()?
-            && handle_key_event(&mut app, key)
-        {
-            break;
+
+        tokio::select! {
+            biased;
+            event = event_stream.next() => {
+                match event {
+                    Some(Ok(Event::Key(key))) => {
+                        if handle_key_event(&mut app, key) {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) | None => break,
+                    _ => {}
+                }
+            }
+            Some(result) = result_rx.recv() => {
+                handle_load_result(&mut app, result);
+            }
         }
     }
     Ok(())
+}
+
+fn drain_pending_loads(
+    app: &mut App,
+    load_show: &ShowLoader,
+    load_inputs: &InputsLoader,
+    result_tx: &mpsc::UnboundedSender<LoadResult>,
+) {
+    for request in app.pending_loads.drain(..) {
+        match request {
+            LoadRequest::ShowDetail {
+                session_id,
+                header_label,
+            } => {
+                let loader = Arc::clone(load_show);
+                let tx = result_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = loader(&session_id);
+                    // Send fails if the TUI exited and the receiver dropped — expected on shutdown.
+                    let _ = tx.send(LoadResult::ShowDetail {
+                        session_id,
+                        header_label,
+                        result,
+                    });
+                });
+            }
+            LoadRequest::InputsRefresh => {
+                let loader = Arc::clone(load_inputs);
+                let tx = result_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = loader();
+                    let _ = tx.send(LoadResult::InputsData(result));
+                });
+            }
+        }
+    }
 }
 
 fn handle_load_result(app: &mut App, result: LoadResult) {
