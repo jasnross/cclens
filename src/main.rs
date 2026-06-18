@@ -3,6 +3,7 @@ mod cli;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use cclens::aggregation::{
     SessionSummary, aggregate, dedup_assistant_turns, group_into_exchanges, prepare_exchanges,
@@ -140,7 +141,7 @@ fn run_list(
     scope: &SessionFilterArgs,
     thresholds: ThresholdsFilterArgs,
 ) -> anyhow::Result<()> {
-    let catalog = pricing::load_catalog();
+    let catalog = Arc::new(pricing::load_catalog());
     let session_filter = scope.session_filter();
     let thresholds_filter = thresholds.thresholds_filter();
     let sessions = load_sessions_data(projects_dir, &session_filter, &thresholds_filter, &catalog)?;
@@ -158,17 +159,23 @@ fn run_list(
                     .collect(),
                 cache_info: pricing::cache_info(),
             };
+            let projects_dir_owned = projects_dir.to_path_buf();
+            let show_loader = {
+                let pd = projects_dir_owned.clone();
+                let cat = Arc::clone(&catalog);
+                move |session_id: &str| {
+                    load_show_detail(&pd, session_id, &cat, ThresholdsFilter::default())
+                }
+            };
+            let inputs_loader = {
+                let pd = projects_dir_owned;
+                let cat = Arc::clone(&catalog);
+                move || load_inputs_data(&pd, &inputs_filter, &cat)
+            };
             run_tui(
                 sessions,
-                |session_id| {
-                    load_show_detail(
-                        projects_dir,
-                        session_id,
-                        &catalog,
-                        ThresholdsFilter::default(),
-                    )
-                },
-                || load_inputs_data(projects_dir, &inputs_filter, &catalog),
+                show_loader,
+                inputs_loader,
                 pricing_data,
                 Tab::Sessions,
             )?;
@@ -274,7 +281,7 @@ fn run_inputs(
     inputs: &InputsArgs,
     thresholds: ThresholdsFilterArgs,
 ) -> anyhow::Result<()> {
-    let catalog = pricing::load_catalog();
+    let catalog = Arc::new(pricing::load_catalog());
     let inputs_filter = InputsFilter {
         session_id: inputs.session_id(),
         scope: scope.session_filter(),
@@ -297,19 +304,19 @@ fn run_inputs(
                     .collect(),
                 cache_info: pricing::cache_info(),
             };
-            run_tui(
-                sessions,
-                |session_id| {
-                    load_show_detail(
-                        projects_dir,
-                        session_id,
-                        &catalog,
-                        ThresholdsFilter::default(),
-                    )
-                },
-                || {
-                    let (rows, coverage) =
-                        load_inputs_data(projects_dir, &inputs_filter, &catalog)?;
+            let projects_dir_owned = projects_dir.to_path_buf();
+            let show_loader = {
+                let pd = projects_dir_owned.clone();
+                let cat = Arc::clone(&catalog);
+                move |session_id: &str| {
+                    load_show_detail(&pd, session_id, &cat, ThresholdsFilter::default())
+                }
+            };
+            let inputs_loader = {
+                let pd = projects_dir_owned;
+                let cat = Arc::clone(&catalog);
+                move || {
+                    let (rows, coverage) = load_inputs_data(&pd, &inputs_filter, &cat)?;
                     let visible: Vec<_> = rows
                         .into_iter()
                         .filter(|r| {
@@ -317,7 +324,12 @@ fn run_inputs(
                         })
                         .collect();
                     Ok((visible, coverage))
-                },
+                }
+            };
+            run_tui(
+                sessions,
+                show_loader,
+                inputs_loader,
                 pricing_data,
                 Tab::Inputs,
             )?;

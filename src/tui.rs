@@ -128,8 +128,8 @@ pub fn run_tui<F, G>(
     default_tab: Tab,
 ) -> anyhow::Result<()>
 where
-    F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>>,
-    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
+    F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>> + Send + Sync + 'static,
+    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync + 'static,
 {
     let mut terminal = ratatui::try_init()?;
     let result = run_event_loop(
@@ -153,8 +153,8 @@ fn run_event_loop<F, G>(
     default_tab: Tab,
 ) -> anyhow::Result<()>
 where
-    F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>>,
-    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
+    F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>> + Send + Sync + 'static,
+    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync + 'static,
 {
     let mut app = App::new(sessions, pricing, default_tab);
 
