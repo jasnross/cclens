@@ -175,13 +175,15 @@ fn run_list(
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_tui(
+            let result = rt.block_on(run_tui(
                 sessions,
                 show_loader,
                 inputs_loader,
                 pricing_data,
                 Tab::Sessions,
-            ))?;
+            ));
+            rt.shutdown_timeout(std::time::Duration::from_millis(100));
+            result?;
         }
         RenderMode::Json => {
             let summaries: Vec<SessionSummary> =
@@ -332,13 +334,15 @@ fn run_inputs(
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_tui(
+            let result = rt.block_on(run_tui(
                 sessions,
                 show_loader,
                 inputs_loader,
                 pricing_data,
                 Tab::Inputs,
-            ))?;
+            ));
+            rt.shutdown_timeout(std::time::Duration::from_millis(100));
+            result?;
         }
         RenderMode::Json => {
             let (rows, coverage) = load_inputs_data(projects_dir, &inputs_filter, &catalog)?;

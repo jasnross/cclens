@@ -242,8 +242,10 @@ fn drain_pending_loads(
                 let loader = Arc::clone(load_show);
                 let tx = result_tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let result = loader(&session_id);
-                    // Send fails if the TUI exited and the receiver dropped — expected on shutdown.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        loader(&session_id)
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error: loader panicked")));
                     let _ = tx.send(LoadResult::ShowDetail {
                         session_id,
                         header_label,
@@ -255,7 +257,10 @@ fn drain_pending_loads(
                 let loader = Arc::clone(load_inputs);
                 let tx = result_tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let result = loader();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        loader()
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error: loader panicked")));
                     let _ = tx.send(LoadResult::InputsData(result));
                 });
             }
