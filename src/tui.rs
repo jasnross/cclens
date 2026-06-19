@@ -7,14 +7,19 @@
 //!
 //! Public API:
 //! - `Tab` — `Sessions` | `Inputs` — the active tab.
+//! - `RefreshFingerprint` — file-size fingerprint for change detection.
 //! - `PricingData` — owned pricing entries + cache staleness info,
 //!   constructed once before entering the TUI.
-//! - `run_tui<F, G>(Vec<Session>, F, G, PricingData, Tab)
-//!   -> anyhow::Result<()>` — fullscreen TUI with tab switching
-//!   (1/2 keys), scrollable tables, session drill-down (Enter/Esc
-//!   within Sessions tab), attribution table with coverage footer
-//!   (Inputs tab), and pricing overlay (`p` toggles, Esc/q closes).
+//! - `run_tui<F, G, H, I>(Vec<Session>, F, G, H, I,
+//!   RefreshFingerprint, PricingData, Tab) -> anyhow::Result<()>`
+//!   — fullscreen TUI with tab switching (1/2 keys), scrollable
+//!   tables, session drill-down (Enter/Esc within Sessions tab),
+//!   attribution table with coverage footer (Inputs tab), pricing
+//!   overlay (`p` toggles, Esc/q closes), and timer-driven
+//!   auto-refresh (3s interval, fingerprint-gated).
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::EventStream;
@@ -26,6 +31,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
+use tokio::time::{self, MissedTickBehavior};
 
 use crate::aggregation::{PreparedExchange, PreparedRow};
 use crate::attribution::{AttributionRow, CoverageStats};
@@ -39,6 +45,13 @@ use crate::views::{
 type ShowLoader = Arc<dyn Fn(&str) -> anyhow::Result<Vec<PreparedExchange>> + Send + Sync>;
 type InputsLoader =
     Arc<dyn Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync>;
+type SessionsLoader = Arc<dyn Fn() -> anyhow::Result<Vec<Session>> + Send + Sync>;
+type FingerprintBuilder = Arc<dyn Fn() -> anyhow::Result<RefreshFingerprint> + Send + Sync>;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RefreshFingerprint {
+    pub entries: HashMap<PathBuf, u64>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -105,6 +118,9 @@ enum LoadRequest {
         header_label: String,
     },
     InputsRefresh,
+    RefreshSessions {
+        fingerprint: RefreshFingerprint,
+    },
 }
 
 enum LoadResult {
@@ -114,6 +130,11 @@ enum LoadResult {
         result: anyhow::Result<Vec<PreparedExchange>>,
     },
     InputsData(anyhow::Result<(Vec<AttributionRow>, CoverageStats)>),
+    SessionsData {
+        sessions: Vec<Session>,
+        fingerprint: RefreshFingerprint,
+    },
+    NoChange,
 }
 
 struct App {
@@ -127,6 +148,8 @@ struct App {
     overlay: Option<Overlay>,
     pricing: PricingData,
     pending_loads: Vec<LoadRequest>,
+    refresh_fingerprint: RefreshFingerprint,
+    refresh_in_flight: bool,
 }
 
 impl App {
@@ -148,21 +171,71 @@ impl App {
             overlay: None,
             pricing,
             pending_loads: Vec::new(),
+            refresh_fingerprint: RefreshFingerprint::default(),
+            refresh_in_flight: false,
+        }
+    }
+
+    fn selected_session_id(&self) -> Option<&str> {
+        let idx = self.list_state.selected()?;
+        self.sessions.get(idx).map(|s| s.id.as_str())
+    }
+
+    fn apply_sessions_refresh(
+        &mut self,
+        new_sessions: Vec<Session>,
+        new_fingerprint: RefreshFingerprint,
+    ) {
+        let prev_id = self.selected_session_id().map(str::to_owned);
+        let prev_idx = self.list_state.selected();
+
+        let (total_tokens, total_cost) =
+            session_totals(&new_sessions).map_or((0, None), |t| (t.total_tokens, t.total_cost));
+        self.sessions = new_sessions;
+        self.total_tokens = total_tokens;
+        self.total_cost = total_cost;
+        self.refresh_fingerprint = new_fingerprint;
+
+        if let Some(prev_id) = prev_id {
+            if let Some(new_idx) = self.sessions.iter().position(|s| s.id == prev_id) {
+                self.list_state.select(Some(new_idx));
+            } else if self.sessions.is_empty() {
+                self.list_state.select(None);
+            } else {
+                let fallback = prev_idx.unwrap_or(0).min(self.sessions.len() - 1);
+                self.list_state.select(Some(fallback));
+            }
+        } else if !self.sessions.is_empty() {
+            self.list_state.select_first();
         }
     }
 }
 
-#[allow(clippy::missing_errors_doc)]
-pub async fn run_tui<F, G>(
+fn build_refresh_request(app: &App) -> Option<LoadRequest> {
+    match (&app.tab, &app.view, &app.inputs) {
+        (Tab::Sessions, View::List, _) => Some(LoadRequest::RefreshSessions {
+            fingerprint: app.refresh_fingerprint.clone(),
+        }),
+        _ => None,
+    }
+}
+
+#[allow(clippy::missing_errors_doc, clippy::too_many_arguments)]
+pub async fn run_tui<F, G, H, I>(
     sessions: Vec<Session>,
     load_show: F,
     load_inputs: G,
+    load_sessions: H,
+    build_fingerprint: I,
+    initial_fingerprint: RefreshFingerprint,
     pricing: PricingData,
     default_tab: Tab,
 ) -> anyhow::Result<()>
 where
     F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>> + Send + Sync + 'static,
     G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync + 'static,
+    H: Fn() -> anyhow::Result<Vec<Session>> + Send + Sync + 'static,
+    I: Fn() -> anyhow::Result<RefreshFingerprint> + Send + Sync + 'static,
 {
     let mut terminal = ratatui::try_init()?;
     let result = run_event_loop(
@@ -170,6 +243,9 @@ where
         sessions,
         load_show,
         load_inputs,
+        load_sessions,
+        build_fingerprint,
+        initial_fingerprint,
         pricing,
         default_tab,
     )
@@ -178,24 +254,37 @@ where
     result
 }
 
-async fn run_event_loop<F, G>(
+#[allow(clippy::too_many_arguments)]
+async fn run_event_loop<F, G, H, I>(
     terminal: &mut DefaultTerminal,
     sessions: Vec<Session>,
     load_show: F,
     load_inputs: G,
+    load_sessions: H,
+    build_fingerprint: I,
+    initial_fingerprint: RefreshFingerprint,
     pricing: PricingData,
     default_tab: Tab,
 ) -> anyhow::Result<()>
 where
     F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>> + Send + Sync + 'static,
     G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync + 'static,
+    H: Fn() -> anyhow::Result<Vec<Session>> + Send + Sync + 'static,
+    I: Fn() -> anyhow::Result<RefreshFingerprint> + Send + Sync + 'static,
 {
     let mut app = App::new(sessions, pricing, default_tab);
+    app.refresh_fingerprint = initial_fingerprint;
     let mut event_stream = EventStream::new();
 
     let load_show: ShowLoader = Arc::new(load_show);
     let load_inputs: InputsLoader = Arc::new(load_inputs);
+    let load_sessions: SessionsLoader = Arc::new(load_sessions);
+    let build_fp: FingerprintBuilder = Arc::new(build_fingerprint);
     let (result_tx, mut result_rx) = mpsc::unbounded_channel::<LoadResult>();
+
+    let mut refresh_interval = time::interval(std::time::Duration::from_secs(3));
+    refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    refresh_interval.tick().await;
 
     if default_tab == Tab::Inputs {
         app.inputs = Some(InputsData::Loading);
@@ -203,7 +292,14 @@ where
     }
 
     loop {
-        drain_pending_loads(&mut app, &load_show, &load_inputs, &result_tx);
+        drain_pending_loads(
+            &mut app,
+            &load_show,
+            &load_inputs,
+            &load_sessions,
+            &build_fp,
+            &result_tx,
+        );
         terminal.draw(|frame| render(&mut app, frame))?;
 
         tokio::select! {
@@ -222,6 +318,14 @@ where
             Some(result) = result_rx.recv() => {
                 handle_load_result(&mut app, result);
             }
+            _ = refresh_interval.tick() => {
+                if !app.refresh_in_flight
+                    && let Some(request) = build_refresh_request(&app)
+                {
+                    app.refresh_in_flight = true;
+                    app.pending_loads.push(request);
+                }
+            }
         }
     }
     Ok(())
@@ -231,6 +335,8 @@ fn drain_pending_loads(
     app: &mut App,
     load_show: &ShowLoader,
     load_inputs: &InputsLoader,
+    load_sessions: &SessionsLoader,
+    build_fp: &FingerprintBuilder,
     result_tx: &mpsc::UnboundedSender<LoadResult>,
 ) {
     for request in app.pending_loads.drain(..) {
@@ -257,11 +363,37 @@ fn drain_pending_loads(
                 let loader = Arc::clone(load_inputs);
                 let tx = result_tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        loader()
-                    }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error: loader panicked")));
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader()))
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!("internal error: loader panicked"))
+                            });
                     let _ = tx.send(LoadResult::InputsData(result));
+                });
+            }
+            LoadRequest::RefreshSessions { fingerprint } => {
+                let fp_builder = Arc::clone(build_fp);
+                let loader = Arc::clone(load_sessions);
+                let tx = result_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<_> {
+                            let new_fp = fp_builder().ok()?;
+                            if new_fp == fingerprint {
+                                return None;
+                            }
+                            let sessions = loader().ok()?;
+                            Some((sessions, new_fp))
+                        }))
+                        .ok()
+                        .flatten();
+                    let _ = tx.send(match outcome {
+                        Some((sessions, fingerprint)) => LoadResult::SessionsData {
+                            sessions,
+                            fingerprint,
+                        },
+                        None => LoadResult::NoChange,
+                    });
                 });
             }
         }
@@ -315,6 +447,20 @@ fn handle_load_result(app: &mut App, result: LoadResult) {
                     app.inputs = Some(InputsData::Error(format!("{e}")));
                 }
             }
+        }
+        LoadResult::SessionsData {
+            sessions,
+            fingerprint,
+        } => {
+            if app.tab != Tab::Sessions || !matches!(app.view, View::List) {
+                app.refresh_in_flight = false;
+                return;
+            }
+            app.apply_sessions_refresh(sessions, fingerprint);
+            app.refresh_in_flight = false;
+        }
+        LoadResult::NoChange => {
+            app.refresh_in_flight = false;
         }
     }
 }
@@ -2552,5 +2698,172 @@ mod tests {
             output.contains("Loading inputs..."),
             "should render loading message; got:\n{output}",
         );
+    }
+
+    // --- Refresh fingerprint tests ---
+
+    #[test]
+    fn refresh_fingerprint_eq_same_entries() {
+        let mut a = RefreshFingerprint::default();
+        a.entries.insert(PathBuf::from("/a.jsonl"), 100);
+        a.entries.insert(PathBuf::from("/b.jsonl"), 200);
+        let mut b = RefreshFingerprint::default();
+        b.entries.insert(PathBuf::from("/b.jsonl"), 200);
+        b.entries.insert(PathBuf::from("/a.jsonl"), 100);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn refresh_fingerprint_ne_different_size() {
+        let mut a = RefreshFingerprint::default();
+        a.entries.insert(PathBuf::from("/a.jsonl"), 100);
+        let mut b = RefreshFingerprint::default();
+        b.entries.insert(PathBuf::from("/a.jsonl"), 200);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn refresh_fingerprint_ne_new_path() {
+        let mut a = RefreshFingerprint::default();
+        a.entries.insert(PathBuf::from("/a.jsonl"), 100);
+        let mut b = a.clone();
+        b.entries.insert(PathBuf::from("/c.jsonl"), 300);
+        assert_ne!(a, b);
+    }
+
+    // --- selected_session_id tests ---
+
+    #[test]
+    fn selected_session_id_returns_id() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.list_state.select(Some(1));
+        assert_eq!(app.selected_session_id(), Some("bbb"));
+    }
+
+    #[test]
+    fn selected_session_id_none_when_empty() {
+        let app = App::new(vec![], fixture_pricing_data(), Tab::Sessions);
+        assert_eq!(app.selected_session_id(), None);
+    }
+
+    // --- apply_sessions_refresh tests ---
+
+    #[test]
+    fn apply_sessions_refresh_preserves_selection_by_id() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.list_state.select(Some(1)); // "bbb"
+
+        let mut reordered = fixture_sessions();
+        reordered.reverse(); // ccc, bbb, aaa
+        app.apply_sessions_refresh(reordered, RefreshFingerprint::default());
+
+        assert_eq!(app.list_state.selected(), Some(1)); // "bbb" is now at index 1
+    }
+
+    #[test]
+    fn apply_sessions_refresh_falls_back_on_removed_session() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.list_state.select(Some(2)); // "ccc"
+
+        let mut shorter = fixture_sessions();
+        shorter.retain(|s| s.id != "ccc");
+        app.apply_sessions_refresh(shorter, RefreshFingerprint::default());
+
+        // Old index 2 is clamped to new_len - 1 = 1
+        assert_eq!(app.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn apply_sessions_refresh_updates_totals() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut updated = fixture_sessions();
+        updated[0].total_billable = 5000;
+        updated[0].cost_breakdown = Some(CostBreakdown {
+            output: 0.05,
+            ..CostBreakdown::default()
+        });
+        app.apply_sessions_refresh(updated, RefreshFingerprint::default());
+
+        assert_eq!(app.total_tokens, 5000 + 2500 + 3000);
+        let expected = 0.05 + 0.02 + 0.03;
+        assert!(
+            (app.total_cost.unwrap() - expected).abs() < 1e-10,
+            "expected {expected}, got {:?}",
+            app.total_cost,
+        );
+    }
+
+    // --- handle_load_result refresh tests ---
+
+    #[test]
+    fn handle_sessions_data_applies_in_list_view() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.refresh_in_flight = true;
+        let mut updated = fixture_sessions();
+        updated[0].total_billable = 9999;
+        handle_load_result(
+            &mut app,
+            LoadResult::SessionsData {
+                sessions: updated,
+                fingerprint: RefreshFingerprint::default(),
+            },
+        );
+        assert_eq!(app.sessions[0].total_billable, 9999);
+        assert!(!app.refresh_in_flight);
+    }
+
+    #[test]
+    fn handle_sessions_data_discarded_in_show_view() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        app.refresh_in_flight = true;
+        let original_count = app.sessions.len();
+        handle_load_result(
+            &mut app,
+            LoadResult::SessionsData {
+                sessions: vec![],
+                fingerprint: RefreshFingerprint::default(),
+            },
+        );
+        assert_eq!(app.sessions.len(), original_count);
+        assert!(!app.refresh_in_flight);
+    }
+
+    #[test]
+    fn handle_no_change_clears_in_flight() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.refresh_in_flight = true;
+        handle_load_result(&mut app, LoadResult::NoChange);
+        assert!(!app.refresh_in_flight);
+    }
+
+    // --- build_refresh_request tests ---
+
+    #[test]
+    fn build_refresh_request_returns_sessions_in_list() {
+        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let request = build_refresh_request(&app);
+        assert!(matches!(request, Some(LoadRequest::RefreshSessions { .. })));
+    }
+
+    #[test]
+    fn build_refresh_request_returns_none_in_show_loading() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.view = View::ShowLoading {
+            session_id: "aaa".to_string(),
+            header_label: "test".to_string(),
+        };
+        assert!(build_refresh_request(&app).is_none());
+    }
+
+    #[test]
+    fn build_refresh_request_returns_none_in_show_error() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.view = View::ShowError {
+            session_id: "aaa".to_string(),
+            header_label: "test".to_string(),
+            message: "fail".to_string(),
+        };
+        assert!(build_refresh_request(&app).is_none());
     }
 }

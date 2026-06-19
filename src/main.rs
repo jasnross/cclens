@@ -1,6 +1,6 @@
 mod cli;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use cclens::inventory::{InventoryConfig, discover_inventory};
 use cclens::parsing::parse_jsonl;
 use cclens::pricing;
 use cclens::rendering::{render_inputs, render_prices, render_session, render_table};
-use cclens::tui::{PricingData, Tab, run_tui};
+use cclens::tui::{PricingData, RefreshFingerprint, Tab, run_tui};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::{
@@ -135,6 +135,24 @@ fn load_sessions_data(
     Ok(sessions)
 }
 
+fn build_fingerprint(projects_dir: &Path) -> anyhow::Result<RefreshFingerprint> {
+    let project_entries = discover(projects_dir)?;
+    let mut entries = HashMap::new();
+    for project in &project_entries {
+        for session in &project.sessions {
+            if let Ok(meta) = std::fs::metadata(&session.jsonl) {
+                entries.insert(session.jsonl.clone(), meta.len());
+            }
+            for sub in &session.subagents {
+                if let Ok(meta) = std::fs::metadata(&sub.jsonl) {
+                    entries.insert(sub.jsonl.clone(), meta.len());
+                }
+            }
+        }
+    }
+    Ok(RefreshFingerprint { entries })
+}
+
 fn run_list(
     mode: RenderMode,
     projects_dir: &Path,
@@ -147,10 +165,6 @@ fn run_list(
     let sessions = load_sessions_data(projects_dir, &session_filter, &thresholds_filter, &catalog)?;
     match mode {
         RenderMode::Tui if !sessions.is_empty() => {
-            let inputs_filter = InputsFilter {
-                session_id: None,
-                scope: session_filter,
-            };
             let pricing_data = PricingData {
                 entries: catalog
                     .sorted_entries(false)
@@ -159,13 +173,29 @@ fn run_list(
                     .collect(),
                 cache_info: pricing::cache_info(),
             };
+            let initial_fingerprint = build_fingerprint(projects_dir).unwrap_or_default();
             let projects_dir_owned = projects_dir.to_path_buf();
+            let sessions_loader = {
+                let pd = projects_dir_owned.clone();
+                let cat = Arc::clone(&catalog);
+                let sf = session_filter.clone();
+                let tf = thresholds_filter;
+                move || load_sessions_data(&pd, &sf, &tf, &cat)
+            };
+            let fp_builder = {
+                let pd = projects_dir_owned.clone();
+                move || build_fingerprint(&pd)
+            };
             let show_loader = {
                 let pd = projects_dir_owned.clone();
                 let cat = Arc::clone(&catalog);
                 move |session_id: &str| {
                     load_show_detail(&pd, session_id, &cat, ThresholdsFilter::default())
                 }
+            };
+            let inputs_filter = InputsFilter {
+                session_id: None,
+                scope: session_filter,
             };
             let inputs_loader = {
                 let pd = projects_dir_owned;
@@ -179,6 +209,9 @@ fn run_list(
                 sessions,
                 show_loader,
                 inputs_loader,
+                sessions_loader,
+                fp_builder,
+                initial_fingerprint,
                 pricing_data,
                 Tab::Sessions,
             ));
@@ -309,7 +342,18 @@ fn run_inputs(
                     .collect(),
                 cache_info: pricing::cache_info(),
             };
+            let initial_fingerprint = build_fingerprint(projects_dir).unwrap_or_default();
             let projects_dir_owned = projects_dir.to_path_buf();
+            let sessions_loader = {
+                let pd = projects_dir_owned.clone();
+                let cat = Arc::clone(&catalog);
+                let sf = session_filter;
+                move || load_sessions_data(&pd, &sf, &ThresholdsFilter::default(), &cat)
+            };
+            let fp_builder = {
+                let pd = projects_dir_owned.clone();
+                move || build_fingerprint(&pd)
+            };
             let show_loader = {
                 let pd = projects_dir_owned.clone();
                 let cat = Arc::clone(&catalog);
@@ -338,6 +382,9 @@ fn run_inputs(
                 sessions,
                 show_loader,
                 inputs_loader,
+                sessions_loader,
+                fp_builder,
+                initial_fingerprint,
                 pricing_data,
                 Tab::Inputs,
             ));
