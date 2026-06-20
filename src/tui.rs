@@ -7,7 +7,7 @@
 //!
 //! Public API:
 //! - `Tab` — `Sessions` | `Inputs` — the active tab.
-//! - `RefreshFingerprint` — file-size fingerprint for change detection.
+//! - `RefreshFingerprint` — file-size + mtime fingerprint for change detection.
 //! - `PricingData` — owned pricing entries + cache staleness info,
 //!   constructed once before entering the TUI.
 //! - `run_tui<F, G, H, I>(Vec<Session>, F, G, H, I,
@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
@@ -50,7 +51,7 @@ type FingerprintBuilder = Arc<dyn Fn() -> anyhow::Result<RefreshFingerprint> + S
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RefreshFingerprint {
-    pub entries: HashMap<PathBuf, u64>,
+    pub entries: HashMap<PathBuf, (u64, SystemTime)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2876,30 +2877,33 @@ mod tests {
 
     #[test]
     fn refresh_fingerprint_eq_same_entries() {
+        let t = SystemTime::UNIX_EPOCH;
         let mut a = RefreshFingerprint::default();
-        a.entries.insert(PathBuf::from("/a.jsonl"), 100);
-        a.entries.insert(PathBuf::from("/b.jsonl"), 200);
+        a.entries.insert(PathBuf::from("/a.jsonl"), (100, t));
+        a.entries.insert(PathBuf::from("/b.jsonl"), (200, t));
         let mut b = RefreshFingerprint::default();
-        b.entries.insert(PathBuf::from("/b.jsonl"), 200);
-        b.entries.insert(PathBuf::from("/a.jsonl"), 100);
+        b.entries.insert(PathBuf::from("/b.jsonl"), (200, t));
+        b.entries.insert(PathBuf::from("/a.jsonl"), (100, t));
         assert_eq!(a, b);
     }
 
     #[test]
     fn refresh_fingerprint_ne_different_size() {
+        let t = SystemTime::UNIX_EPOCH;
         let mut a = RefreshFingerprint::default();
-        a.entries.insert(PathBuf::from("/a.jsonl"), 100);
+        a.entries.insert(PathBuf::from("/a.jsonl"), (100, t));
         let mut b = RefreshFingerprint::default();
-        b.entries.insert(PathBuf::from("/a.jsonl"), 200);
+        b.entries.insert(PathBuf::from("/a.jsonl"), (200, t));
         assert_ne!(a, b);
     }
 
     #[test]
     fn refresh_fingerprint_ne_new_path() {
+        let t = SystemTime::UNIX_EPOCH;
         let mut a = RefreshFingerprint::default();
-        a.entries.insert(PathBuf::from("/a.jsonl"), 100);
+        a.entries.insert(PathBuf::from("/a.jsonl"), (100, t));
         let mut b = a.clone();
-        b.entries.insert(PathBuf::from("/c.jsonl"), 300);
+        b.entries.insert(PathBuf::from("/c.jsonl"), (300, t));
         assert_ne!(a, b);
     }
 

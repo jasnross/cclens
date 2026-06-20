@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use cclens::aggregation::{
     SessionSummary, aggregate, dedup_assistant_turns, group_into_exchanges, prepare_exchanges,
@@ -138,14 +139,15 @@ fn load_sessions_data(
 fn build_fingerprint(projects_dir: &Path) -> anyhow::Result<RefreshFingerprint> {
     let project_entries = discover(projects_dir)?;
     let mut entries = HashMap::new();
+    let mtime = |meta: &std::fs::Metadata| meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     for project in &project_entries {
         for session in &project.sessions {
             if let Ok(meta) = std::fs::metadata(&session.jsonl) {
-                entries.insert(session.jsonl.clone(), meta.len());
+                entries.insert(session.jsonl.clone(), (meta.len(), mtime(&meta)));
             }
             for sub in &session.subagents {
                 if let Ok(meta) = std::fs::metadata(&sub.jsonl) {
-                    entries.insert(sub.jsonl.clone(), meta.len());
+                    entries.insert(sub.jsonl.clone(), (meta.len(), mtime(&meta)));
                 }
             }
         }
@@ -156,16 +158,26 @@ fn build_fingerprint(projects_dir: &Path) -> anyhow::Result<RefreshFingerprint> 
             let path = claude_dir.join(name);
             if path.is_file() {
                 if let Ok(meta) = std::fs::metadata(&path) {
-                    entries.insert(path, meta.len());
+                    entries.insert(path, (meta.len(), mtime(&meta)));
                 }
             } else if path.is_dir()
                 && let Ok(dir) = std::fs::read_dir(&path)
             {
                 for entry in dir.flatten() {
-                    if let Ok(meta) = entry.metadata()
-                        && meta.is_file()
-                    {
-                        entries.insert(entry.path(), meta.len());
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            entries.insert(entry.path(), (meta.len(), mtime(&meta)));
+                        } else if meta.is_dir()
+                            && let Ok(sub) = std::fs::read_dir(entry.path())
+                        {
+                            for child in sub.flatten() {
+                                if let Ok(cm) = child.metadata()
+                                    && cm.is_file()
+                                {
+                                    entries.insert(child.path(), (cm.len(), mtime(&cm)));
+                                }
+                            }
+                        }
                     }
                 }
             }
