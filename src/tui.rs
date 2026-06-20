@@ -126,6 +126,9 @@ enum LoadRequest {
         session_id: String,
         fingerprint: RefreshFingerprint,
     },
+    RefreshInputs {
+        fingerprint: RefreshFingerprint,
+    },
 }
 
 enum LoadResult {
@@ -136,7 +139,10 @@ enum LoadResult {
         refresh_fingerprint: Option<RefreshFingerprint>,
         is_refresh: bool,
     },
-    InputsData(anyhow::Result<(Vec<AttributionRow>, CoverageStats)>),
+    InputsData {
+        result: anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
+        refresh_fingerprint: Option<RefreshFingerprint>,
+    },
     SessionsData {
         sessions: Vec<Session>,
         fingerprint: RefreshFingerprint,
@@ -225,6 +231,9 @@ fn build_refresh_request(app: &App) -> Option<LoadRequest> {
         }),
         (Tab::Sessions, View::Show { session_id, .. }, _) => Some(LoadRequest::RefreshShow {
             session_id: session_id.clone(),
+            fingerprint: app.refresh_fingerprint.clone(),
+        }),
+        (Tab::Inputs, _, Some(InputsData::Loaded(_))) => Some(LoadRequest::RefreshInputs {
             fingerprint: app.refresh_fingerprint.clone(),
         }),
         _ => None,
@@ -342,6 +351,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn drain_pending_loads(
     app: &mut App,
     load_show: &ShowLoader,
@@ -381,7 +391,10 @@ fn drain_pending_loads(
                             .unwrap_or_else(|_| {
                                 Err(anyhow::anyhow!("internal error: loader panicked"))
                             });
-                    let _ = tx.send(LoadResult::InputsData(result));
+                    let _ = tx.send(LoadResult::InputsData {
+                        result,
+                        refresh_fingerprint: None,
+                    });
                 });
             }
             LoadRequest::RefreshShow {
@@ -440,10 +453,36 @@ fn drain_pending_loads(
                     });
                 });
             }
+            LoadRequest::RefreshInputs { fingerprint } => {
+                let fp_builder = Arc::clone(build_fp);
+                let loader = Arc::clone(load_inputs);
+                let tx = result_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<_> {
+                            let new_fp = fp_builder().ok()?;
+                            if new_fp == fingerprint {
+                                return None;
+                            }
+                            let result = loader();
+                            Some((new_fp, result))
+                        }))
+                        .ok()
+                        .flatten();
+                    let _ = tx.send(match outcome {
+                        Some((new_fp, result)) => LoadResult::InputsData {
+                            result,
+                            refresh_fingerprint: Some(new_fp),
+                        },
+                        None => LoadResult::NoChange,
+                    });
+                });
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_load_result(app: &mut App, result: LoadResult) {
     match result {
         LoadResult::ShowDetail {
@@ -511,17 +550,55 @@ fn handle_load_result(app: &mut App, result: LoadResult) {
                 app.refresh_in_flight = false;
             }
         }
-        LoadResult::InputsData(result) => {
-            if !matches!(&app.inputs, Some(InputsData::Loading)) {
-                return;
+        LoadResult::InputsData {
+            result,
+            refresh_fingerprint,
+        } => {
+            let is_user_triggered =
+                refresh_fingerprint.is_none() && matches!(&app.inputs, Some(InputsData::Loading));
+            let is_refresh_triggered =
+                refresh_fingerprint.is_some() && matches!(&app.inputs, Some(InputsData::Loaded(_)));
+
+            if is_user_triggered {
+                match result {
+                    Ok((rows, coverage)) => {
+                        app.inputs = Some(InputsData::Loaded(InputsState::new(rows, coverage)));
+                    }
+                    Err(e) => {
+                        app.inputs = Some(InputsData::Error(format!("{e}")));
+                    }
+                }
+            } else if is_refresh_triggered
+                && let Ok((new_rows, new_coverage)) = result
+                && let Some(InputsData::Loaded(state)) = &mut app.inputs
+            {
+                let prev_path = state
+                    .table_state
+                    .selected()
+                    .and_then(|idx| state.rows.get(idx))
+                    .map(|r| r.file.path.clone());
+                let prev_idx = state.table_state.selected();
+
+                state.rows = new_rows;
+                state.coverage = new_coverage;
+
+                if let Some(prev_path) = prev_path {
+                    if let Some(new_idx) = state.rows.iter().position(|r| r.file.path == prev_path)
+                    {
+                        state.table_state.select(Some(new_idx));
+                    } else if state.rows.is_empty() {
+                        state.table_state.select(None);
+                    } else {
+                        let fallback = prev_idx.unwrap_or(0).min(state.rows.len() - 1);
+                        state.table_state.select(Some(fallback));
+                    }
+                } else if !state.rows.is_empty() {
+                    state.table_state.select_first();
+                }
             }
-            match result {
-                Ok((rows, coverage)) => {
-                    app.inputs = Some(InputsData::Loaded(InputsState::new(rows, coverage)));
-                }
-                Err(e) => {
-                    app.inputs = Some(InputsData::Error(format!("{e}")));
-                }
+            if let Some(fp) = refresh_fingerprint {
+                app.refresh_fingerprint = fp;
+                app.refresh_in_flight = false;
             }
         }
         LoadResult::SessionsData {
@@ -2135,7 +2212,10 @@ mod tests {
         assert!(matches!(app.inputs, Some(InputsData::Loading)));
         handle_load_result(
             &mut app,
-            LoadResult::InputsData(Ok((fixture_attribution_rows(), fixture_coverage_stats()))),
+            LoadResult::InputsData {
+                result: Ok((fixture_attribution_rows(), fixture_coverage_stats())),
+                refresh_fingerprint: None,
+            },
         );
         assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
         app.pending_loads.clear();
@@ -2725,7 +2805,10 @@ mod tests {
         app.inputs = Some(InputsData::Loading);
         handle_load_result(
             &mut app,
-            LoadResult::InputsData(Ok((fixture_attribution_rows(), fixture_coverage_stats()))),
+            LoadResult::InputsData {
+                result: Ok((fixture_attribution_rows(), fixture_coverage_stats())),
+                refresh_fingerprint: None,
+            },
         );
         assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
     }
@@ -2736,7 +2819,10 @@ mod tests {
         app.inputs = Some(InputsData::Loading);
         handle_load_result(
             &mut app,
-            LoadResult::InputsData(Err(anyhow::anyhow!("load failed"))),
+            LoadResult::InputsData {
+                result: Err(anyhow::anyhow!("load failed")),
+                refresh_fingerprint: None,
+            },
         );
         assert!(matches!(app.inputs, Some(InputsData::Error(_))));
     }
@@ -2750,7 +2836,10 @@ mod tests {
         )));
         handle_load_result(
             &mut app,
-            LoadResult::InputsData(Ok((vec![], fixture_coverage_stats()))),
+            LoadResult::InputsData {
+                result: Ok((vec![], fixture_coverage_stats())),
+                refresh_fingerprint: None,
+            },
         );
         assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
         assert_eq!(inputs_table_selected(&app), Some(0));
@@ -3104,6 +3193,93 @@ mod tests {
         } else {
             panic!("expected View::Show");
         }
+        assert!(!app.refresh_in_flight);
+    }
+
+    // --- Phase 3: Inputs view refresh tests ---
+
+    #[test]
+    fn build_refresh_request_returns_inputs_when_loaded() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        let request = build_refresh_request(&app);
+        assert!(matches!(request, Some(LoadRequest::RefreshInputs { .. })));
+    }
+
+    #[test]
+    fn build_refresh_request_returns_none_inputs_loading() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loading);
+        assert!(build_refresh_request(&app).is_none());
+    }
+
+    #[test]
+    fn refresh_inputs_preserves_selection_by_path() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        // Select the second row (skill at index 1)
+        if let Some(InputsData::Loaded(state)) = &mut app.inputs {
+            state.table_state.select(Some(1));
+        }
+        app.refresh_in_flight = true;
+
+        let mut reordered = fixture_attribution_rows();
+        reordered.reverse(); // project, skill, global → skill is now at index 1
+        let new_coverage = fixture_coverage_stats();
+
+        handle_load_result(
+            &mut app,
+            LoadResult::InputsData {
+                result: Ok((reordered, new_coverage)),
+                refresh_fingerprint: Some(RefreshFingerprint::default()),
+            },
+        );
+
+        // skill path is "/home/user/.claude/skills/foo/SKILL.md" — find its new index
+        if let Some(InputsData::Loaded(state)) = &app.inputs {
+            let selected = state.table_state.selected();
+            let selected_path = selected.and_then(|idx| state.rows.get(idx));
+            assert!(
+                selected_path.is_some_and(|r| r.file.path.to_string_lossy().contains("skills")),
+                "selection should track by file path to the skill row",
+            );
+        } else {
+            panic!("expected InputsData::Loaded");
+        }
+        assert!(!app.refresh_in_flight);
+    }
+
+    #[test]
+    fn refresh_inputs_falls_back_on_removed_row() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        // Select the last row (index 2)
+        if let Some(InputsData::Loaded(state)) = &mut app.inputs {
+            state.table_state.select(Some(2));
+        }
+        app.refresh_in_flight = true;
+
+        // Refresh with only one row — the previously selected row is gone
+        let single_row = vec![fixture_attribution_rows().remove(0)];
+        handle_load_result(
+            &mut app,
+            LoadResult::InputsData {
+                result: Ok((single_row, fixture_coverage_stats())),
+                refresh_fingerprint: Some(RefreshFingerprint::default()),
+            },
+        );
+
+        // Old index 2 should fall back to min(2, 0) = 0
+        assert_eq!(inputs_table_selected(&app), Some(0));
         assert!(!app.refresh_in_flight);
     }
 }

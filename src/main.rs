@@ -150,6 +150,27 @@ fn build_fingerprint(projects_dir: &Path) -> anyhow::Result<RefreshFingerprint> 
             }
         }
     }
+    if let Some(home) = dirs::home_dir() {
+        let claude_dir = home.join(".claude");
+        for name in ["CLAUDE.md", "rules", "skills", "agents"] {
+            let path = claude_dir.join(name);
+            if path.is_file() {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    entries.insert(path, meta.len());
+                }
+            } else if path.is_dir()
+                && let Ok(dir) = std::fs::read_dir(&path)
+            {
+                for entry in dir.flatten() {
+                    if let Ok(meta) = entry.metadata()
+                        && meta.is_file()
+                    {
+                        entries.insert(entry.path(), meta.len());
+                    }
+                }
+            }
+        }
+    }
     Ok(RefreshFingerprint { entries })
 }
 
