@@ -145,7 +145,7 @@ enum LoadResult {
         refresh_fingerprint: Option<RefreshFingerprint>,
     },
     SessionsData {
-        sessions: Vec<Session>,
+        result: anyhow::Result<Vec<Session>>,
         fingerprint: RefreshFingerprint,
     },
     NoChange,
@@ -440,14 +440,14 @@ fn drain_pending_loads(
                             if new_fp == fingerprint {
                                 return None;
                             }
-                            let sessions = loader().ok()?;
-                            Some((sessions, new_fp))
+                            let result = loader();
+                            Some((new_fp, result))
                         }))
                         .ok()
                         .flatten();
                     let _ = tx.send(match outcome {
-                        Some((sessions, fingerprint)) => LoadResult::SessionsData {
-                            sessions,
+                        Some((fingerprint, result)) => LoadResult::SessionsData {
+                            result,
                             fingerprint,
                         },
                         None => LoadResult::NoChange,
@@ -603,14 +603,16 @@ fn handle_load_result(app: &mut App, result: LoadResult) {
             }
         }
         LoadResult::SessionsData {
-            sessions,
+            result,
             fingerprint,
         } => {
             if app.tab != Tab::Sessions || !matches!(app.view, View::List) {
                 app.refresh_in_flight = false;
                 return;
             }
-            app.apply_sessions_refresh(sessions, fingerprint);
+            if let Ok(sessions) = result {
+                app.apply_sessions_refresh(sessions, fingerprint);
+            }
             app.refresh_in_flight = false;
         }
         LoadResult::NoChange => {
@@ -2980,7 +2982,7 @@ mod tests {
         handle_load_result(
             &mut app,
             LoadResult::SessionsData {
-                sessions: updated,
+                result: Ok(updated),
                 fingerprint: RefreshFingerprint::default(),
             },
         );
@@ -2997,7 +2999,7 @@ mod tests {
         handle_load_result(
             &mut app,
             LoadResult::SessionsData {
-                sessions: vec![],
+                result: Ok(vec![]),
                 fingerprint: RefreshFingerprint::default(),
             },
         );
