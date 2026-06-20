@@ -101,6 +101,7 @@ enum View {
         header_label: String,
     },
     Show {
+        session_id: String,
         header_label: String,
         prepared: Vec<PreparedExchange>,
         table_state: TableState,
@@ -121,6 +122,10 @@ enum LoadRequest {
     RefreshSessions {
         fingerprint: RefreshFingerprint,
     },
+    RefreshShow {
+        session_id: String,
+        fingerprint: RefreshFingerprint,
+    },
 }
 
 enum LoadResult {
@@ -128,6 +133,8 @@ enum LoadResult {
         session_id: String,
         header_label: String,
         result: anyhow::Result<Vec<PreparedExchange>>,
+        refresh_fingerprint: Option<RefreshFingerprint>,
+        is_refresh: bool,
     },
     InputsData(anyhow::Result<(Vec<AttributionRow>, CoverageStats)>),
     SessionsData {
@@ -214,6 +221,10 @@ impl App {
 fn build_refresh_request(app: &App) -> Option<LoadRequest> {
     match (&app.tab, &app.view, &app.inputs) {
         (Tab::Sessions, View::List, _) => Some(LoadRequest::RefreshSessions {
+            fingerprint: app.refresh_fingerprint.clone(),
+        }),
+        (Tab::Sessions, View::Show { session_id, .. }, _) => Some(LoadRequest::RefreshShow {
+            session_id: session_id.clone(),
             fingerprint: app.refresh_fingerprint.clone(),
         }),
         _ => None,
@@ -356,6 +367,8 @@ fn drain_pending_loads(
                         session_id,
                         header_label,
                         result,
+                        refresh_fingerprint: None,
+                        is_refresh: false,
                     });
                 });
             }
@@ -369,6 +382,37 @@ fn drain_pending_loads(
                                 Err(anyhow::anyhow!("internal error: loader panicked"))
                             });
                     let _ = tx.send(LoadResult::InputsData(result));
+                });
+            }
+            LoadRequest::RefreshShow {
+                session_id,
+                fingerprint,
+            } => {
+                let fp_builder = Arc::clone(build_fp);
+                let loader = Arc::clone(load_show);
+                let tx = result_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<_> {
+                            let new_fp = fp_builder().ok()?;
+                            if new_fp == fingerprint {
+                                return None;
+                            }
+                            let result = loader(&session_id);
+                            Some((session_id, new_fp, result))
+                        }))
+                        .ok()
+                        .flatten();
+                    let _ = tx.send(match outcome {
+                        Some((session_id, new_fingerprint, result)) => LoadResult::ShowDetail {
+                            session_id,
+                            header_label: String::new(),
+                            result,
+                            refresh_fingerprint: Some(new_fingerprint),
+                            is_refresh: true,
+                        },
+                        None => LoadResult::NoChange,
+                    });
                 });
             }
             LoadRequest::RefreshSessions { fingerprint } => {
@@ -406,33 +450,65 @@ fn handle_load_result(app: &mut App, result: LoadResult) {
             session_id,
             header_label,
             result,
+            refresh_fingerprint,
+            is_refresh,
         } => {
-            let is_current = matches!(
-                &app.view,
-                View::ShowLoading { session_id: sid, .. } if *sid == session_id
-            );
-            if !is_current {
-                return;
-            }
-            match result {
-                Ok(prepared) => {
-                    let mut table_state = TableState::default();
-                    if !prepared.is_empty() {
-                        table_state.select_first();
+            let is_user_triggered = !is_refresh
+                && matches!(
+                    &app.view,
+                    View::ShowLoading { session_id: sid, .. } if *sid == session_id
+                );
+            let is_refresh_triggered = is_refresh
+                && matches!(
+                    &app.view,
+                    View::Show { session_id: sid, .. } if *sid == session_id
+                );
+
+            if is_user_triggered {
+                match result {
+                    Ok(prepared) => {
+                        let mut table_state = TableState::default();
+                        if !prepared.is_empty() {
+                            table_state.select_first();
+                        }
+                        app.view = View::Show {
+                            session_id,
+                            header_label,
+                            prepared,
+                            table_state,
+                        };
                     }
-                    app.view = View::Show {
-                        header_label,
-                        prepared,
-                        table_state,
-                    };
+                    Err(e) => {
+                        app.view = View::ShowError {
+                            session_id,
+                            header_label,
+                            message: format!("{e}"),
+                        };
+                    }
                 }
-                Err(e) => {
-                    app.view = View::ShowError {
-                        session_id,
-                        header_label,
-                        message: format!("{e}"),
-                    };
+            } else if is_refresh_triggered
+                && let Ok(new_prepared) = result
+                && let View::Show {
+                    prepared,
+                    table_state,
+                    ..
+                } = &mut app.view
+            {
+                let row_count: usize = prepared.iter().map(|e| e.rows.len()).sum();
+                let was_at_end = row_count > 0 && table_state.selected() == Some(row_count - 1);
+                *prepared = new_prepared;
+                if was_at_end {
+                    let new_row_count: usize = prepared.iter().map(|e| e.rows.len()).sum();
+                    if new_row_count > 0 {
+                        table_state.select(Some(new_row_count - 1));
+                    }
                 }
+            }
+            if is_refresh {
+                if let Some(fp) = refresh_fingerprint {
+                    app.refresh_fingerprint = fp;
+                }
+                app.refresh_in_flight = false;
             }
         }
         LoadResult::InputsData(result) => {
@@ -1499,6 +1575,7 @@ mod tests {
         let mut table_state = TableState::default();
         table_state.select_first();
         app.view = View::Show {
+            session_id: "aaa".to_string(),
             header_label: "\"First session\" (alpha)".to_string(),
             prepared: fixture_prepared_exchanges(),
             table_state,
@@ -2599,6 +2676,8 @@ mod tests {
                 session_id: "aaa".to_string(),
                 header_label: "test".to_string(),
                 result: Ok(fixture_prepared_exchanges()),
+                refresh_fingerprint: None,
+                is_refresh: false,
             },
         );
         assert!(matches!(app.view, View::Show { .. }));
@@ -2617,6 +2696,8 @@ mod tests {
                 session_id: "aaa".to_string(),
                 header_label: "test".to_string(),
                 result: Err(anyhow::anyhow!("load failed")),
+                refresh_fingerprint: None,
+                is_refresh: false,
             },
         );
         assert!(matches!(app.view, View::ShowError { .. }));
@@ -2631,6 +2712,8 @@ mod tests {
                 session_id: "aaa".to_string(),
                 header_label: "test".to_string(),
                 result: Ok(fixture_prepared_exchanges()),
+                refresh_fingerprint: None,
+                is_refresh: false,
             },
         );
         assert!(matches!(app.view, View::List));
@@ -2865,5 +2948,162 @@ mod tests {
             message: "fail".to_string(),
         };
         assert!(build_refresh_request(&app).is_none());
+    }
+
+    // --- Phase 2: Show view refresh tests ---
+
+    #[test]
+    fn build_refresh_request_returns_show_in_show_view() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        let request = build_refresh_request(&app);
+        assert!(matches!(
+            request,
+            Some(LoadRequest::RefreshShow {
+                session_id,
+                ..
+            }) if session_id == "aaa"
+        ));
+    }
+
+    #[test]
+    fn refresh_show_auto_scrolls_when_at_end() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        // Select last row (index 2 — 3 rows from fixture_prepared_exchanges)
+        if let View::Show { table_state, .. } = &mut app.view {
+            table_state.select(Some(2));
+        }
+        app.refresh_in_flight = true;
+
+        let mut new_prepared = fixture_prepared_exchanges();
+        new_prepared.push(PreparedExchange {
+            origin: TurnOrigin::Parent,
+            rows: vec![
+                PreparedRow {
+                    timestamp: Some("2026-04-01T10:03:00Z".parse::<DateTime<Utc>>().unwrap()),
+                    role: PreparedRowRole::User,
+                    tokens: Some(100),
+                    cost: None,
+                    cumulative_tokens: 1100,
+                    cumulative_cost: None,
+                    content: "New exchange".to_string(),
+                    tool_use_count: 0,
+                },
+                PreparedRow {
+                    timestamp: Some("2026-04-01T10:04:00Z".parse::<DateTime<Utc>>().unwrap()),
+                    role: PreparedRowRole::Assistant,
+                    tokens: Some(100),
+                    cost: None,
+                    cumulative_tokens: 1200,
+                    cumulative_cost: None,
+                    content: "Response".to_string(),
+                    tool_use_count: 0,
+                },
+            ],
+        });
+        let total_rows = new_prepared.iter().map(|e| e.rows.len()).sum::<usize>();
+
+        handle_load_result(
+            &mut app,
+            LoadResult::ShowDetail {
+                session_id: "aaa".to_string(),
+                header_label: String::new(),
+                result: Ok(new_prepared),
+                refresh_fingerprint: Some(RefreshFingerprint::default()),
+                is_refresh: true,
+            },
+        );
+
+        if let View::Show { table_state, .. } = &app.view {
+            assert_eq!(
+                table_state.selected(),
+                Some(total_rows - 1),
+                "should auto-scroll to new last row",
+            );
+        } else {
+            panic!("expected View::Show");
+        }
+        assert!(!app.refresh_in_flight);
+    }
+
+    #[test]
+    fn refresh_show_holds_position_when_scrolled_up() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        // Select middle row (index 1)
+        if let View::Show { table_state, .. } = &mut app.view {
+            table_state.select(Some(1));
+        }
+        app.refresh_in_flight = true;
+
+        let mut new_prepared = fixture_prepared_exchanges();
+        new_prepared.push(PreparedExchange {
+            origin: TurnOrigin::Parent,
+            rows: vec![PreparedRow {
+                timestamp: Some("2026-04-01T10:05:00Z".parse::<DateTime<Utc>>().unwrap()),
+                role: PreparedRowRole::User,
+                tokens: Some(100),
+                cost: None,
+                cumulative_tokens: 1100,
+                cumulative_cost: None,
+                content: "Another one".to_string(),
+                tool_use_count: 0,
+            }],
+        });
+
+        handle_load_result(
+            &mut app,
+            LoadResult::ShowDetail {
+                session_id: "aaa".to_string(),
+                header_label: String::new(),
+                result: Ok(new_prepared),
+                refresh_fingerprint: Some(RefreshFingerprint::default()),
+                is_refresh: true,
+            },
+        );
+
+        if let View::Show { table_state, .. } = &app.view {
+            assert_eq!(
+                table_state.selected(),
+                Some(1),
+                "should hold position when scrolled up",
+            );
+        } else {
+            panic!("expected View::Show");
+        }
+        assert!(!app.refresh_in_flight);
+    }
+
+    #[test]
+    fn refresh_show_discarded_when_session_mismatch() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app); // viewing session "aaa"
+        app.refresh_in_flight = true;
+
+        handle_load_result(
+            &mut app,
+            LoadResult::ShowDetail {
+                session_id: "bbb".to_string(),
+                header_label: String::new(),
+                result: Ok(vec![]),
+                refresh_fingerprint: Some(RefreshFingerprint::default()),
+                is_refresh: true,
+            },
+        );
+
+        // View should be unchanged — still showing "aaa"'s data
+        if let View::Show {
+            session_id,
+            prepared,
+            ..
+        } = &app.view
+        {
+            assert_eq!(session_id, "aaa");
+            assert!(!prepared.is_empty(), "data should be unchanged");
+        } else {
+            panic!("expected View::Show");
+        }
+        assert!(!app.refresh_in_flight);
     }
 }
