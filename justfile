@@ -6,12 +6,16 @@ default:
 build:
     cargo build
 
+run *args:
+    cargo run -- {{ args }}
+
 # Run tests
 test:
     cargo test
 
 # Format source files
 fmt:
+    just --fmt
     cargo +nightly fmt
     cargo fix --allow-dirty
     prettier -w ./**/*.md
