@@ -10,13 +10,13 @@
 //! - `RefreshFingerprint` — file-size + mtime fingerprint for change detection.
 //! - `PricingData` — owned pricing entries + cache staleness info,
 //!   constructed once before entering the TUI.
-//! - `run_tui<F, G, H, I>(Vec<Session>, F, G, H, I,
+//! - `run_tui<F, G, H, I, J>(Vec<Session>, F, G, H, I, J,
 //!   RefreshFingerprint, PricingData, Tab) -> anyhow::Result<()>`
 //!   — fullscreen TUI with tab switching (1/2 keys), scrollable
 //!   tables, session drill-down (Enter/Esc within Sessions tab),
 //!   attribution table with coverage footer (Inputs tab), pricing
-//!   overlay (`p` toggles, Esc/q closes), and timer-driven
-//!   auto-refresh (3s interval, fingerprint-gated).
+//!   overlay (`p` toggles, `r` refreshes, Esc/q closes), and
+//!   timer-driven auto-refresh (3s interval, fingerprint-gated).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -48,6 +48,7 @@ type InputsLoader =
     Arc<dyn Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync>;
 type SessionsLoader = Arc<dyn Fn() -> anyhow::Result<Vec<Session>> + Send + Sync>;
 type FingerprintBuilder = Arc<dyn Fn() -> anyhow::Result<RefreshFingerprint> + Send + Sync>;
+type PricingLoader = Arc<dyn Fn() -> anyhow::Result<PricingData> + Send + Sync>;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RefreshFingerprint {
@@ -130,6 +131,7 @@ enum LoadRequest {
     RefreshInputs {
         fingerprint: RefreshFingerprint,
     },
+    RefreshPricing,
 }
 
 enum LoadResult {
@@ -148,6 +150,9 @@ enum LoadResult {
         result: anyhow::Result<Vec<Session>>,
         fingerprint: RefreshFingerprint,
     },
+    Pricing {
+        result: anyhow::Result<PricingData>,
+    },
     NoChange,
 }
 
@@ -164,6 +169,7 @@ struct App {
     pending_loads: Vec<LoadRequest>,
     refresh_fingerprint: RefreshFingerprint,
     refresh_in_flight: bool,
+    pricing_refresh_in_flight: bool,
 }
 
 impl App {
@@ -187,6 +193,7 @@ impl App {
             pending_loads: Vec::new(),
             refresh_fingerprint: RefreshFingerprint::default(),
             refresh_in_flight: false,
+            pricing_refresh_in_flight: false,
         }
     }
 
@@ -242,12 +249,13 @@ fn build_refresh_request(app: &App) -> Option<LoadRequest> {
 }
 
 #[allow(clippy::missing_errors_doc, clippy::too_many_arguments)]
-pub async fn run_tui<F, G, H, I>(
+pub async fn run_tui<F, G, H, I, J>(
     sessions: Vec<Session>,
     load_show: F,
     load_inputs: G,
     load_sessions: H,
     build_fingerprint: I,
+    load_pricing: J,
     initial_fingerprint: RefreshFingerprint,
     pricing: PricingData,
     default_tab: Tab,
@@ -257,6 +265,7 @@ where
     G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync + 'static,
     H: Fn() -> anyhow::Result<Vec<Session>> + Send + Sync + 'static,
     I: Fn() -> anyhow::Result<RefreshFingerprint> + Send + Sync + 'static,
+    J: Fn() -> anyhow::Result<PricingData> + Send + Sync + 'static,
 {
     let mut terminal = ratatui::try_init()?;
     let result = run_event_loop(
@@ -266,6 +275,7 @@ where
         load_inputs,
         load_sessions,
         build_fingerprint,
+        load_pricing,
         initial_fingerprint,
         pricing,
         default_tab,
@@ -276,13 +286,14 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_event_loop<F, G, H, I>(
+async fn run_event_loop<F, G, H, I, J>(
     terminal: &mut DefaultTerminal,
     sessions: Vec<Session>,
     load_show: F,
     load_inputs: G,
     load_sessions: H,
     build_fingerprint: I,
+    load_pricing: J,
     initial_fingerprint: RefreshFingerprint,
     pricing: PricingData,
     default_tab: Tab,
@@ -292,6 +303,7 @@ where
     G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync + 'static,
     H: Fn() -> anyhow::Result<Vec<Session>> + Send + Sync + 'static,
     I: Fn() -> anyhow::Result<RefreshFingerprint> + Send + Sync + 'static,
+    J: Fn() -> anyhow::Result<PricingData> + Send + Sync + 'static,
 {
     let mut app = App::new(sessions, pricing, default_tab);
     app.refresh_fingerprint = initial_fingerprint;
@@ -301,6 +313,7 @@ where
     let load_inputs: InputsLoader = Arc::new(load_inputs);
     let load_sessions: SessionsLoader = Arc::new(load_sessions);
     let build_fp: FingerprintBuilder = Arc::new(build_fingerprint);
+    let load_pricing: PricingLoader = Arc::new(load_pricing);
     let (result_tx, mut result_rx) = mpsc::unbounded_channel::<LoadResult>();
 
     let mut refresh_interval = time::interval(std::time::Duration::from_secs(3));
@@ -319,6 +332,7 @@ where
             &load_inputs,
             &load_sessions,
             &build_fp,
+            &load_pricing,
             &result_tx,
         );
         terminal.draw(|frame| render(&mut app, frame))?;
@@ -359,6 +373,7 @@ fn drain_pending_loads(
     load_inputs: &InputsLoader,
     load_sessions: &SessionsLoader,
     build_fp: &FingerprintBuilder,
+    load_pricing: &PricingLoader,
     result_tx: &mpsc::UnboundedSender<LoadResult>,
 ) {
     for request in app.pending_loads.drain(..) {
@@ -477,6 +492,18 @@ fn drain_pending_loads(
                         },
                         None => LoadResult::NoChange,
                     });
+                });
+            }
+            LoadRequest::RefreshPricing => {
+                let loader = Arc::clone(load_pricing);
+                let tx = result_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader()))
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!("internal error: loader panicked"))
+                            });
+                    let _ = tx.send(LoadResult::Pricing { result });
                 });
             }
         }
@@ -615,6 +642,12 @@ fn handle_load_result(app: &mut App, result: LoadResult) {
             }
             app.refresh_in_flight = false;
         }
+        LoadResult::Pricing { result } => {
+            if let Ok(pricing) = result {
+                app.pricing = pricing;
+            }
+            app.pricing_refresh_in_flight = false;
+        }
         LoadResult::NoChange => {
             app.refresh_in_flight = false;
         }
@@ -629,6 +662,12 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc | KeyCode::Char('p' | 'q') => {
                 app.overlay = None;
+            }
+            KeyCode::Char('r') => {
+                if !app.pricing_refresh_in_flight {
+                    app.pricing_refresh_in_flight = true;
+                    app.pending_loads.push(LoadRequest::RefreshPricing);
+                }
             }
             KeyCode::Backspace
             | KeyCode::Enter
@@ -1443,8 +1482,12 @@ fn render_pricing_overlay(app: &App, frame: &mut Frame) {
     let table = Table::new(rows, widths).header(header);
     frame.render_widget(table, table_area);
 
-    let staleness = format_cache_staleness(&app.pricing.cache_info);
-    let footer = Line::from(format!(" {staleness}  Esc close")).dim();
+    let footer = if app.pricing_refresh_in_flight {
+        Line::from(" refreshing\u{2026}  Esc close").dim()
+    } else {
+        let staleness = format_cache_staleness(&app.pricing.cache_info);
+        Line::from(format!(" {staleness}  r refresh  Esc close")).dim()
+    };
     frame.render_widget(Paragraph::new(footer), footer_area);
 }
 
@@ -2596,6 +2639,104 @@ mod tests {
         assert!(
             !output.contains("Pricing ($/MTok)"),
             "overlay should not appear when closed; got:\n{output}",
+        );
+    }
+
+    // --- Pricing refresh tests ---
+
+    #[test]
+    fn r_in_overlay_pushes_pricing_refresh_request() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('p')));
+        handle_key_event(&mut app, key_event(KeyCode::Char('r')));
+        assert!(app.pricing_refresh_in_flight);
+        assert_eq!(app.pending_loads.len(), 1);
+        assert!(matches!(app.pending_loads[0], LoadRequest::RefreshPricing));
+    }
+
+    #[test]
+    fn r_in_overlay_while_refresh_in_flight_is_noop() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.overlay = Some(Overlay::Pricing);
+        app.pricing_refresh_in_flight = true;
+        handle_key_event(&mut app, key_event(KeyCode::Char('r')));
+        assert!(app.pending_loads.is_empty());
+    }
+
+    #[test]
+    fn r_without_overlay_does_not_trigger_pricing_refresh() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('r')));
+        assert!(
+            !app.pending_loads
+                .iter()
+                .any(|r| matches!(r, LoadRequest::RefreshPricing))
+        );
+    }
+
+    #[test]
+    fn handle_load_result_pricing_success_updates_data() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.pricing_refresh_in_flight = true;
+        let new_pricing = PricingData {
+            entries: vec![(
+                "claude-test".to_string(),
+                fixture_pricing_data().entries[0].1,
+            )],
+            cache_info: CacheInfo {
+                path: None,
+                exists: true,
+                last_modified: Some(SystemTime::now()),
+                size: 2048,
+                entry_count: Some(1),
+            },
+        };
+        handle_load_result(
+            &mut app,
+            LoadResult::Pricing {
+                result: Ok(new_pricing),
+            },
+        );
+        assert_eq!(app.pricing.entries.len(), 1);
+        assert_eq!(app.pricing.entries[0].0, "claude-test");
+        assert!(!app.pricing_refresh_in_flight);
+    }
+
+    #[test]
+    fn handle_load_result_pricing_error_keeps_old_data() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.pricing_refresh_in_flight = true;
+        let original_len = app.pricing.entries.len();
+        handle_load_result(
+            &mut app,
+            LoadResult::Pricing {
+                result: Err(anyhow::anyhow!("network error")),
+            },
+        );
+        assert_eq!(app.pricing.entries.len(), original_len);
+        assert!(!app.pricing_refresh_in_flight);
+    }
+
+    #[test]
+    fn pricing_overlay_footer_shows_refresh_hint() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.overlay = Some(Overlay::Pricing);
+        let output = render_app(&mut app, 100, 20);
+        assert!(
+            output.contains("r refresh"),
+            "overlay footer should contain 'r refresh'; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn pricing_overlay_footer_shows_refreshing_state() {
+        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.overlay = Some(Overlay::Pricing);
+        app.pricing_refresh_in_flight = true;
+        let output = render_app(&mut app, 100, 20);
+        assert!(
+            output.contains("refreshing"),
+            "overlay footer should contain 'refreshing' during refresh; got:\n{output}",
         );
     }
 

@@ -235,6 +235,18 @@ fn run_list(
                 let cat = Arc::clone(&catalog);
                 move || load_inputs_data(&pd, &inputs_filter, &cat)
             };
+            let pricing_loader = || -> anyhow::Result<PricingData> {
+                pricing::refresh_catalog()?;
+                let catalog = pricing::load_catalog();
+                Ok(PricingData {
+                    entries: catalog
+                        .sorted_entries(false)
+                        .into_iter()
+                        .map(|(k, v)| (k.to_owned(), *v))
+                        .collect(),
+                    cache_info: pricing::cache_info(),
+                })
+            };
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -244,6 +256,7 @@ fn run_list(
                 inputs_loader,
                 sessions_loader,
                 fp_builder,
+                pricing_loader,
                 initial_fingerprint,
                 pricing_data,
                 Tab::Sessions,
@@ -345,6 +358,7 @@ fn load_inputs_data(
     Ok((rows, coverage))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_inputs(
     mode: RenderMode,
     projects_dir: &Path,
@@ -408,6 +422,18 @@ fn run_inputs(
                     Ok((visible, coverage))
                 }
             };
+            let pricing_loader = || -> anyhow::Result<PricingData> {
+                pricing::refresh_catalog()?;
+                let catalog = pricing::load_catalog();
+                Ok(PricingData {
+                    entries: catalog
+                        .sorted_entries(false)
+                        .into_iter()
+                        .map(|(k, v)| (k.to_owned(), *v))
+                        .collect(),
+                    cache_info: pricing::cache_info(),
+                })
+            };
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -417,6 +443,7 @@ fn run_inputs(
                 inputs_loader,
                 sessions_loader,
                 fp_builder,
+                pricing_loader,
                 initial_fingerprint,
                 pricing_data,
                 Tab::Inputs,
