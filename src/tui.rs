@@ -3,25 +3,21 @@
 //!
 //! Cell data comes from `views` (shared with `rendering`); this
 //! module handles ratatui widget construction, styling, layout
-//! constraints, and the event loop.
+//! constraints, and the event loop. Data loading is `loading`'s
+//! responsibility — this module consumes `loading::DataContext` and
+//! its load functions directly, with no dependency-inversion layer.
 //!
 //! Public API:
 //! - `Tab` — `Sessions` | `Inputs` — the active tab.
-//! - `RefreshFingerprint` — file-size + mtime fingerprint for change detection.
-//! - `PricingData` — owned pricing entries + cache staleness info,
-//!   constructed once before entering the TUI.
-//! - `run_tui<F, G, H, I, J>(Vec<Session>, F, G, H, I, J,
-//!   RefreshFingerprint, PricingData, Tab) -> anyhow::Result<()>`
-//!   — fullscreen TUI with tab switching (1/2 keys), scrollable
-//!   tables, session drill-down (Enter/Esc within Sessions tab),
-//!   attribution table with coverage footer (Inputs tab), pricing
-//!   overlay (`p` toggles, `r` refreshes, Esc/q closes), and
-//!   timer-driven auto-refresh (3s interval, fingerprint-gated).
+//! - `run_tui(DataContext, Vec<Session>, RefreshFingerprint,
+//!   PricingData, Tab) -> anyhow::Result<()>` — fullscreen TUI with
+//!   tab switching (1/2 keys), scrollable tables, session drill-down
+//!   (Enter/Esc within Sessions tab), attribution table with coverage
+//!   footer (Inputs tab), pricing overlay (`p` toggles, `r` refreshes,
+//!   Esc/q closes), and timer-driven auto-refresh (3s interval,
+//!   fingerprint-gated).
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
@@ -38,32 +34,16 @@ use crate::aggregation::{PreparedExchange, PreparedRow};
 use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::Session;
 use crate::formatting::{coverage_line, format_cost_opt, format_tokens, tiers_differ};
-use crate::pricing::{CacheInfo, ClaudePricing};
+use crate::loading::{self, DataContext, PricingData, RefreshFingerprint};
+use crate::pricing::{CacheInfo, PricingCatalog};
 use crate::views::{
     inputs_cells, pricing_view_rows, session_cells, session_totals, show_row_cells,
 };
-
-type ShowLoader = Arc<dyn Fn(&str) -> anyhow::Result<Vec<PreparedExchange>> + Send + Sync>;
-type InputsLoader =
-    Arc<dyn Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync>;
-type SessionsLoader = Arc<dyn Fn() -> anyhow::Result<Vec<Session>> + Send + Sync>;
-type FingerprintBuilder = Arc<dyn Fn() -> anyhow::Result<RefreshFingerprint> + Send + Sync>;
-type PricingLoader = Arc<dyn Fn() -> anyhow::Result<PricingData> + Send + Sync>;
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct RefreshFingerprint {
-    pub entries: HashMap<PathBuf, (u64, SystemTime)>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Sessions,
     Inputs,
-}
-
-pub struct PricingData {
-    pub entries: Vec<(String, ClaudePricing)>,
-    pub cache_info: CacheInfo,
 }
 
 struct InputsState {
@@ -115,21 +95,25 @@ enum View {
     },
 }
 
+/// Which view's data a forced or guarded refresh targets.
+enum RefreshScope {
+    Sessions,
+    Show { session_id: String },
+    Inputs,
+}
+
 enum LoadRequest {
     ShowDetail {
         session_id: String,
         header_label: String,
     },
     InputsRefresh,
-    RefreshSessions {
-        fingerprint: RefreshFingerprint,
-    },
-    RefreshShow {
-        session_id: String,
-        fingerprint: RefreshFingerprint,
-    },
-    RefreshInputs {
-        fingerprint: RefreshFingerprint,
+    /// `guard: Some(fp)` is a timer-driven refresh — skipped if the
+    /// filesystem is unchanged. `guard: None` is a forced reload
+    /// (filter/catalog change) — always runs.
+    Refresh {
+        scope: RefreshScope,
+        guard: Option<RefreshFingerprint>,
     },
     RefreshPricing,
 }
@@ -148,15 +132,40 @@ enum LoadResult {
     },
     SessionsData {
         result: anyhow::Result<Vec<Session>>,
-        fingerprint: RefreshFingerprint,
+        fingerprint: Option<RefreshFingerprint>,
     },
     Pricing {
-        result: anyhow::Result<PricingData>,
+        result: anyhow::Result<(Arc<PricingCatalog>, PricingData)>,
+    },
+    /// A guarded fingerprint build failed (the watched path is
+    /// unreadable or gone). Distinct from `NoChange` so a future
+    /// status footer can surface it; today it only clears
+    /// backpressure, like `NoChange`.
+    RefreshFailed {
+        message: String,
     },
     NoChange,
 }
 
+/// Generation wrapper carried on the result channel. Every dispatched
+/// load is stamped with the `ctx_generation` it ran against;
+/// `handle_load_result` discards a result whose stamp is behind the
+/// app's current generation before applying it, so a load computed
+/// against a superseded catalog/query can never overwrite fresher
+/// data.
+struct StampedResult {
+    generation: u64,
+    result: LoadResult,
+}
+
 struct App {
+    /// Everything the next dispatched load needs. Cloned into each
+    /// `spawn_blocking` task at dispatch time — the single-threaded
+    /// event loop is the only mutator, so no lock is needed.
+    ctx: DataContext,
+    /// Bumped on every `ctx` mutation (today: catalog swap). Loads
+    /// carry the generation they were dispatched with.
+    ctx_generation: u64,
     tab: Tab,
     sessions: Vec<Session>,
     list_state: TableState,
@@ -173,7 +182,12 @@ struct App {
 }
 
 impl App {
-    fn new(sessions: Vec<Session>, pricing: PricingData, default_tab: Tab) -> Self {
+    fn new(
+        ctx: DataContext,
+        sessions: Vec<Session>,
+        pricing: PricingData,
+        default_tab: Tab,
+    ) -> Self {
         let (total_tokens, total_cost) =
             session_totals(&sessions).map_or((0, None), |t| (t.total_tokens, t.total_cost));
         let mut list_state = TableState::default();
@@ -181,6 +195,8 @@ impl App {
             list_state.select_first();
         }
         Self {
+            ctx,
+            ctx_generation: 0,
             tab: default_tab,
             sessions,
             list_state,
@@ -232,50 +248,46 @@ impl App {
     }
 }
 
-fn build_refresh_request(app: &App) -> Option<LoadRequest> {
+/// Maps the current tab/view to the `RefreshScope` a refresh should
+/// target, or `None` when nothing on screen has loaded data to
+/// refresh. Shared by `build_refresh_request` (guarded, timer-driven)
+/// and `apply_pricing` (forced, after a catalog swap) so both refresh
+/// triggers agree on "what's on screen right now".
+fn current_scope(app: &App) -> Option<RefreshScope> {
     match (&app.tab, &app.view, &app.inputs) {
-        (Tab::Sessions, View::List, _) => Some(LoadRequest::RefreshSessions {
-            fingerprint: app.refresh_fingerprint.clone(),
-        }),
-        (Tab::Sessions, View::Show { session_id, .. }, _) => Some(LoadRequest::RefreshShow {
+        (Tab::Sessions, View::List, _) => Some(RefreshScope::Sessions),
+        (Tab::Sessions, View::Show { session_id, .. }, _) => Some(RefreshScope::Show {
             session_id: session_id.clone(),
-            fingerprint: app.refresh_fingerprint.clone(),
         }),
-        (Tab::Inputs, _, Some(InputsData::Loaded(_))) => Some(LoadRequest::RefreshInputs {
-            fingerprint: app.refresh_fingerprint.clone(),
-        }),
+        (Tab::Inputs, _, Some(InputsData::Loaded(_))) => Some(RefreshScope::Inputs),
         _ => None,
     }
 }
 
-#[allow(clippy::missing_errors_doc, clippy::too_many_arguments)]
-pub async fn run_tui<F, G, H, I, J>(
+fn build_refresh_request(app: &App) -> Option<LoadRequest> {
+    let scope = current_scope(app)?;
+    Some(LoadRequest::Refresh {
+        scope,
+        guard: Some(app.refresh_fingerprint.clone()),
+    })
+}
+
+/// # Errors
+///
+/// Propagates a terminal init/restore failure or an unrecoverable
+/// event-loop error.
+pub async fn run_tui(
+    ctx: DataContext,
     sessions: Vec<Session>,
-    load_show: F,
-    load_inputs: G,
-    load_sessions: H,
-    build_fingerprint: I,
-    load_pricing: J,
     initial_fingerprint: RefreshFingerprint,
     pricing: PricingData,
     default_tab: Tab,
-) -> anyhow::Result<()>
-where
-    F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>> + Send + Sync + 'static,
-    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync + 'static,
-    H: Fn() -> anyhow::Result<Vec<Session>> + Send + Sync + 'static,
-    I: Fn() -> anyhow::Result<RefreshFingerprint> + Send + Sync + 'static,
-    J: Fn() -> anyhow::Result<PricingData> + Send + Sync + 'static,
-{
+) -> anyhow::Result<()> {
     let mut terminal = ratatui::try_init()?;
     let result = run_event_loop(
         &mut terminal,
+        ctx,
         sessions,
-        load_show,
-        load_inputs,
-        load_sessions,
-        build_fingerprint,
-        load_pricing,
         initial_fingerprint,
         pricing,
         default_tab,
@@ -285,36 +297,19 @@ where
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_event_loop<F, G, H, I, J>(
+async fn run_event_loop(
     terminal: &mut DefaultTerminal,
+    ctx: DataContext,
     sessions: Vec<Session>,
-    load_show: F,
-    load_inputs: G,
-    load_sessions: H,
-    build_fingerprint: I,
-    load_pricing: J,
     initial_fingerprint: RefreshFingerprint,
     pricing: PricingData,
     default_tab: Tab,
-) -> anyhow::Result<()>
-where
-    F: Fn(&str) -> anyhow::Result<Vec<PreparedExchange>> + Send + Sync + 'static,
-    G: Fn() -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)> + Send + Sync + 'static,
-    H: Fn() -> anyhow::Result<Vec<Session>> + Send + Sync + 'static,
-    I: Fn() -> anyhow::Result<RefreshFingerprint> + Send + Sync + 'static,
-    J: Fn() -> anyhow::Result<PricingData> + Send + Sync + 'static,
-{
-    let mut app = App::new(sessions, pricing, default_tab);
+) -> anyhow::Result<()> {
+    let mut app = App::new(ctx, sessions, pricing, default_tab);
     app.refresh_fingerprint = initial_fingerprint;
     let mut event_stream = EventStream::new();
 
-    let load_show: ShowLoader = Arc::new(load_show);
-    let load_inputs: InputsLoader = Arc::new(load_inputs);
-    let load_sessions: SessionsLoader = Arc::new(load_sessions);
-    let build_fp: FingerprintBuilder = Arc::new(build_fingerprint);
-    let load_pricing: PricingLoader = Arc::new(load_pricing);
-    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<LoadResult>();
+    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<StampedResult>();
 
     let mut refresh_interval = time::interval(std::time::Duration::from_secs(3));
     refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -326,15 +321,7 @@ where
     }
 
     loop {
-        drain_pending_loads(
-            &mut app,
-            &load_show,
-            &load_inputs,
-            &load_sessions,
-            &build_fp,
-            &load_pricing,
-            &result_tx,
-        );
+        drain_pending_loads(&mut app, &result_tx);
         terminal.draw(|frame| render(&mut app, frame))?;
 
         tokio::select! {
@@ -350,8 +337,8 @@ where
                     _ => {}
                 }
             }
-            Some(result) = result_rx.recv() => {
-                handle_load_result(&mut app, result);
+            Some(stamped) = result_rx.recv() => {
+                handle_load_result(&mut app, stamped);
             }
             _ = refresh_interval.tick() => {
                 if !app.refresh_in_flight
@@ -366,292 +353,381 @@ where
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-fn drain_pending_loads(
-    app: &mut App,
-    load_show: &ShowLoader,
-    load_inputs: &InputsLoader,
-    load_sessions: &SessionsLoader,
-    build_fp: &FingerprintBuilder,
-    load_pricing: &PricingLoader,
-    result_tx: &mpsc::UnboundedSender<LoadResult>,
-) {
+/// Dispatch one load onto a blocking task and send its stamped
+/// outcome back over `tx`. Owns the shape shared by every dispatch
+/// site: clone `ctx`, `spawn_blocking`, `catch_unwind` (panic → an
+/// `Err`/`RefreshFailed` outcome depending on `guard`), gate on
+/// `guard` when present, run `load`, map the outcome, stamp the
+/// dispatch generation.
+///
+/// `guard: Some(old)` is a timer-driven refresh: a fresh fingerprint
+/// is built first. A build failure sends `LoadResult::RefreshFailed`;
+/// an unchanged fingerprint sends `LoadResult::NoChange`; otherwise
+/// `load` runs and `map(result, Some(new_fp))` is sent. `guard: None`
+/// is a forced or user-triggered load: `load` runs unconditionally
+/// and `map` is called with `None`.
+fn spawn_load<T, L, M>(
+    ctx: &DataContext,
+    generation: u64,
+    guard: Option<RefreshFingerprint>,
+    tx: &mpsc::UnboundedSender<StampedResult>,
+    load: L,
+    map: M,
+) where
+    T: Send + 'static,
+    L: FnOnce(&DataContext) -> anyhow::Result<T> + Send + 'static,
+    M: FnOnce(anyhow::Result<T>, Option<RefreshFingerprint>) -> LoadResult + Send + 'static,
+{
+    let ctx = ctx.clone();
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = match guard {
+            None => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&ctx)))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error: loader panicked")));
+                map(outcome, None)
+            }
+            Some(old) => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> anyhow::Result<Option<(anyhow::Result<T>, RefreshFingerprint)>> {
+                        let new_fp = loading::build_fingerprint(&ctx.projects_dir)?;
+                        if new_fp == old {
+                            return Ok(None);
+                        }
+                        Ok(Some((load(&ctx), new_fp)))
+                    },
+                ));
+                match outcome {
+                    Ok(Ok(None)) => LoadResult::NoChange,
+                    Ok(Ok(Some((result, new_fp)))) => map(result, Some(new_fp)),
+                    Ok(Err(e)) => LoadResult::RefreshFailed {
+                        message: format!("{e}"),
+                    },
+                    Err(_) => LoadResult::RefreshFailed {
+                        message: "internal error: loader panicked".to_string(),
+                    },
+                }
+            }
+        };
+        let _ = tx.send(StampedResult { generation, result });
+    });
+}
+
+fn drain_pending_loads(app: &mut App, tx: &mpsc::UnboundedSender<StampedResult>) {
     for request in app.pending_loads.drain(..) {
+        let ctx = &app.ctx;
+        let generation = app.ctx_generation;
         match request {
             LoadRequest::ShowDetail {
                 session_id,
                 header_label,
             } => {
-                let loader = Arc::clone(load_show);
-                let tx = result_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        loader(&session_id)
-                    }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error: loader panicked")));
-                    let _ = tx.send(LoadResult::ShowDetail {
-                        session_id,
+                let sid = session_id.clone();
+                spawn_load(
+                    ctx,
+                    generation,
+                    None,
+                    tx,
+                    move |c| loading::load_show(c, &session_id),
+                    move |result, _fp| LoadResult::ShowDetail {
+                        session_id: sid,
                         header_label,
                         result,
                         refresh_fingerprint: None,
                         is_refresh: false,
-                    });
-                });
+                    },
+                );
             }
             LoadRequest::InputsRefresh => {
-                let loader = Arc::clone(load_inputs);
-                let tx = result_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader()))
-                            .unwrap_or_else(|_| {
-                                Err(anyhow::anyhow!("internal error: loader panicked"))
-                            });
-                    let _ = tx.send(LoadResult::InputsData {
+                spawn_load(
+                    ctx,
+                    generation,
+                    None,
+                    tx,
+                    loading::load_inputs,
+                    |result, _fp| LoadResult::InputsData {
                         result,
                         refresh_fingerprint: None,
-                    });
-                });
+                    },
+                );
             }
-            LoadRequest::RefreshShow {
-                session_id,
-                fingerprint,
-            } => {
-                let fp_builder = Arc::clone(build_fp);
-                let loader = Arc::clone(load_show);
-                let tx = result_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let outcome =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<_> {
-                            let new_fp = fp_builder().ok()?;
-                            if new_fp == fingerprint {
-                                return None;
-                            }
-                            let result = loader(&session_id);
-                            Some((session_id, new_fp, result))
-                        }))
-                        .ok()
-                        .flatten();
-                    let _ = tx.send(match outcome {
-                        Some((session_id, new_fingerprint, result)) => LoadResult::ShowDetail {
-                            session_id,
+            LoadRequest::Refresh { scope, guard } => match scope {
+                RefreshScope::Sessions => {
+                    spawn_load(
+                        ctx,
+                        generation,
+                        guard,
+                        tx,
+                        loading::load_sessions,
+                        |result, fp| LoadResult::SessionsData {
+                            result,
+                            fingerprint: fp,
+                        },
+                    );
+                }
+                RefreshScope::Show { session_id } => {
+                    let sid = session_id.clone();
+                    spawn_load(
+                        ctx,
+                        generation,
+                        guard,
+                        tx,
+                        move |c| loading::load_show(c, &session_id),
+                        move |result, fp| LoadResult::ShowDetail {
+                            session_id: sid,
                             header_label: String::new(),
                             result,
-                            refresh_fingerprint: Some(new_fingerprint),
+                            refresh_fingerprint: fp,
                             is_refresh: true,
                         },
-                        None => LoadResult::NoChange,
-                    });
-                });
-            }
-            LoadRequest::RefreshSessions { fingerprint } => {
-                let fp_builder = Arc::clone(build_fp);
-                let loader = Arc::clone(load_sessions);
-                let tx = result_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let outcome =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<_> {
-                            let new_fp = fp_builder().ok()?;
-                            if new_fp == fingerprint {
-                                return None;
-                            }
-                            let result = loader();
-                            Some((new_fp, result))
-                        }))
-                        .ok()
-                        .flatten();
-                    let _ = tx.send(match outcome {
-                        Some((fingerprint, result)) => LoadResult::SessionsData {
+                    );
+                }
+                RefreshScope::Inputs => {
+                    spawn_load(
+                        ctx,
+                        generation,
+                        guard,
+                        tx,
+                        loading::load_inputs,
+                        |result, fp| LoadResult::InputsData {
                             result,
-                            fingerprint,
+                            refresh_fingerprint: fp,
                         },
-                        None => LoadResult::NoChange,
-                    });
-                });
-            }
-            LoadRequest::RefreshInputs { fingerprint } => {
-                let fp_builder = Arc::clone(build_fp);
-                let loader = Arc::clone(load_inputs);
-                let tx = result_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let outcome =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<_> {
-                            let new_fp = fp_builder().ok()?;
-                            if new_fp == fingerprint {
-                                return None;
-                            }
-                            let result = loader();
-                            Some((new_fp, result))
-                        }))
-                        .ok()
-                        .flatten();
-                    let _ = tx.send(match outcome {
-                        Some((new_fp, result)) => LoadResult::InputsData {
-                            result,
-                            refresh_fingerprint: Some(new_fp),
-                        },
-                        None => LoadResult::NoChange,
-                    });
-                });
-            }
+                    );
+                }
+            },
             LoadRequest::RefreshPricing => {
-                let loader = Arc::clone(load_pricing);
-                let tx = result_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader()))
-                            .unwrap_or_else(|_| {
-                                Err(anyhow::anyhow!("internal error: loader panicked"))
-                            });
-                    let _ = tx.send(LoadResult::Pricing { result });
-                });
+                spawn_load(
+                    ctx,
+                    generation,
+                    None,
+                    tx,
+                    |_ctx| loading::refresh_pricing(),
+                    |result, _fp| LoadResult::Pricing { result },
+                );
             }
         }
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn handle_load_result(app: &mut App, result: LoadResult) {
-    match result {
+fn handle_load_result(app: &mut App, stamped: StampedResult) {
+    if stamped.generation < app.ctx_generation {
+        // Superseded context: the payload is computed against stale
+        // state. Still clear backpressure, or the timer never
+        // refreshes again. Both flags are cleared defensively — only
+        // `refresh_in_flight` is reachable here today (`ctx_generation`
+        // bumps only inside `apply_pricing`, and `pricing_refresh_in_flight`
+        // already enforces one in-flight pricing load) — but a dropped
+        // `Pricing` result must not leave `r` permanently dead if a
+        // second generation source is ever added.
+        app.refresh_in_flight = false;
+        app.pricing_refresh_in_flight = false;
+        return;
+    }
+    match stamped.result {
         LoadResult::ShowDetail {
             session_id,
             header_label,
             result,
             refresh_fingerprint,
             is_refresh,
-        } => {
-            let is_user_triggered = !is_refresh
-                && matches!(
-                    &app.view,
-                    View::ShowLoading { session_id: sid, .. } if *sid == session_id
-                );
-            let is_refresh_triggered = is_refresh
-                && matches!(
-                    &app.view,
-                    View::Show { session_id: sid, .. } if *sid == session_id
-                );
-
-            if is_user_triggered {
-                match result {
-                    Ok(prepared) => {
-                        let mut table_state = TableState::default();
-                        if !prepared.is_empty() {
-                            table_state.select_first();
-                        }
-                        app.view = View::Show {
-                            session_id,
-                            header_label,
-                            prepared,
-                            table_state,
-                        };
-                    }
-                    Err(e) => {
-                        app.view = View::ShowError {
-                            session_id,
-                            header_label,
-                            message: format!("{e}"),
-                        };
-                    }
-                }
-            } else if is_refresh_triggered
-                && let Ok(new_prepared) = result
-                && let View::Show {
-                    prepared,
-                    table_state,
-                    ..
-                } = &mut app.view
-            {
-                let row_count: usize = prepared.iter().map(|e| e.rows.len()).sum();
-                let was_at_end = row_count > 0 && table_state.selected() == Some(row_count - 1);
-                *prepared = new_prepared;
-                if was_at_end {
-                    let new_row_count: usize = prepared.iter().map(|e| e.rows.len()).sum();
-                    if new_row_count > 0 {
-                        table_state.select(Some(new_row_count - 1));
-                    }
-                }
-            }
-            if is_refresh {
-                if let Some(fp) = refresh_fingerprint {
-                    app.refresh_fingerprint = fp;
-                }
-                app.refresh_in_flight = false;
-            }
-        }
+        } => apply_show_detail(
+            app,
+            session_id,
+            header_label,
+            result,
+            refresh_fingerprint,
+            is_refresh,
+        ),
         LoadResult::InputsData {
             result,
             refresh_fingerprint,
-        } => {
-            let is_user_triggered =
-                refresh_fingerprint.is_none() && matches!(&app.inputs, Some(InputsData::Loading));
-            let is_refresh_triggered =
-                refresh_fingerprint.is_some() && matches!(&app.inputs, Some(InputsData::Loaded(_)));
-
-            if is_user_triggered {
-                match result {
-                    Ok((rows, coverage)) => {
-                        app.inputs = Some(InputsData::Loaded(InputsState::new(rows, coverage)));
-                    }
-                    Err(e) => {
-                        app.inputs = Some(InputsData::Error(format!("{e}")));
-                    }
-                }
-            } else if is_refresh_triggered
-                && let Ok((new_rows, new_coverage)) = result
-                && let Some(InputsData::Loaded(state)) = &mut app.inputs
-            {
-                let prev_path = state
-                    .table_state
-                    .selected()
-                    .and_then(|idx| state.rows.get(idx))
-                    .map(|r| r.file.path.clone());
-                let prev_idx = state.table_state.selected();
-
-                state.rows = new_rows;
-                state.coverage = new_coverage;
-
-                if let Some(prev_path) = prev_path {
-                    if let Some(new_idx) = state.rows.iter().position(|r| r.file.path == prev_path)
-                    {
-                        state.table_state.select(Some(new_idx));
-                    } else if state.rows.is_empty() {
-                        state.table_state.select(None);
-                    } else {
-                        let fallback = prev_idx.unwrap_or(0).min(state.rows.len() - 1);
-                        state.table_state.select(Some(fallback));
-                    }
-                } else if !state.rows.is_empty() {
-                    state.table_state.select_first();
-                }
-            }
-            if let Some(fp) = refresh_fingerprint {
-                app.refresh_fingerprint = fp;
-                app.refresh_in_flight = false;
-            }
-        }
+        } => apply_inputs_data(app, result, refresh_fingerprint),
         LoadResult::SessionsData {
             result,
             fingerprint,
-        } => {
-            if app.tab != Tab::Sessions || !matches!(app.view, View::List) {
-                app.refresh_in_flight = false;
-                return;
-            }
-            if let Ok(sessions) = result {
-                app.apply_sessions_refresh(sessions, fingerprint);
-            }
-            app.refresh_in_flight = false;
-        }
-        LoadResult::Pricing { result } => {
-            if let Ok(pricing) = result {
-                app.pricing = pricing;
-            }
-            app.pricing_refresh_in_flight = false;
-        }
+        } => apply_sessions_data(app, result, fingerprint),
+        LoadResult::Pricing { result } => apply_pricing(app, result),
+        LoadResult::RefreshFailed { message } => apply_refresh_failed(app, &message),
         LoadResult::NoChange => {
             app.refresh_in_flight = false;
         }
     }
+}
+
+fn apply_show_detail(
+    app: &mut App,
+    session_id: String,
+    header_label: String,
+    result: anyhow::Result<Vec<PreparedExchange>>,
+    refresh_fingerprint: Option<RefreshFingerprint>,
+    is_refresh: bool,
+) {
+    let is_user_triggered = !is_refresh
+        && matches!(
+            &app.view,
+            View::ShowLoading { session_id: sid, .. } if *sid == session_id
+        );
+    let is_refresh_triggered = is_refresh
+        && matches!(
+            &app.view,
+            View::Show { session_id: sid, .. } if *sid == session_id
+        );
+
+    if is_user_triggered {
+        match result {
+            Ok(prepared) => {
+                let mut table_state = TableState::default();
+                if !prepared.is_empty() {
+                    table_state.select_first();
+                }
+                app.view = View::Show {
+                    session_id,
+                    header_label,
+                    prepared,
+                    table_state,
+                };
+            }
+            Err(e) => {
+                app.view = View::ShowError {
+                    session_id,
+                    header_label,
+                    message: format!("{e}"),
+                };
+            }
+        }
+    } else if is_refresh_triggered
+        && let Ok(new_prepared) = result
+        && let View::Show {
+            prepared,
+            table_state,
+            ..
+        } = &mut app.view
+    {
+        let row_count: usize = prepared.iter().map(|e| e.rows.len()).sum();
+        let was_at_end = row_count > 0 && table_state.selected() == Some(row_count - 1);
+        *prepared = new_prepared;
+        if was_at_end {
+            let new_row_count: usize = prepared.iter().map(|e| e.rows.len()).sum();
+            if new_row_count > 0 {
+                table_state.select(Some(new_row_count - 1));
+            }
+        }
+    }
+    // Clearing is gated on `refresh_fingerprint.is_some()`, not on
+    // `is_refresh` — `is_refresh` is also `true` for a *forced*
+    // (`guard: None`) Show reload dispatched after a catalog swap,
+    // which never set `refresh_in_flight` in the first place. Clearing
+    // it there would let the next timer tick dispatch a second guarded
+    // load while a real one is still in flight. `NoChange` and
+    // `RefreshFailed` — the only other outcomes a guarded dispatch can
+    // produce — clear it in their own `handle_load_result` arms.
+    if let Some(fp) = refresh_fingerprint {
+        app.refresh_fingerprint = fp;
+        app.refresh_in_flight = false;
+    }
+}
+
+fn apply_inputs_data(
+    app: &mut App,
+    result: anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
+    refresh_fingerprint: Option<RefreshFingerprint>,
+) {
+    let is_user_triggered =
+        refresh_fingerprint.is_none() && matches!(&app.inputs, Some(InputsData::Loading));
+    // Not gated on `refresh_fingerprint.is_some()`: a forced reload
+    // (catalog swap) dispatches with `guard: None`, so a fingerprint-
+    // free result must still be treated as a refresh when the inputs
+    // table is already loaded — otherwise a pricing-catalog swap
+    // would never recompute costs on a visible Inputs tab.
+    let is_refresh_triggered = matches!(&app.inputs, Some(InputsData::Loaded(_)));
+
+    if is_user_triggered {
+        match result {
+            Ok((rows, coverage)) => {
+                app.inputs = Some(InputsData::Loaded(InputsState::new(rows, coverage)));
+            }
+            Err(e) => {
+                app.inputs = Some(InputsData::Error(format!("{e}")));
+            }
+        }
+    } else if is_refresh_triggered
+        && let Ok((new_rows, new_coverage)) = result
+        && let Some(InputsData::Loaded(state)) = &mut app.inputs
+    {
+        let prev_path = state
+            .table_state
+            .selected()
+            .and_then(|idx| state.rows.get(idx))
+            .map(|r| r.file.path.clone());
+        let prev_idx = state.table_state.selected();
+
+        state.rows = new_rows;
+        state.coverage = new_coverage;
+
+        if let Some(prev_path) = prev_path {
+            if let Some(new_idx) = state.rows.iter().position(|r| r.file.path == prev_path) {
+                state.table_state.select(Some(new_idx));
+            } else if state.rows.is_empty() {
+                state.table_state.select(None);
+            } else {
+                let fallback = prev_idx.unwrap_or(0).min(state.rows.len() - 1);
+                state.table_state.select(Some(fallback));
+            }
+        } else if !state.rows.is_empty() {
+            state.table_state.select_first();
+        }
+    }
+    if let Some(fp) = refresh_fingerprint {
+        app.refresh_fingerprint = fp;
+        app.refresh_in_flight = false;
+    }
+}
+
+fn apply_sessions_data(
+    app: &mut App,
+    result: anyhow::Result<Vec<Session>>,
+    fingerprint: Option<RefreshFingerprint>,
+) {
+    // Only a guarded (timer-driven) dispatch ever set `refresh_in_flight`
+    // — a forced (`guard: None`) reload after a catalog swap carries no
+    // fingerprint and never acquired the flag, so it must not clear it
+    // out from under a real guarded load still in flight.
+    let was_guarded = fingerprint.is_some();
+    if app.tab != Tab::Sessions || !matches!(app.view, View::List) {
+        if was_guarded {
+            app.refresh_in_flight = false;
+        }
+        return;
+    }
+    if let Ok(sessions) = result {
+        // A forced reload (catalog swap) carries no fresh fingerprint
+        // — the filesystem didn't change, so the existing one stands.
+        let fp = fingerprint.unwrap_or_else(|| app.refresh_fingerprint.clone());
+        app.apply_sessions_refresh(sessions, fp);
+    }
+    if was_guarded {
+        app.refresh_in_flight = false;
+    }
+}
+
+fn apply_pricing(app: &mut App, result: anyhow::Result<(Arc<PricingCatalog>, PricingData)>) {
+    if let Ok((catalog, data)) = result {
+        app.pricing = data;
+        app.ctx.catalog = catalog;
+        app.ctx_generation += 1;
+        if let Some(scope) = current_scope(app) {
+            app.pending_loads
+                .push(LoadRequest::Refresh { scope, guard: None });
+        }
+    }
+    app.pricing_refresh_in_flight = false;
+}
+
+fn apply_refresh_failed(app: &mut App, _message: &str) {
+    // Phase 1: clear backpressure only. A future status footer can
+    // surface `_message`, including after N consecutive failures.
+    app.refresh_in_flight = false;
 }
 
 fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
@@ -1528,7 +1604,31 @@ mod tests {
     use crate::attribution::TierCoverage;
     use crate::domain::{CostBreakdown, TurnOrigin};
     use crate::inventory::{ContextFile, ContextFileKind, Scope};
-    use crate::pricing::TieredRate;
+    use crate::pricing::{ClaudePricing, TieredRate};
+
+    /// A `DataContext` pointed at a nonexistent directory with an
+    /// empty pricing catalog — every test in this module drives `App`
+    /// state directly rather than through a real load, so the context
+    /// itself is never dereferenced.
+    fn fixture_ctx() -> DataContext {
+        DataContext {
+            projects_dir: PathBuf::from("/nonexistent"),
+            catalog: Arc::new(PricingCatalog::default()),
+            query: crate::loading::Query::default(),
+        }
+    }
+
+    fn new_app(sessions: Vec<Session>, pricing: PricingData, default_tab: Tab) -> App {
+        App::new(fixture_ctx(), sessions, pricing, default_tab)
+    }
+
+    /// Wraps `handle_load_result` for call sites that don't care about
+    /// generation staleness — stamps with the app's current
+    /// generation, which is never considered stale.
+    fn hlr(app: &mut App, result: LoadResult) {
+        let generation = app.ctx_generation;
+        handle_load_result(app, StampedResult { generation, result });
+    }
 
     fn fixture_pricing_data() -> PricingData {
         let uniform = |rate: f64| {
@@ -1709,19 +1809,19 @@ mod tests {
 
     #[test]
     fn app_new_selects_first_when_non_empty() {
-        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]
     fn app_new_no_selection_when_empty() {
-        let app = App::new(vec![], fixture_pricing_data(), Tab::Sessions);
+        let app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.list_state.selected(), None);
     }
 
     #[test]
     fn app_new_computes_totals() {
-        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.total_tokens, 1500 + 2500 + 3000);
         let expected_cost = 0.01 + 0.02 + 0.03;
         assert!(
@@ -1735,13 +1835,13 @@ mod tests {
 
     #[test]
     fn app_starts_in_list_view() {
-        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert!(matches!(app.view, View::List));
     }
 
     #[test]
     fn enter_transitions_to_show_loading() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Enter));
         assert!(matches!(app.view, View::ShowLoading { .. }));
         assert_eq!(app.pending_loads.len(), 1);
@@ -1753,14 +1853,14 @@ mod tests {
 
     #[test]
     fn enter_with_no_selection_is_noop() {
-        let mut app = App::new(vec![], fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Enter));
         assert!(matches!(app.view, View::List));
     }
 
     #[test]
     fn esc_in_show_returns_to_list() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::Esc));
         assert!(matches!(app.view, View::List));
@@ -1768,7 +1868,7 @@ mod tests {
 
     #[test]
     fn backspace_in_show_returns_to_list() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::Backspace));
         assert!(matches!(app.view, View::List));
@@ -1776,14 +1876,14 @@ mod tests {
 
     #[test]
     fn q_in_show_quits() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         assert!(handle_key_event(&mut app, key_event(KeyCode::Char('q'))));
     }
 
     #[test]
     fn list_selection_preserved_after_roundtrip() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.list_state.select(Some(2));
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::Esc));
@@ -1794,26 +1894,26 @@ mod tests {
 
     #[test]
     fn handle_key_quit_on_q() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert!(handle_key_event(&mut app, key_event(KeyCode::Char('q'))));
     }
 
     #[test]
     fn handle_key_quit_on_esc() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert!(handle_key_event(&mut app, key_event(KeyCode::Esc)));
     }
 
     #[test]
     fn handle_key_quit_on_ctrl_c() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(handle_key_event(&mut app, key));
     }
 
     #[test]
     fn handle_key_down_advances_selection() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.list_state.selected(), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::Down));
         assert_eq!(app.list_state.selected(), Some(1));
@@ -1821,7 +1921,7 @@ mod tests {
 
     #[test]
     fn handle_key_up_retreats_selection() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.list_state.select(Some(1));
         handle_key_event(&mut app, key_event(KeyCode::Up));
         assert_eq!(app.list_state.selected(), Some(0));
@@ -1829,7 +1929,7 @@ mod tests {
 
     #[test]
     fn handle_key_j_advances_like_down() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.list_state.selected(), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::Char('j')));
         assert_eq!(app.list_state.selected(), Some(1));
@@ -1837,7 +1937,7 @@ mod tests {
 
     #[test]
     fn handle_key_k_retreats_like_up() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.list_state.select(Some(1));
         handle_key_event(&mut app, key_event(KeyCode::Char('k')));
         assert_eq!(app.list_state.selected(), Some(0));
@@ -1845,7 +1945,7 @@ mod tests {
 
     #[test]
     fn handle_key_home_selects_first() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.list_state.select(Some(2));
         handle_key_event(&mut app, key_event(KeyCode::Home));
         assert_eq!(app.list_state.selected(), Some(0));
@@ -1855,7 +1955,7 @@ mod tests {
     fn handle_key_end_selects_last() {
         let sessions = fixture_sessions();
         let last = sessions.len() - 1;
-        let mut app = App::new(sessions, fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(sessions, fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.list_state.selected(), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::End));
         render_app(&mut app, 80, 10);
@@ -1864,7 +1964,7 @@ mod tests {
 
     #[test]
     fn handle_key_unknown_is_noop() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.list_state.selected(), Some(0));
         let quit = handle_key_event(&mut app, key_event(KeyCode::Char('x')));
         assert!(!quit);
@@ -1875,7 +1975,7 @@ mod tests {
 
     #[test]
     fn show_down_advances_selection() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         if let View::Show { table_state, .. } = &app.view {
             assert_eq!(table_state.selected(), Some(0));
@@ -1888,7 +1988,7 @@ mod tests {
 
     #[test]
     fn show_up_retreats_selection() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::Down));
         handle_key_event(&mut app, key_event(KeyCode::Up));
@@ -1899,7 +1999,7 @@ mod tests {
 
     #[test]
     fn show_home_selects_first() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::Down));
         handle_key_event(&mut app, key_event(KeyCode::Down));
@@ -1911,7 +2011,7 @@ mod tests {
 
     #[test]
     fn show_end_selects_last() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::End));
         render_app(&mut app, 120, 20);
@@ -1931,7 +2031,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_header_with_session_count() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let first_line = output.lines().next().unwrap();
         assert!(
@@ -1942,7 +2042,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_table_header_columns() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let second_line = output.lines().nth(1).unwrap();
         for col in ["datetime", "project", "title", "tokens", "cost"] {
@@ -1955,7 +2055,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_footer_key_hints() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
@@ -1966,7 +2066,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_totals_when_multiple_sessions() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let lines: Vec<&str> = output.lines().collect();
         let totals_line = lines[lines.len() - 2];
@@ -1982,7 +2082,7 @@ mod tests {
 
     #[test]
     fn list_tui_omits_totals_for_single_session() {
-        let mut app = App::new(
+        let mut app = new_app(
             vec![fixture_sessions().remove(0)],
             fixture_pricing_data(),
             Tab::Sessions,
@@ -1998,7 +2098,7 @@ mod tests {
 
     #[test]
     fn list_tui_renders_session_data_in_rows() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let data_line = output.lines().nth(2).unwrap();
         assert!(
@@ -2013,7 +2113,7 @@ mod tests {
 
     #[test]
     fn list_footer_shows_enter_hint() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
@@ -2026,7 +2126,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_header_with_session_info() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         let output = render_app(&mut app, 120, 20);
         let first_line = output.lines().next().unwrap();
@@ -2042,7 +2142,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_column_headers() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         let second_line = output.lines().nth(1).unwrap();
@@ -2059,7 +2159,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_footer_with_back_hint() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         let output = render_app(&mut app, 120, 20);
         let last_line = output.lines().last().unwrap();
@@ -2071,7 +2171,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_exchange_rows() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         assert!(
@@ -2090,7 +2190,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_per_component_costs() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         assert!(
@@ -2105,7 +2205,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_dash_for_none_cost() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         let output = render_app(&mut app, 140, 20);
         let subagent_line = output.lines().find(|l| l.contains("subagent")).unwrap();
@@ -2117,7 +2217,7 @@ mod tests {
 
     #[test]
     fn show_tui_renders_tool_use_count_in_content() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         let output = render_app(&mut app, 160, 20);
         assert!(
@@ -2128,7 +2228,7 @@ mod tests {
 
     #[test]
     fn show_tui_dims_odd_exchange_rows() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         let backend = TestBackend::new(140, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2226,13 +2326,13 @@ mod tests {
 
     #[test]
     fn app_starts_on_specified_tab() {
-        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         assert_eq!(app.tab, Tab::Inputs);
     }
 
     #[test]
     fn key_1_switches_to_sessions() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2243,7 +2343,7 @@ mod tests {
 
     #[test]
     fn key_2_switches_to_inputs_loading() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('2')));
         assert_eq!(app.tab, Tab::Inputs);
         assert!(matches!(app.inputs, Some(InputsData::Loading)));
@@ -2253,10 +2353,10 @@ mod tests {
 
     #[test]
     fn key_2_reuses_cached_inputs() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('2')));
         assert!(matches!(app.inputs, Some(InputsData::Loading)));
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::InputsData {
                 result: Ok((fixture_attribution_rows(), fixture_coverage_stats())),
@@ -2273,7 +2373,7 @@ mod tests {
 
     #[test]
     fn tab_switch_from_show_view() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::Char('2')));
         assert_eq!(app.tab, Tab::Inputs);
@@ -2300,7 +2400,7 @@ mod tests {
 
     #[test]
     fn inputs_key_quit_on_q() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2310,7 +2410,7 @@ mod tests {
 
     #[test]
     fn inputs_key_quit_on_esc() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2320,7 +2420,7 @@ mod tests {
 
     #[test]
     fn inputs_key_down_advances_selection() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2332,7 +2432,7 @@ mod tests {
 
     #[test]
     fn inputs_key_up_retreats_selection() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2344,7 +2444,7 @@ mod tests {
 
     #[test]
     fn inputs_key_unknown_is_noop() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2358,7 +2458,7 @@ mod tests {
 
     #[test]
     fn tab_header_shows_sessions_active() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let first_line = output.lines().next().unwrap();
         assert!(
@@ -2373,7 +2473,7 @@ mod tests {
 
     #[test]
     fn tab_header_shows_inputs_active() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2389,7 +2489,7 @@ mod tests {
 
     #[test]
     fn tab_header_shows_context_count() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let first_line = output.lines().next().unwrap();
         assert!(
@@ -2400,7 +2500,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_table_columns() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2417,7 +2517,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_coverage_line() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2436,7 +2536,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_footer_with_tab_hint() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2452,7 +2552,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_kind_labels() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2471,7 +2571,7 @@ mod tests {
 
     #[test]
     fn inputs_tab_renders_dash_for_unknown_cost() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2487,7 +2587,7 @@ mod tests {
 
     #[test]
     fn list_footer_shows_tab_hint() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
@@ -2500,14 +2600,14 @@ mod tests {
 
     #[test]
     fn p_opens_pricing_overlay() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         assert!(matches!(app.overlay, Some(Overlay::Pricing)));
     }
 
     #[test]
     fn p_opens_overlay_from_show_view() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         assert!(matches!(app.overlay, Some(Overlay::Pricing)));
@@ -2515,7 +2615,7 @@ mod tests {
 
     #[test]
     fn p_opens_overlay_from_inputs_tab() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -2526,7 +2626,7 @@ mod tests {
 
     #[test]
     fn esc_closes_pricing_overlay() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         assert!(app.overlay.is_some());
         handle_key_event(&mut app, key_event(KeyCode::Esc));
@@ -2535,7 +2635,7 @@ mod tests {
 
     #[test]
     fn p_toggles_pricing_overlay_closed() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         assert!(app.overlay.is_some());
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
@@ -2544,7 +2644,7 @@ mod tests {
 
     #[test]
     fn q_closes_pricing_overlay() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         assert!(app.overlay.is_some());
         let quit = handle_key_event(&mut app, key_event(KeyCode::Char('q')));
@@ -2554,7 +2654,7 @@ mod tests {
 
     #[test]
     fn overlay_swallows_unhandled_keys() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         let original_tab = app.tab;
         let original_selected = app.list_state.selected();
@@ -2574,7 +2674,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits_even_with_overlay_open() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         assert!(app.overlay.is_some());
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -2583,7 +2683,7 @@ mod tests {
 
     #[test]
     fn overlay_close_preserves_tab_and_view_state() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         assert!(app.overlay.is_some());
@@ -2597,7 +2697,7 @@ mod tests {
 
     #[test]
     fn pricing_overlay_renders_model_rates() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.overlay = Some(Overlay::Pricing);
         let output = render_app(&mut app, 100, 20);
         assert!(
@@ -2612,7 +2712,7 @@ mod tests {
 
     #[test]
     fn pricing_overlay_renders_cache_staleness() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.overlay = Some(Overlay::Pricing);
         let output = render_app(&mut app, 100, 20);
         assert!(
@@ -2623,7 +2723,7 @@ mod tests {
 
     #[test]
     fn pricing_overlay_renders_block_border() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.overlay = Some(Overlay::Pricing);
         let output = render_app(&mut app, 100, 20);
         assert!(
@@ -2634,7 +2734,7 @@ mod tests {
 
     #[test]
     fn pricing_overlay_does_not_render_when_closed() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let output = render_app(&mut app, 100, 20);
         assert!(
             !output.contains("Pricing ($/MTok)"),
@@ -2646,7 +2746,7 @@ mod tests {
 
     #[test]
     fn r_in_overlay_pushes_pricing_refresh_request() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         handle_key_event(&mut app, key_event(KeyCode::Char('r')));
         assert!(app.pricing_refresh_in_flight);
@@ -2656,7 +2756,7 @@ mod tests {
 
     #[test]
     fn r_in_overlay_while_refresh_in_flight_is_noop() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.overlay = Some(Overlay::Pricing);
         app.pricing_refresh_in_flight = true;
         handle_key_event(&mut app, key_event(KeyCode::Char('r')));
@@ -2665,7 +2765,7 @@ mod tests {
 
     #[test]
     fn r_without_overlay_does_not_trigger_pricing_refresh() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('r')));
         assert!(
             !app.pending_loads
@@ -2676,7 +2776,7 @@ mod tests {
 
     #[test]
     fn handle_load_result_pricing_success_updates_data() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.pricing_refresh_in_flight = true;
         let new_pricing = PricingData {
             entries: vec![(
@@ -2691,10 +2791,10 @@ mod tests {
                 entry_count: Some(1),
             },
         };
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::Pricing {
-                result: Ok(new_pricing),
+                result: Ok((Arc::new(PricingCatalog::default()), new_pricing)),
             },
         );
         assert_eq!(app.pricing.entries.len(), 1);
@@ -2704,10 +2804,10 @@ mod tests {
 
     #[test]
     fn handle_load_result_pricing_error_keeps_old_data() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.pricing_refresh_in_flight = true;
         let original_len = app.pricing.entries.len();
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::Pricing {
                 result: Err(anyhow::anyhow!("network error")),
@@ -2719,7 +2819,7 @@ mod tests {
 
     #[test]
     fn pricing_overlay_footer_shows_refresh_hint() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.overlay = Some(Overlay::Pricing);
         let output = render_app(&mut app, 100, 20);
         assert!(
@@ -2730,7 +2830,7 @@ mod tests {
 
     #[test]
     fn pricing_overlay_footer_shows_refreshing_state() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.overlay = Some(Overlay::Pricing);
         app.pricing_refresh_in_flight = true;
         let output = render_app(&mut app, 100, 20);
@@ -2744,7 +2844,7 @@ mod tests {
 
     #[test]
     fn inputs_error_retry_on_enter() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Error("test error".to_string()));
         handle_key_event(&mut app, key_event(KeyCode::Enter));
         assert!(matches!(app.inputs, Some(InputsData::Loading)));
@@ -2753,7 +2853,7 @@ mod tests {
 
     #[test]
     fn inputs_error_retry_on_r() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Error("test error".to_string()));
         handle_key_event(&mut app, key_event(KeyCode::Char('r')));
         assert!(matches!(app.inputs, Some(InputsData::Loading)));
@@ -2762,14 +2862,14 @@ mod tests {
 
     #[test]
     fn inputs_error_quit_on_q() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Error("test error".to_string()));
         assert!(handle_key_event(&mut app, key_event(KeyCode::Char('q'))));
     }
 
     #[test]
     fn show_error_esc_returns_to_list() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowError {
             session_id: "aaa".to_string(),
             header_label: "test".to_string(),
@@ -2781,7 +2881,7 @@ mod tests {
 
     #[test]
     fn show_error_backspace_returns_to_list() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowError {
             session_id: "aaa".to_string(),
             header_label: "test".to_string(),
@@ -2793,7 +2893,7 @@ mod tests {
 
     #[test]
     fn show_error_enter_retries() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowError {
             session_id: "aaa".to_string(),
             header_label: "test".to_string(),
@@ -2809,7 +2909,7 @@ mod tests {
 
     #[test]
     fn show_error_retry_on_r() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowError {
             session_id: "aaa".to_string(),
             header_label: "test".to_string(),
@@ -2825,7 +2925,7 @@ mod tests {
 
     #[test]
     fn inputs_error_renders_error_message() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Error("test error".to_string()));
         let output = render_app(&mut app, 80, 10);
         assert!(
@@ -2840,7 +2940,7 @@ mod tests {
 
     #[test]
     fn show_error_renders_error_message() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowError {
             session_id: "aaa".to_string(),
             header_label: "\"First session\" (alpha)".to_string(),
@@ -2859,7 +2959,7 @@ mod tests {
 
     #[test]
     fn inputs_error_header_shows_error_indicator() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Error("test error".to_string()));
         let output = render_app(&mut app, 80, 10);
         let first_line = output.lines().next().unwrap();
@@ -2871,7 +2971,7 @@ mod tests {
 
     #[test]
     fn show_error_header_shows_session_context() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowError {
             session_id: "aaa".to_string(),
             header_label: "\"First session\" (alpha)".to_string(),
@@ -2885,16 +2985,162 @@ mod tests {
         );
     }
 
-    // --- handle_load_result tests ---
+    // --- Context versioning (generation) tests ---
 
     #[test]
-    fn load_result_show_detail_success() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+    fn stale_generation_result_is_discarded() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowLoading {
             session_id: "aaa".to_string(),
             header_label: "test".to_string(),
         };
+        app.ctx_generation = 1;
         handle_load_result(
+            &mut app,
+            StampedResult {
+                generation: 0,
+                result: LoadResult::ShowDetail {
+                    session_id: "aaa".to_string(),
+                    header_label: "test".to_string(),
+                    result: Ok(fixture_prepared_exchanges()),
+                    refresh_fingerprint: None,
+                    is_refresh: false,
+                },
+            },
+        );
+        assert!(
+            matches!(app.view, View::ShowLoading { .. }),
+            "a result stamped below the current generation must not apply",
+        );
+    }
+
+    #[test]
+    fn stale_generation_result_still_clears_refresh_in_flight() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx_generation = 1;
+        app.refresh_in_flight = true;
+        handle_load_result(
+            &mut app,
+            StampedResult {
+                generation: 0,
+                result: LoadResult::NoChange,
+            },
+        );
+        assert!(
+            !app.refresh_in_flight,
+            "a discarded stale result must still clear backpressure or the timer never refreshes again",
+        );
+    }
+
+    #[test]
+    fn current_generation_result_applies() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.view = View::ShowLoading {
+            session_id: "aaa".to_string(),
+            header_label: "test".to_string(),
+        };
+        let generation = app.ctx_generation;
+        handle_load_result(
+            &mut app,
+            StampedResult {
+                generation,
+                result: LoadResult::ShowDetail {
+                    session_id: "aaa".to_string(),
+                    header_label: "test".to_string(),
+                    result: Ok(fixture_prepared_exchanges()),
+                    refresh_fingerprint: None,
+                    is_refresh: false,
+                },
+            },
+        );
+        assert!(matches!(app.view, View::Show { .. }));
+    }
+
+    // --- apply_pricing / current_scope tests ---
+
+    #[test]
+    fn apply_pricing_success_bumps_generation_and_swaps_catalog() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let original_generation = app.ctx_generation;
+        let new_catalog = Arc::new(PricingCatalog::default());
+        apply_pricing(
+            &mut app,
+            Ok((Arc::clone(&new_catalog), fixture_pricing_data())),
+        );
+        assert_eq!(app.ctx_generation, original_generation + 1);
+        assert!(Arc::ptr_eq(&app.ctx.catalog, &new_catalog));
+    }
+
+    #[test]
+    fn apply_pricing_success_pushes_forced_refresh_of_current_scope() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        apply_pricing(
+            &mut app,
+            Ok((Arc::new(PricingCatalog::default()), fixture_pricing_data())),
+        );
+        assert_eq!(app.pending_loads.len(), 1);
+        assert!(matches!(
+            app.pending_loads[0],
+            LoadRequest::Refresh {
+                scope: RefreshScope::Sessions,
+                guard: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn apply_pricing_failure_does_not_bump_generation() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let original_generation = app.ctx_generation;
+        apply_pricing(&mut app, Err(anyhow::anyhow!("network error")));
+        assert_eq!(app.ctx_generation, original_generation);
+        assert!(app.pending_loads.is_empty());
+        assert!(!app.pricing_refresh_in_flight);
+    }
+
+    #[test]
+    fn current_scope_maps_list_view_to_sessions() {
+        let app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        assert!(matches!(current_scope(&app), Some(RefreshScope::Sessions)));
+    }
+
+    #[test]
+    fn current_scope_maps_show_view_to_show_with_session_id() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        assert!(matches!(
+            current_scope(&app),
+            Some(RefreshScope::Show { session_id }) if session_id == "aaa"
+        ));
+    }
+
+    #[test]
+    fn current_scope_maps_loaded_inputs_tab_to_inputs() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        assert!(matches!(current_scope(&app), Some(RefreshScope::Inputs)));
+    }
+
+    #[test]
+    fn current_scope_none_for_loading_inputs_tab() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loading);
+        assert!(current_scope(&app).is_none());
+    }
+
+    // --- handle_load_result tests ---
+
+    #[test]
+    fn load_result_show_detail_success() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.view = View::ShowLoading {
+            session_id: "aaa".to_string(),
+            header_label: "test".to_string(),
+        };
+        hlr(
             &mut app,
             LoadResult::ShowDetail {
                 session_id: "aaa".to_string(),
@@ -2909,12 +3155,12 @@ mod tests {
 
     #[test]
     fn load_result_show_detail_failure() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowLoading {
             session_id: "aaa".to_string(),
             header_label: "test".to_string(),
         };
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::ShowDetail {
                 session_id: "aaa".to_string(),
@@ -2929,8 +3175,8 @@ mod tests {
 
     #[test]
     fn load_result_show_detail_stale_is_discarded() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        handle_load_result(
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        hlr(
             &mut app,
             LoadResult::ShowDetail {
                 session_id: "aaa".to_string(),
@@ -2945,9 +3191,9 @@ mod tests {
 
     #[test]
     fn load_result_inputs_success() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loading);
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::InputsData {
                 result: Ok((fixture_attribution_rows(), fixture_coverage_stats())),
@@ -2959,9 +3205,9 @@ mod tests {
 
     #[test]
     fn load_result_inputs_failure() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loading);
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::InputsData {
                 result: Err(anyhow::anyhow!("load failed")),
@@ -2972,13 +3218,18 @@ mod tests {
     }
 
     #[test]
-    fn load_result_inputs_stale_is_discarded() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+    /// A `refresh_fingerprint: None` result landing while the inputs
+    /// table is already `Loaded` is a *forced* reload (catalog swap),
+    /// not a stray duplicate — it must apply, not be discarded. This
+    /// is what makes a pricing refresh recompute costs on a visible
+    /// Inputs tab; see `apply_inputs_data`'s `is_refresh_triggered`.
+    fn forced_inputs_refresh_applies_while_loaded() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
         )));
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::InputsData {
                 result: Ok((vec![], fixture_coverage_stats())),
@@ -2986,14 +3237,18 @@ mod tests {
             },
         );
         assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
-        assert_eq!(inputs_table_selected(&app), Some(0));
+        assert_eq!(
+            inputs_table_selected(&app),
+            None,
+            "empty rows clear selection"
+        );
     }
 
     // --- Loading state rendering tests ---
 
     #[test]
     fn show_loading_renders_loading_message() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowLoading {
             session_id: "aaa".to_string(),
             header_label: "\"First session\" (alpha)".to_string(),
@@ -3007,7 +3262,7 @@ mod tests {
 
     #[test]
     fn inputs_loading_renders_loading_message() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loading);
         let output = render_app(&mut app, 80, 10);
         assert!(
@@ -3054,14 +3309,14 @@ mod tests {
 
     #[test]
     fn selected_session_id_returns_id() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.list_state.select(Some(1));
         assert_eq!(app.selected_session_id(), Some("bbb"));
     }
 
     #[test]
     fn selected_session_id_none_when_empty() {
-        let app = App::new(vec![], fixture_pricing_data(), Tab::Sessions);
+        let app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
         assert_eq!(app.selected_session_id(), None);
     }
 
@@ -3069,7 +3324,7 @@ mod tests {
 
     #[test]
     fn apply_sessions_refresh_preserves_selection_by_id() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.list_state.select(Some(1)); // "bbb"
 
         let mut reordered = fixture_sessions();
@@ -3081,7 +3336,7 @@ mod tests {
 
     #[test]
     fn apply_sessions_refresh_falls_back_on_removed_session() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.list_state.select(Some(2)); // "ccc"
 
         let mut shorter = fixture_sessions();
@@ -3094,7 +3349,7 @@ mod tests {
 
     #[test]
     fn apply_sessions_refresh_updates_totals() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let mut updated = fixture_sessions();
         updated[0].total_billable = 5000;
         updated[0].cost_breakdown = Some(CostBreakdown {
@@ -3116,15 +3371,15 @@ mod tests {
 
     #[test]
     fn handle_sessions_data_applies_in_list_view() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.refresh_in_flight = true;
         let mut updated = fixture_sessions();
         updated[0].total_billable = 9999;
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::SessionsData {
                 result: Ok(updated),
-                fingerprint: RefreshFingerprint::default(),
+                fingerprint: Some(RefreshFingerprint::default()),
             },
         );
         assert_eq!(app.sessions[0].total_billable, 9999);
@@ -3133,15 +3388,15 @@ mod tests {
 
     #[test]
     fn handle_sessions_data_discarded_in_show_view() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         app.refresh_in_flight = true;
         let original_count = app.sessions.len();
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::SessionsData {
                 result: Ok(vec![]),
-                fingerprint: RefreshFingerprint::default(),
+                fingerprint: Some(RefreshFingerprint::default()),
             },
         );
         assert_eq!(app.sessions.len(), original_count);
@@ -3150,9 +3405,9 @@ mod tests {
 
     #[test]
     fn handle_no_change_clears_in_flight() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.refresh_in_flight = true;
-        handle_load_result(&mut app, LoadResult::NoChange);
+        hlr(&mut app, LoadResult::NoChange);
         assert!(!app.refresh_in_flight);
     }
 
@@ -3160,14 +3415,20 @@ mod tests {
 
     #[test]
     fn build_refresh_request_returns_sessions_in_list() {
-        let app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let request = build_refresh_request(&app);
-        assert!(matches!(request, Some(LoadRequest::RefreshSessions { .. })));
+        assert!(matches!(
+            request,
+            Some(LoadRequest::Refresh {
+                scope: RefreshScope::Sessions,
+                guard: Some(_),
+            })
+        ));
     }
 
     #[test]
     fn build_refresh_request_returns_none_in_show_loading() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowLoading {
             session_id: "aaa".to_string(),
             header_label: "test".to_string(),
@@ -3177,7 +3438,7 @@ mod tests {
 
     #[test]
     fn build_refresh_request_returns_none_in_show_error() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.view = View::ShowError {
             session_id: "aaa".to_string(),
             header_label: "test".to_string(),
@@ -3190,21 +3451,21 @@ mod tests {
 
     #[test]
     fn build_refresh_request_returns_show_in_show_view() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         let request = build_refresh_request(&app);
         assert!(matches!(
             request,
-            Some(LoadRequest::RefreshShow {
-                session_id,
-                ..
+            Some(LoadRequest::Refresh {
+                scope: RefreshScope::Show { session_id },
+                guard: Some(_),
             }) if session_id == "aaa"
         ));
     }
 
     #[test]
     fn refresh_show_auto_scrolls_when_at_end() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         // Select last row (index 2 — 3 rows from fixture_prepared_exchanges)
         if let View::Show { table_state, .. } = &mut app.view {
@@ -3240,7 +3501,7 @@ mod tests {
         });
         let total_rows = new_prepared.iter().map(|e| e.rows.len()).sum::<usize>();
 
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::ShowDetail {
                 session_id: "aaa".to_string(),
@@ -3265,7 +3526,7 @@ mod tests {
 
     #[test]
     fn refresh_show_holds_position_when_scrolled_up() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         // Select middle row (index 1)
         if let View::Show { table_state, .. } = &mut app.view {
@@ -3288,7 +3549,7 @@ mod tests {
             }],
         });
 
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::ShowDetail {
                 session_id: "aaa".to_string(),
@@ -3313,11 +3574,11 @@ mod tests {
 
     #[test]
     fn refresh_show_discarded_when_session_mismatch() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app); // viewing session "aaa"
         app.refresh_in_flight = true;
 
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::ShowDetail {
                 session_id: "bbb".to_string(),
@@ -3347,25 +3608,31 @@ mod tests {
 
     #[test]
     fn build_refresh_request_returns_inputs_when_loaded() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
         )));
         let request = build_refresh_request(&app);
-        assert!(matches!(request, Some(LoadRequest::RefreshInputs { .. })));
+        assert!(matches!(
+            request,
+            Some(LoadRequest::Refresh {
+                scope: RefreshScope::Inputs,
+                guard: Some(_),
+            })
+        ));
     }
 
     #[test]
     fn build_refresh_request_returns_none_inputs_loading() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loading);
         assert!(build_refresh_request(&app).is_none());
     }
 
     #[test]
     fn refresh_inputs_preserves_selection_by_path() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -3380,7 +3647,7 @@ mod tests {
         reordered.reverse(); // project, skill, global → skill is now at index 1
         let new_coverage = fixture_coverage_stats();
 
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::InputsData {
                 result: Ok((reordered, new_coverage)),
@@ -3404,7 +3671,7 @@ mod tests {
 
     #[test]
     fn refresh_inputs_falls_back_on_removed_row() {
-        let mut app = App::new(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
             fixture_attribution_rows(),
             fixture_coverage_stats(),
@@ -3417,7 +3684,7 @@ mod tests {
 
         // Refresh with only one row — the previously selected row is gone
         let single_row = vec![fixture_attribution_rows().remove(0)];
-        handle_load_result(
+        hlr(
             &mut app,
             LoadResult::InputsData {
                 result: Ok((single_row, fixture_coverage_stats())),

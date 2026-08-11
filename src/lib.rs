@@ -6,11 +6,13 @@
 //! Pipeline order (alphabetical declaration below; pipeline order
 //! documented for orientation):
 //!   `domain → parsing → discovery → inventory → aggregation
-//!     → attribution → pricing → rendering → filter`.
+//!     → attribution → loading → pricing → rendering → filter`.
 //! `inventory` walks user-controlled context-file locations
 //! (`~/.claude/{CLAUDE.md,rules,skills,agents}` and the plugin cache);
 //! `attribution` folds inventory + per-session metadata + pricing into
-//! ranked rows for the `inputs` subcommand.
+//! ranked rows for the `inputs` subcommand. `loading` composes the
+//! prior stages into the view-ready data the TUI (and, via the same
+//! functions, the plain/JSON CLI paths) consumes.
 //!
 //! `formatting` provides shared per-value format helpers.
 //! `views` provides shared per-row view builders consumed by both
@@ -23,6 +25,7 @@ pub mod domain;
 pub mod filter;
 pub mod formatting;
 pub mod inventory;
+pub mod loading;
 pub mod parsing;
 pub mod pricing;
 pub mod rendering;

@@ -78,7 +78,7 @@ Run `cargo fmt && cargo clippy --all-targets -- -D warnings` before committing.
 
 ## Source Layout
 
-The crate compiles as two crates from the same `src/` tree: a library (`src/lib.rs`, root for the seven promoted modules) and a binary (`src/main.rs`, root for orchestration plus the CLI submodule). Both are named `cclens`; the binary consumes the library via `use cclens::...`.
+The crate compiles as two crates from the same `src/` tree: a library (`src/lib.rs`, root for the thirteen promoted modules) and a binary (`src/main.rs`, root for orchestration plus the CLI submodule). Both are named `cclens`; the binary consumes the library via `use cclens::...`.
 
 Library modules (declared `pub mod` in `src/lib.rs`, one file each under `src/<name>.rs`; declarations are alphabetical, the pipeline order below is for orientation):
 
@@ -112,6 +112,14 @@ attribution   ← turn list → SessionMeta { kind: Parent | Subagent
                 AttributionRow { loads_1h, loads_5m, ... } with strict
                 None cost propagation; per-tier CoverageStats summed
                 across parent + subagent metas
+loading       ← composes discovery/parsing/aggregation/attribution/
+                pricing into view-ready data behind DataContext {
+                projects_dir, catalog: Arc<PricingCatalog>, query };
+                load_sessions / load_show / load_inputs /
+                build_fingerprint / pricing_data / refresh_pricing;
+                consumed by both the TUI (src/tui.rs) and the binary's
+                plain/JSON CLI paths — one loader definition per view,
+                not one per entry point
 pricing       ← LiteLLM-catalog fetch/cache/lookup, tiered cost math,
                 pricing-subcommand handlers; cost_for_cache_creation_{1h,5m}
                 helpers exposed for the inputs subcommand
@@ -129,7 +137,7 @@ Binary entry point (`src/main.rs`):
 
 - Declares `mod cli;` (binary-only — `src/cli.rs` is **not** in `lib.rs`) so library code cannot reach into clap-derived types.
 - Imports library modules via `use cclens::...`.
-- Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs`, the per-project `dedup_assistant_turns` orchestration helper, the `build_subagent_meta` helper that drives per-subagent transcript parsing for `run_inputs`, the `build_subagent_turns` helper that drives per-subagent transcript parsing (with `TurnOrigin::Subagent` tagging) for `run_list` and `run_show`, and `stem_matches`.
+- Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs` — orchestration only. Each `run_*` builds a `loading::DataContext` from CLI args and either drives the TUI (`run_tui`) or calls `loading::load_sessions` / `loading::load_show` / `loading::load_inputs` directly for the plain/JSON paths. The loaders themselves, their `build_subagent_turns` / `build_subagent_meta` / `stem_matches` helpers, and fingerprint-building all live in `loading` — the binary has no data-loading code of its own.
 
 Binary CLI submodule (`src/cli.rs`):
 
