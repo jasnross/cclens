@@ -158,6 +158,30 @@ struct StampedResult {
     result: LoadResult,
 }
 
+/// The status footer's only content today is a failure — every
+/// producer in this phase is an error path (`apply_show_detail`,
+/// `apply_inputs_data`, `apply_pricing`, `apply_refresh_failed`), so
+/// `render_status_footer` styles every message the same way. A
+/// severity field (e.g. for a future non-error status like an
+/// active-filter indicator) is a one-line addition to make when a
+/// second kind of message actually exists — see CLAUDE.md's Project
+/// Status on not pre-widening pre-1.0 types speculatively.
+struct StatusMessage {
+    text: String,
+    /// Set only by `apply_refresh_failed`. A later `NoChange` proves
+    /// the *guarded-refresh pipeline* recovered — that is meaningful
+    /// evidence only against a status this same mechanism raised.
+    /// Without this distinction, `NoChange`'s auto-clear (added so a
+    /// pricing-refresh error isn't wiped by an unrelated background
+    /// tick — see `handle_load_result`) would also permanently trap a
+    /// resolved `RefreshFailed` warning: a directory that's fixed by
+    /// restoring its exact prior state (e.g. `mv away && mv back`,
+    /// which preserves mtime) never produces a *changed* fingerprint,
+    /// so `NoChange` — not a fresh successful reload — is the only
+    /// signal recovery ever produces for that case.
+    from_refresh_failure: bool,
+}
+
 struct App {
     /// Everything the next dispatched load needs. Cloned into each
     /// `spawn_blocking` task at dispatch time — the single-threaded
@@ -179,7 +203,21 @@ struct App {
     refresh_fingerprint: RefreshFingerprint,
     refresh_in_flight: bool,
     pricing_refresh_in_flight: bool,
+    /// Replaces the footer's keybinding hint when set. Cleared on any
+    /// successful load, alongside `consecutive_refresh_failures`.
+    status: Option<StatusMessage>,
+    /// Consecutive silent (timer-driven) refresh failures. Reset to 0
+    /// on any successful load. At `CONSECUTIVE_REFRESH_FAILURE_THRESHOLD`,
+    /// `apply_refresh_failed` breaks silence and sets `status`.
+    consecutive_refresh_failures: u8,
 }
+
+/// Number of consecutive silent `RefreshFailed` results before the
+/// status footer speaks up. A single transient failure stays silent
+/// (see the prior design's Error Handling section — the user already
+/// has valid data displayed and the next tick retries); this many in
+/// a row means the failure probably isn't transient.
+const CONSECUTIVE_REFRESH_FAILURE_THRESHOLD: u8 = 3;
 
 impl App {
     fn new(
@@ -210,7 +248,28 @@ impl App {
             refresh_fingerprint: RefreshFingerprint::default(),
             refresh_in_flight: false,
             pricing_refresh_in_flight: false,
+            status: None,
+            consecutive_refresh_failures: 0,
         }
+    }
+
+    /// Clear the status footer and reset the failure counter. Called
+    /// by every applier on a successful load.
+    fn clear_status(&mut self) {
+        self.status = None;
+        self.consecutive_refresh_failures = 0;
+    }
+
+    /// Reset only the failure counter, leaving `status` untouched.
+    /// Used by `NoChange`: an unchanged fingerprint proves the guarded
+    /// refresh pipeline is healthy (evidence against a *persistent*
+    /// failure, resetting the threshold), but it is not itself
+    /// evidence against whatever specific status is currently
+    /// displayed — a user-triggered error (e.g. a failed pricing
+    /// refresh) must survive an unrelated background tick finding
+    /// nothing changed, or it would vanish within one ~3s cycle.
+    fn reset_refresh_failures(&mut self) {
+        self.consecutive_refresh_failures = 0;
     }
 
     fn selected_session_id(&self) -> Option<&str> {
@@ -551,6 +610,21 @@ fn handle_load_result(app: &mut App, stamped: StampedResult) {
         LoadResult::RefreshFailed { message } => apply_refresh_failed(app, &message),
         LoadResult::NoChange => {
             app.refresh_in_flight = false;
+            // An unchanged fingerprint means the guarded fingerprint
+            // build itself succeeded — always evidence the failure
+            // counter should reset. Whether it also clears `status`
+            // depends on who set it: a warning `apply_refresh_failed`
+            // raised is provably resolved by this same signal (e.g.
+            // recovery via `mv away && mv back`, which restores an
+            // identical fingerprint and so can *only* ever be
+            // observed as `NoChange`, never a changed-data reload).
+            // A status from anywhere else (a failed pricing refresh)
+            // is unrelated — clearing it here would let it vanish
+            // within one ~3s idle tick before anyone reads it.
+            match &app.status {
+                Some(status) if status.from_refresh_failure => app.clear_status(),
+                _ => app.reset_refresh_failures(),
+            }
         }
     }
 }
@@ -587,12 +661,20 @@ fn apply_show_detail(
                     prepared,
                     table_state,
                 };
+                app.clear_status();
             }
             Err(e) => {
+                let message = format!("{e}");
+                // User-triggered (Enter / retry) — the user is owed
+                // an answer immediately, no threshold.
+                app.status = Some(StatusMessage {
+                    text: message.clone(),
+                    from_refresh_failure: false,
+                });
                 app.view = View::ShowError {
                     session_id,
                     header_label,
-                    message: format!("{e}"),
+                    message,
                 };
             }
         }
@@ -613,6 +695,7 @@ fn apply_show_detail(
                 table_state.select(Some(new_row_count - 1));
             }
         }
+        app.clear_status();
     }
     // Clearing is gated on `refresh_fingerprint.is_some()`, not on
     // `is_refresh` — `is_refresh` is also `true` for a *forced*
@@ -646,9 +729,15 @@ fn apply_inputs_data(
         match result {
             Ok((rows, coverage)) => {
                 app.inputs = Some(InputsData::Loaded(InputsState::new(rows, coverage)));
+                app.clear_status();
             }
             Err(e) => {
-                app.inputs = Some(InputsData::Error(format!("{e}")));
+                let message = format!("{e}");
+                app.status = Some(StatusMessage {
+                    text: message.clone(),
+                    from_refresh_failure: false,
+                });
+                app.inputs = Some(InputsData::Error(message));
             }
         }
     } else if is_refresh_triggered
@@ -677,6 +766,7 @@ fn apply_inputs_data(
         } else if !state.rows.is_empty() {
             state.table_state.select_first();
         }
+        app.clear_status();
     }
     if let Some(fp) = refresh_fingerprint {
         app.refresh_fingerprint = fp;
@@ -705,6 +795,7 @@ fn apply_sessions_data(
         // — the filesystem didn't change, so the existing one stands.
         let fp = fingerprint.unwrap_or_else(|| app.refresh_fingerprint.clone());
         app.apply_sessions_refresh(sessions, fp);
+        app.clear_status();
     }
     if was_guarded {
         app.refresh_in_flight = false;
@@ -712,22 +803,46 @@ fn apply_sessions_data(
 }
 
 fn apply_pricing(app: &mut App, result: anyhow::Result<(Arc<PricingCatalog>, PricingData)>) {
-    if let Ok((catalog, data)) = result {
-        app.pricing = data;
-        app.ctx.catalog = catalog;
-        app.ctx_generation += 1;
-        if let Some(scope) = current_scope(app) {
-            app.pending_loads
-                .push(LoadRequest::Refresh { scope, guard: None });
+    match result {
+        Ok((catalog, data)) => {
+            app.pricing = data;
+            app.ctx.catalog = catalog;
+            app.ctx_generation += 1;
+            if let Some(scope) = current_scope(app) {
+                app.pending_loads
+                    .push(LoadRequest::Refresh { scope, guard: None });
+            }
+            app.clear_status();
+        }
+        Err(e) => {
+            // User pressed `r` in the overlay and is owed an answer
+            // immediately — no threshold, unlike `apply_refresh_failed`.
+            app.status = Some(StatusMessage {
+                text: format!("{e}"),
+                from_refresh_failure: false,
+            });
         }
     }
     app.pricing_refresh_in_flight = false;
 }
 
-fn apply_refresh_failed(app: &mut App, _message: &str) {
-    // Phase 1: clear backpressure only. A future status footer can
-    // surface `_message`, including after N consecutive failures.
+fn apply_refresh_failed(app: &mut App, message: &str) {
     app.refresh_in_flight = false;
+    // Single transient failures stay silent — the prior design's
+    // rationale holds: valid data is still displayed and the next
+    // tick retries. Only a persistent, repeated failure breaks
+    // silence, since by then "wait for the next tick" has stopped
+    // being a credible remedy.
+    app.consecutive_refresh_failures = app.consecutive_refresh_failures.saturating_add(1);
+    if app.consecutive_refresh_failures >= CONSECUTIVE_REFRESH_FAILURE_THRESHOLD {
+        app.status = Some(StatusMessage {
+            // Diagnostic first: the footer is one row, so on a narrow
+            // terminal a long `message` truncates — put the part
+            // worth reading before the boilerplate, not after it.
+            text: format!("{message} — refresh failing, data may be stale"),
+            from_refresh_failure: true,
+        });
+    }
 }
 
 fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
@@ -1173,6 +1288,7 @@ fn render(app: &mut App, frame: &mut Frame) {
         Tab::Sessions => match &app.view {
             View::ShowLoading { .. } => {
                 render_feedback_content(
+                    app,
                     frame,
                     content_area,
                     vec![Line::raw(""), Line::from(" Loading session...")],
@@ -1181,6 +1297,7 @@ fn render(app: &mut App, frame: &mut Frame) {
             }
             View::ShowError { message, .. } => {
                 render_feedback_content(
+                    app,
                     frame,
                     content_area,
                     vec![
@@ -1263,7 +1380,12 @@ fn render_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
 
     render_sessions_table(app, frame, table_area);
     render_totals(app, frame, totals_area);
-    render_list_footer(frame, footer_area);
+    render_status_footer(
+        app,
+        frame,
+        footer_area,
+        " 1/2 tabs  ↑↓ navigate  Enter open  p pricing  q quit",
+    );
 }
 
 fn render_sessions_table(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -1318,14 +1440,25 @@ fn render_totals(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
     frame.render_widget(table, area);
 }
 
-fn render_list_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
-    let text = Line::from(" 1/2 tabs  ↑↓ navigate  Enter open  p pricing  q quit").dim();
-    frame.render_widget(Paragraph::new(text), area);
+/// Renders `app.status` (styled red — see `StatusMessage`'s doc
+/// comment on why there's no severity field yet) in place of `hint`
+/// when set. Shared by every footer row so error/refresh-failure
+/// feedback surfaces uniformly across List, Show, Inputs, and the
+/// loading/error feedback views — one status slot, four render sites.
+fn render_status_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect, hint: &str) {
+    let line = match &app.status {
+        Some(status) => Line::from(format!(" {}", status.text)).red(),
+        None => Line::from(hint).dim(),
+    };
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 // ---- show view ----
 
 fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let [table_area, footer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+
     let View::Show {
         prepared,
         table_state,
@@ -1334,14 +1467,14 @@ fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
     else {
         return;
     };
-
-    let [table_area, footer_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-
     render_show_table(prepared, table_state, frame, table_area);
 
-    let footer = Line::from(" 1/2 tabs  ↑↓ navigate  Esc back  p pricing  q quit").dim();
-    frame.render_widget(Paragraph::new(footer), footer_area);
+    render_status_footer(
+        app,
+        frame,
+        footer_area,
+        " 1/2 tabs  ↑↓ navigate  Esc back  p pricing  q quit",
+    );
 }
 
 fn show_table_widths() -> [Constraint; 11] {
@@ -1408,6 +1541,7 @@ fn show_row(row: &PreparedRow, dim: bool) -> Row<'static> {
 // ---- shared feedback rendering ----
 
 fn render_feedback_content(
+    app: &App,
     frame: &mut Frame,
     area: ratatui::layout::Rect,
     message_lines: Vec<Line<'static>>,
@@ -1416,8 +1550,7 @@ fn render_feedback_content(
     let [content_area, footer_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     frame.render_widget(Paragraph::new(message_lines), content_area);
-    let footer = Line::from(footer_text).dim();
-    frame.render_widget(Paragraph::new(footer), footer_area);
+    render_status_footer(app, frame, footer_area, footer_text);
 }
 
 // ---- inputs view ----
@@ -1434,10 +1567,16 @@ fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout
 
             render_inputs_table(inputs, frame, table_area);
             render_inputs_coverage(inputs, frame, coverage_area);
-            render_inputs_footer(frame, footer_area);
+            render_status_footer(
+                app,
+                frame,
+                footer_area,
+                " 1/2 tabs  ↑↓ navigate  p pricing  q quit",
+            );
         }
         Some(InputsData::Loading) => {
             render_feedback_content(
+                app,
                 frame,
                 area,
                 vec![Line::raw(""), Line::from(" Loading inputs...")],
@@ -1445,17 +1584,19 @@ fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout
             );
         }
         Some(InputsData::Error(msg)) => {
-            render_feedback_content(
-                frame,
-                area,
-                vec![
-                    Line::raw(""),
-                    Line::from(format!(" Error: {msg}")),
-                    Line::raw(""),
-                    Line::from(" Press Enter or r to retry.").dim(),
-                ],
-                " 1/2 tabs  Enter retry  q quit",
-            );
+            // Built before the call, not inline as an argument: `msg`
+            // borrows `app.inputs` mutably (this match's scrutinee),
+            // and that borrow must end before `app` is reborrowed for
+            // the status footer — argument evaluation is left-to-right,
+            // so `app` would otherwise be reborrowed while `msg` is
+            // still live for a later argument.
+            let lines = vec![
+                Line::raw(""),
+                Line::from(format!(" Error: {msg}")),
+                Line::raw(""),
+                Line::from(" Press Enter or r to retry.").dim(),
+            ];
+            render_feedback_content(app, frame, area, lines, " 1/2 tabs  Enter retry  q quit");
         }
         None => {}
     }
@@ -1503,11 +1644,6 @@ fn render_inputs_table(inputs: &mut InputsState, frame: &mut Frame, area: ratatu
 
 fn render_inputs_coverage(inputs: &InputsState, frame: &mut Frame, area: ratatui::layout::Rect) {
     let text = Line::from(format!(" {}", coverage_line(&inputs.coverage)));
-    frame.render_widget(Paragraph::new(text), area);
-}
-
-fn render_inputs_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
-    let text = Line::from(" 1/2 tabs  ↑↓ navigate  p pricing  q quit").dim();
     frame.render_widget(Paragraph::new(text), area);
 }
 
@@ -3096,6 +3232,230 @@ mod tests {
         assert_eq!(app.ctx_generation, original_generation);
         assert!(app.pending_loads.is_empty());
         assert!(!app.pricing_refresh_in_flight);
+    }
+
+    #[test]
+    fn apply_pricing_failure_sets_status_immediately() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        apply_pricing(&mut app, Err(anyhow::anyhow!("network error")));
+        assert!(
+            app.status.is_some(),
+            "a user-triggered pricing failure must set status with no threshold",
+        );
+    }
+
+    #[test]
+    fn apply_show_detail_user_triggered_failure_sets_status() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.view = View::ShowLoading {
+            session_id: "aaa".to_string(),
+            header_label: "test".to_string(),
+        };
+        apply_show_detail(
+            &mut app,
+            "aaa".to_string(),
+            "test".to_string(),
+            Err(anyhow::anyhow!("load failed")),
+            None,
+            false,
+        );
+        assert!(matches!(app.view, View::ShowError { .. }));
+        assert!(
+            app.status.is_some(),
+            "a user-triggered show-detail failure must set status",
+        );
+    }
+
+    #[test]
+    fn apply_inputs_data_user_triggered_failure_sets_status() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loading);
+        apply_inputs_data(&mut app, Err(anyhow::anyhow!("load failed")), None);
+        assert!(matches!(app.inputs, Some(InputsData::Error(_))));
+        assert!(
+            app.status.is_some(),
+            "a user-triggered inputs-load failure must set status",
+        );
+    }
+
+    #[test]
+    fn no_change_does_not_clear_an_existing_status() {
+        // Regression test: `NoChange` fires on the overwhelmingly
+        // common idle refresh tick. A user-triggered error (here, a
+        // failed pricing refresh — the status footer is its only
+        // display surface) must survive one of those ticks landing
+        // moments later, or it vanishes before it can be read.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        apply_pricing(&mut app, Err(anyhow::anyhow!("network error")));
+        assert!(app.status.is_some());
+        apply_refresh_failed(&mut app, "boom");
+        assert_eq!(app.consecutive_refresh_failures, 1);
+
+        let generation = app.ctx_generation;
+        handle_load_result(
+            &mut app,
+            StampedResult {
+                generation,
+                result: LoadResult::NoChange,
+            },
+        );
+
+        assert!(
+            app.status.is_some(),
+            "an unrelated background NoChange must not clear an existing status",
+        );
+        assert_eq!(
+            app.consecutive_refresh_failures, 0,
+            "NoChange still proves the refresh pipeline healthy, resetting the failure counter",
+        );
+    }
+
+    // --- Status footer tests ---
+
+    #[test]
+    fn status_footer_shows_hint_when_status_none() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        assert!(app.status.is_none());
+        let output = render_app(&mut app, 80, 10);
+        let last_line = output.lines().last().unwrap();
+        assert!(
+            last_line.contains("Enter open"),
+            "footer should show the keybinding hint when status is unset; got: {last_line}",
+        );
+    }
+
+    #[test]
+    fn status_footer_shows_message_when_status_some() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.status = Some(StatusMessage {
+            text: "something went wrong".to_string(),
+            from_refresh_failure: false,
+        });
+        let output = render_app(&mut app, 80, 10);
+        let last_line = output.lines().last().unwrap();
+        assert!(
+            last_line.contains("something went wrong"),
+            "footer should show the status message in place of the hint; got: {last_line}",
+        );
+        assert!(
+            !last_line.contains("Enter open"),
+            "the keybinding hint must not appear alongside a status message; got: {last_line}",
+        );
+    }
+
+    #[test]
+    fn status_footer_shows_message_on_show_view() {
+        // Covers the fourth footer site — `render_show_content`'s
+        // formerly-inline footer was the only one not behind a named
+        // helper, so it's the one most likely to have been missed.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        app.status = Some(StatusMessage {
+            text: "show refresh failed".to_string(),
+            from_refresh_failure: false,
+        });
+        let output = render_app(&mut app, 120, 20);
+        let last_line = output.lines().last().unwrap();
+        assert!(
+            last_line.contains("show refresh failed"),
+            "Show view footer should render status; got: {last_line}",
+        );
+    }
+
+    #[test]
+    fn status_footer_shows_message_on_loaded_inputs_view() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        app.status = Some(StatusMessage {
+            text: "inputs refresh failed".to_string(),
+            from_refresh_failure: false,
+        });
+        let output = render_app(&mut app, 120, 10);
+        let last_line = output.lines().last().unwrap();
+        assert!(
+            last_line.contains("inputs refresh failed"),
+            "Inputs view footer should render status; got: {last_line}",
+        );
+    }
+
+    // --- Consecutive refresh-failure threshold tests ---
+
+    #[test]
+    fn two_consecutive_refresh_failures_leave_status_none() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        apply_refresh_failed(&mut app, "boom");
+        apply_refresh_failed(&mut app, "boom");
+        assert_eq!(app.consecutive_refresh_failures, 2);
+        assert!(app.status.is_none(), "two failures should stay silent");
+    }
+
+    #[test]
+    fn third_consecutive_refresh_failure_sets_status() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        apply_refresh_failed(&mut app, "boom");
+        apply_refresh_failed(&mut app, "boom");
+        apply_refresh_failed(&mut app, "boom");
+        assert_eq!(app.consecutive_refresh_failures, 3);
+        assert!(
+            app.status.is_some(),
+            "the third consecutive failure must break silence",
+        );
+    }
+
+    #[test]
+    fn successful_load_after_failures_clears_status_and_resets_counter() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        apply_refresh_failed(&mut app, "boom");
+        apply_refresh_failed(&mut app, "boom");
+        apply_refresh_failed(&mut app, "boom");
+        assert!(app.status.is_some());
+
+        apply_sessions_data(
+            &mut app,
+            Ok(fixture_sessions()),
+            Some(RefreshFingerprint::default()),
+        );
+
+        assert!(app.status.is_none(), "a successful load must clear status");
+        assert_eq!(
+            app.consecutive_refresh_failures, 0,
+            "a successful load must reset the failure counter",
+        );
+    }
+
+    #[test]
+    fn no_change_clears_a_refresh_failure_status() {
+        // Regression test for a manually-observed bug: recovering a
+        // deleted `--projects-dir` via `mv away && mv back` restores
+        // the file with its *original* mtime, so the guarded refresh
+        // that follows can only ever see an unchanged fingerprint
+        // (`NoChange`) — never a changed-data reload. A status that
+        // `apply_refresh_failed` raised must clear on that signal, or
+        // a fully-recovered directory leaves the "may be stale"
+        // warning stuck forever.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        apply_refresh_failed(&mut app, "boom");
+        apply_refresh_failed(&mut app, "boom");
+        apply_refresh_failed(&mut app, "boom");
+        assert!(app.status.is_some());
+
+        let generation = app.ctx_generation;
+        handle_load_result(
+            &mut app,
+            StampedResult {
+                generation,
+                result: LoadResult::NoChange,
+            },
+        );
+
+        assert!(
+            app.status.is_none(),
+            "NoChange must clear a status that apply_refresh_failed itself raised",
+        );
+        assert_eq!(app.consecutive_refresh_failures, 0);
     }
 
     #[test]
