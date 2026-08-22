@@ -18,6 +18,10 @@
 //!   (bare `YYYY-MM-DD` or full RFC 3339), shared by clap and the TUI.
 //! - `render_filter_datetime` — its inverse, in the shortest spelling
 //!   that reparses to the same instant.
+//! - `parse_min_cost` — `--min-cost` parser rejecting negative and
+//!   non-finite values, shared by clap and the TUI filter editor.
+
+use std::str::FromStr;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 
@@ -63,6 +67,29 @@ pub fn parse_filter_datetime(s: &str) -> Result<DateTime<Utc>, String> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|_| "expected YYYY-MM-DD or an RFC 3339 timestamp".to_string())
+}
+
+/// Parse a `--min-cost` threshold. Shared by clap's `--min-cost` and
+/// the TUI filter editor, so a value one surface accepts is a value
+/// the other accepts.
+///
+/// Rejects non-finite and negative values. `NaN` is the motivating
+/// case: `ThresholdsFilter::matches` compares `cost >= NaN`, which is
+/// false for every row, so `--min-cost nan` would commit as a filter
+/// that silently empties every view instead of reporting an error.
+///
+/// # Errors
+/// Returns a human-readable message when the text is unparseable,
+/// non-finite, or below zero.
+pub fn parse_min_cost(s: &str) -> Result<f64, String> {
+    let value = f64::from_str(s).map_err(|_| "expected a number".to_string())?;
+    if !value.is_finite() {
+        return Err("expected a finite number".to_string());
+    }
+    if value < 0.0 {
+        return Err("expected a number at or above zero".to_string());
+    }
+    Ok(value)
 }
 
 /// Render an instant in the shortest spelling that `parse_filter_datetime`
@@ -486,5 +513,25 @@ mod tests {
             ],
         );
         assert!(components.iter().all(|c| c.scoped_to.is_none()));
+    }
+
+    #[test]
+    fn parse_min_cost_accepts_zero_and_small_positive_values() {
+        // Compared as `Option<f64>` rather than bare floats: these
+        // are exact round-trips of a parse, not computed values, and
+        // `float_cmp` fires on the bare form.
+        assert_eq!(parse_min_cost("0").ok(), Some(0.0));
+        assert_eq!(parse_min_cost("0.0001").ok(), Some(0.0001));
+        assert_eq!(parse_min_cost("50").ok(), Some(50.0));
+    }
+
+    #[test]
+    fn parse_min_cost_rejects_non_finite_and_negative() {
+        // `NaN` would otherwise commit as a filter that empties every
+        // view, since `cost >= NaN` is false for every row.
+        assert!(parse_min_cost("nan").is_err());
+        assert!(parse_min_cost("inf").is_err());
+        assert!(parse_min_cost("-1").is_err());
+        assert!(parse_min_cost("abc").is_err());
     }
 }

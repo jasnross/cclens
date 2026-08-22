@@ -18,14 +18,17 @@
 //!   fingerprint-gated).
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Style, Stylize};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
@@ -34,8 +37,11 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::aggregation::{PreparedExchange, PreparedRow};
 use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::Session;
+use crate::filter::{
+    FilterComponent, QueryScope, parse_filter_datetime, parse_min_cost, render_filter_datetime,
+};
 use crate::formatting::{coverage_line, format_cost_opt, format_tokens, tiers_differ};
-use crate::loading::{self, DataContext, PricingData, RefreshFingerprint};
+use crate::loading::{self, DataContext, PricingData, Query, RefreshFingerprint};
 use crate::pricing::{CacheInfo, PricingCatalog};
 use crate::views::{
     inputs_cells, pricing_view_rows, session_cells, session_totals, show_row_cells,
@@ -141,6 +147,252 @@ enum SessionsData {
 
 enum Overlay {
     Pricing,
+    /// Boxed so the variant does not inflate every `Option<Overlay>`
+    /// by the editor's six fields — one allocation per `f` press
+    /// against a value that is moved only on open and close.
+    Filter(Box<FilterEditor>),
+}
+
+/// The six editable filter fields, in `Tab` order. `Session` is
+/// clear-only — it displays the committed UUID and accepts only the
+/// keystroke that empties it, because the constraint is exact
+/// equality on a 36-character value that appears nowhere on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterFieldKind {
+    Session,
+    Project,
+    Since,
+    Until,
+    MinTokens,
+    MinCost,
+}
+
+impl FilterFieldKind {
+    fn label(self) -> &'static str {
+        match self {
+            FilterFieldKind::Session => "session",
+            FilterFieldKind::Project => "project",
+            FilterFieldKind::Since => "since",
+            FilterFieldKind::Until => "until",
+            FilterFieldKind::MinTokens => "min-tokens",
+            FilterFieldKind::MinCost => "min-cost",
+        }
+    }
+
+    /// Whether `Char` input reaches this field. False only for
+    /// `Session`, which is clear-only.
+    fn accepts_text(self) -> bool {
+        match self {
+            FilterFieldKind::Session => false,
+            FilterFieldKind::Project
+            | FilterFieldKind::Since
+            | FilterFieldKind::Until
+            | FilterFieldKind::MinTokens
+            | FilterFieldKind::MinCost => true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ParsedFilterValue {
+    Text(String),
+    Date(DateTime<Utc>),
+    Tokens(u64),
+    Cost(f64),
+}
+
+struct FilterField {
+    kind: FilterFieldKind,
+    /// The field's text, seeded on open by rendering the committed
+    /// `Query` in its shortest round-tripping spelling. Append-only:
+    /// `Char` pushes, `Backspace` pops, and no cursor offset exists.
+    input: String,
+    /// Reparsed on every keystroke. `Err` while the text is non-empty
+    /// and unparseable; `Ok(None)` means the field is empty, which is
+    /// how a filter is cleared. `Enter` is inert while any field is
+    /// `Err`.
+    parsed: Result<Option<ParsedFilterValue>, String>,
+}
+
+struct FilterEditor {
+    fields: [FilterField; 6],
+    focused: usize,
+}
+
+/// Parse one field's text. Empty (or whitespace-only) is `Ok(None)` —
+/// the way a filter is cleared — so fallibility never reaches
+/// `loading`: `Query` is only ever built from already-parsed values.
+fn parse_filter_field(
+    kind: FilterFieldKind,
+    input: &str,
+) -> Result<Option<ParsedFilterValue>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match kind {
+        FilterFieldKind::Session | FilterFieldKind::Project => {
+            Ok(Some(ParsedFilterValue::Text(trimmed.to_string())))
+        }
+        FilterFieldKind::Since | FilterFieldKind::Until => {
+            parse_filter_datetime(trimmed).map(|d| Some(ParsedFilterValue::Date(d)))
+        }
+        FilterFieldKind::MinTokens => u64::from_str(trimmed)
+            .map(|t| Some(ParsedFilterValue::Tokens(t)))
+            .map_err(|_| "expected a whole number".to_string()),
+        FilterFieldKind::MinCost => {
+            parse_min_cost(trimmed).map(|c| Some(ParsedFilterValue::Cost(c)))
+        }
+    }
+}
+
+fn seeded_field(kind: FilterFieldKind, input: String) -> FilterField {
+    FilterField {
+        kind,
+        parsed: parse_filter_field(kind, &input),
+        input,
+    }
+}
+
+impl FilterEditor {
+    /// Seed every field from the committed `Query`, rendering each
+    /// value in the shortest spelling that reparses to it. A seeded
+    /// editor therefore starts entirely `Ok` — the only way to reach
+    /// an `Err` field is to type into it.
+    fn from_query(query: &Query) -> Self {
+        let text = |v: Option<&String>| v.cloned().unwrap_or_default();
+        Self {
+            fields: [
+                seeded_field(
+                    FilterFieldKind::Session,
+                    text(query.inputs_session_id.as_ref()),
+                ),
+                seeded_field(
+                    FilterFieldKind::Project,
+                    text(query.sessions.project_name.as_ref()),
+                ),
+                seeded_field(
+                    FilterFieldKind::Since,
+                    query
+                        .sessions
+                        .since
+                        .map(render_filter_datetime)
+                        .unwrap_or_default(),
+                ),
+                seeded_field(
+                    FilterFieldKind::Until,
+                    query
+                        .sessions
+                        .until
+                        .map(render_filter_datetime)
+                        .unwrap_or_default(),
+                ),
+                seeded_field(
+                    FilterFieldKind::MinTokens,
+                    query
+                        .thresholds
+                        .min_tokens
+                        .map(|t| t.to_string())
+                        .unwrap_or_default(),
+                ),
+                seeded_field(
+                    FilterFieldKind::MinCost,
+                    query
+                        .thresholds
+                        .min_cost
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                ),
+            ],
+            // Not `Session`: it is the one field that rejects `Char`
+            // input, so opening there would silently discard a user's
+            // first keystrokes.
+            focused: 1,
+        }
+    }
+
+    /// Project the parsed fields back into a `Query`. Each field is
+    /// read with `if let` rather than a `match` on `ParsedFilterValue`
+    /// so `wildcard_enum_match_arm` is satisfied without six
+    /// unreachable arms per field — a kind/value mismatch is
+    /// impossible by construction, and dropping it is the safe
+    /// direction if one ever appeared.
+    fn to_query(&self) -> Query {
+        let mut query = Query::default();
+        for field in &self.fields {
+            let Ok(Some(value)) = &field.parsed else {
+                continue;
+            };
+            match field.kind {
+                FilterFieldKind::Session => {
+                    if let ParsedFilterValue::Text(t) = value {
+                        query.inputs_session_id = Some(t.clone());
+                    }
+                }
+                FilterFieldKind::Project => {
+                    if let ParsedFilterValue::Text(t) = value {
+                        query.sessions.project_name = Some(t.clone());
+                    }
+                }
+                FilterFieldKind::Since => {
+                    if let ParsedFilterValue::Date(d) = value {
+                        query.sessions.since = Some(*d);
+                    }
+                }
+                FilterFieldKind::Until => {
+                    if let ParsedFilterValue::Date(d) = value {
+                        query.sessions.until = Some(*d);
+                    }
+                }
+                FilterFieldKind::MinTokens => {
+                    if let ParsedFilterValue::Tokens(t) = value {
+                        query.thresholds.min_tokens = Some(*t);
+                    }
+                }
+                FilterFieldKind::MinCost => {
+                    if let ParsedFilterValue::Cost(c) = value {
+                        query.thresholds.min_cost = Some(*c);
+                    }
+                }
+            }
+        }
+        query
+    }
+
+    fn is_committable(&self) -> bool {
+        self.fields.iter().all(|f| f.parsed.is_ok())
+    }
+
+    fn focus_next(&mut self) {
+        self.focused = (self.focused + 1) % self.fields.len();
+    }
+
+    fn focus_prev(&mut self) {
+        self.focused = (self.focused + self.fields.len() - 1) % self.fields.len();
+    }
+
+    /// Append to the focused field, unless it is clear-only. This is
+    /// what keeps `q` from quitting while a project name is typed.
+    fn push_char(&mut self, c: char) {
+        let field = &mut self.fields[self.focused];
+        if !field.kind.accepts_text() {
+            return;
+        }
+        field.input.push(c);
+        field.parsed = parse_filter_field(field.kind, &field.input);
+    }
+
+    /// One key means "remove" throughout the editor: pop a character
+    /// from a text field, empty a clear-only one.
+    fn backspace(&mut self) {
+        let field = &mut self.fields[self.focused];
+        if field.kind.accepts_text() {
+            field.input.pop();
+        } else {
+            field.input.clear();
+        }
+        field.parsed = parse_filter_field(field.kind, &field.input);
+    }
 }
 
 enum View {
@@ -1120,6 +1372,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     // `app.overlay` ends at the arm and the handler can take `&mut App`.
     match &app.overlay {
         Some(Overlay::Pricing) => return handle_pricing_overlay_key(app, key),
+        Some(Overlay::Filter(_)) => return handle_filter_overlay_key(app, key),
         None => {}
     }
     match key.code {
@@ -1134,6 +1387,12 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('p') => {
             app.overlay = Some(Overlay::Pricing);
+            return false;
+        }
+        KeyCode::Char('f') => {
+            app.overlay = Some(Overlay::Filter(Box::new(FilterEditor::from_query(
+                &app.ctx.query,
+            ))));
             return false;
         }
         KeyCode::Backspace
@@ -1213,6 +1472,93 @@ fn handle_pricing_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         | KeyCode::Modifier(_) => {}
     }
     false
+}
+
+/// Keys while the filter editor is open. Swallows everything it does
+/// not bind, which is the whole point of the overlay owning the
+/// keyboard: `q`, `p`, and `r` are ordinary characters here.
+fn handle_filter_overlay_key(app: &mut App, key: KeyEvent) -> bool {
+    if key.code == KeyCode::Esc {
+        // Discards the uncommitted edit; `ctx.query` is untouched.
+        app.overlay = None;
+        return false;
+    }
+    if key.code == KeyCode::Enter {
+        commit_filter_edit(app);
+        return false;
+    }
+    let Some(Overlay::Filter(editor)) = &mut app.overlay else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Tab => editor.focus_next(),
+        KeyCode::BackTab => editor.focus_prev(),
+        KeyCode::Backspace => editor.backspace(),
+        KeyCode::Char(c) => {
+            // Ctrl-chords are habitual in a text field (Ctrl+W and
+            // Ctrl+U kill a word / the line in most shells). Inserting
+            // a literal `w` is worse than doing nothing. Ctrl-C never
+            // reaches here — `handle_key_event` intercepts it.
+            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                editor.push_char(c);
+            }
+        }
+        KeyCode::Enter
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Null
+        | KeyCode::Esc
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => {}
+    }
+    false
+}
+
+/// Apply the editor's fields to `ctx.query`. Inert while any field
+/// fails to parse — the overlay stays open with its error text
+/// visible, which is the only feedback an inert `Enter` gives.
+fn commit_filter_edit(app: &mut App) {
+    let committable = match &app.overlay {
+        Some(Overlay::Filter(editor)) => editor.is_committable(),
+        Some(Overlay::Pricing) | None => false,
+    };
+    if !committable {
+        return;
+    }
+    // `take()` ends the borrow on the editor *and* clears the overlay
+    // slot, so no separate `app.overlay = None` is needed.
+    //
+    // `invalidate_data` owns the generation bump, the slot clearing,
+    // the Show-view renewal, and the re-dispatch for the visible tab.
+    // Do not bump `ctx_generation` here (it would double-count) and do
+    // not push a `Refresh` (it carries `is_refresh: true`, which
+    // `apply_show_detail` refuses into the `ShowLoading` invalidation
+    // has just installed).
+    let Some(Overlay::Filter(editor)) = app.overlay.take() else {
+        return;
+    };
+    app.ctx.query = editor.to_query();
+    invalidate_data(app);
+    // As `apply_pricing` does: a user-initiated commit is a fresh
+    // action, and a standing error would outrank the empty-state and
+    // missing-model feedback the reload is about to produce.
+    app.clear_status();
 }
 
 fn handle_list_loading_key(key: KeyEvent) -> bool {
@@ -1684,8 +2030,46 @@ fn render(app: &mut App, frame: &mut Frame) {
 
     match &app.overlay {
         Some(Overlay::Pricing) => render_pricing_overlay(app, frame),
+        Some(Overlay::Filter(editor)) => render_filter_overlay(editor, frame),
         None => {}
     }
+}
+
+/// The leading components that fit within `width`, plus how many were
+/// dropped. Whole components only: every rendered component must still
+/// reparse to what `Query` holds, and a mid-value ellipsis would break
+/// that. Measured with `chars().count()` — project names are
+/// user-authored and frequently multi-byte.
+fn fit_filter_components(
+    components: &[FilterComponent],
+    width: usize,
+) -> (Vec<&FilterComponent>, usize) {
+    let measure = |(i, c): (usize, &FilterComponent)| {
+        // Every component after the first carries a separating space.
+        c.text.chars().count() + usize::from(i > 0)
+    };
+    let total: usize = components.iter().enumerate().map(measure).sum();
+    if total <= width {
+        return (components.iter().collect(), 0);
+    }
+
+    // Something must drop, so the ` +N` marker is certain. Reserve its
+    // widest possible width up front — `N` can never exceed the
+    // component count — so the marker itself cannot overflow the half.
+    let reserved = format!(" +{}", components.len()).chars().count();
+    let budget = width.saturating_sub(reserved);
+    let mut fitted = Vec::new();
+    let mut used = 0usize;
+    for (i, component) in components.iter().enumerate() {
+        let cost = measure((i, component));
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        fitted.push(component);
+    }
+    let dropped = components.len() - fitted.len();
+    (fitted, dropped)
 }
 
 fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -1730,12 +2114,97 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(area);
 
-    let left = Line::from(format!(" {sessions_label}  {inputs_label}")).bold();
+    let tabs = format!(" {sessions_label}  {inputs_label}");
+    let mut left_spans = vec![Span::raw(tabs.clone()).bold()];
+
+    // The indicator describes all of `Query`, without exception.
+    // Over-claiming is the safe direction: a component that does not
+    // constrain the visible tab is dimmed, never omitted, because a
+    // hidden filter is one actively narrowing what the user is
+    // reading with nothing on screen to say so.
+    let components = app.ctx.query.describe_active();
+    if !components.is_empty() {
+        const MARKER: &str = "  filter: ";
+        let available = (left_area.width as usize)
+            .saturating_sub(tabs.chars().count() + MARKER.chars().count());
+        let (fitted, dropped) = fit_filter_components(&components, available);
+        if !fitted.is_empty() {
+            left_spans.push(Span::raw(MARKER).dim());
+            for (i, component) in fitted.iter().enumerate() {
+                if i > 0 {
+                    left_spans.push(Span::raw(" "));
+                }
+                // Identical text on both tabs; only the styling
+                // differs, which is what keeps the TUI's indicator
+                // from diverging from the CLI's flag-shaped hint.
+                let span = Span::raw(component.text.clone());
+                let applies = match component.scoped_to {
+                    None => true,
+                    Some(QueryScope::Inputs) => app.tab == Tab::Inputs,
+                };
+                left_spans.push(if applies { span } else { span.dim() });
+            }
+            if dropped > 0 {
+                left_spans.push(Span::raw(format!(" +{dropped}")).dim());
+            }
+        }
+    }
+
+    let left = Line::from(left_spans);
     let right = Line::from(format!("cclens — {context} "))
         .bold()
         .right_aligned();
     frame.render_widget(Paragraph::new(left), left_area);
     frame.render_widget(Paragraph::new(right), right_area);
+}
+
+/// What a zero-row view says. Branches on whether any filter is
+/// active, because the two cases have different remedies: a filtered
+/// view is fixed by pressing `f`, a genuinely empty `projects_dir` is
+/// not fixed by any filter change.
+/// The scope a rendered view loads under, for deciding which filter
+/// components could have emptied it. Sessions and Show load without
+/// `--session`, so naming it there would blame a filter that provably
+/// excluded nothing — and offer a remedy that changes nothing.
+fn view_scope(tab: Tab) -> Option<QueryScope> {
+    match tab {
+        Tab::Sessions => None,
+        Tab::Inputs => Some(QueryScope::Inputs),
+    }
+}
+
+fn empty_state_lines(
+    query: &Query,
+    noun: &str,
+    projects_dir: &Path,
+    scope: Option<QueryScope>,
+) -> Vec<Line<'static>> {
+    // Unlike the header indicator, which over-claims deliberately (a
+    // dimmed component the tab context explains), the empty state
+    // must under-claim: it asserts causation, so a component that
+    // could not have caused this emptiness has no place in it.
+    let components: Vec<FilterComponent> = query
+        .describe_active()
+        .into_iter()
+        .filter(|c| c.scoped_to.is_none() || c.scoped_to == scope)
+        .collect();
+    if components.is_empty() {
+        return vec![
+            Line::raw(""),
+            Line::from(format!(" No {noun} found in {}.", projects_dir.display())),
+        ];
+    }
+    let joined = components
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec![
+        Line::raw(""),
+        Line::from(format!(" No {noun} match {joined}")),
+        Line::raw(""),
+        Line::from(" Press f to change filters.").dim(),
+    ]
 }
 
 fn render_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -1765,6 +2234,32 @@ fn render_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
 }
 
 fn render_loaded_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    // A filtered-to-empty slot is `Loaded` with zero rows, not
+    // `Loading` — the branch belongs here so the two stay
+    // distinguishable during the reload window a commit opens.
+    let is_empty = match &app.sessions {
+        SessionsData::Loaded(state) => state.sessions.is_empty(),
+        SessionsData::Loading | SessionsData::Error(_) => false,
+    };
+    if is_empty {
+        let lines = empty_state_lines(
+            &app.ctx.query,
+            "sessions",
+            &app.ctx.projects_dir,
+            view_scope(Tab::Sessions),
+        );
+        // Navigation and open keys are omitted — there is nothing to
+        // navigate or open.
+        render_feedback_content(
+            app,
+            frame,
+            area,
+            lines,
+            " 1/2 tabs  f filter  p pricing  q quit",
+        );
+        return;
+    }
+
     let [table_area, totals_area, footer_area] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(1),
@@ -1780,7 +2275,7 @@ fn render_loaded_list_content(app: &mut App, frame: &mut Frame, area: ratatui::l
         app,
         frame,
         footer_area,
-        " 1/2 tabs  ↑↓ navigate  Enter open  p pricing  q quit",
+        " 1/2 tabs  ↑↓ navigate  Enter open  f filter  p pricing  q quit",
     );
 }
 
@@ -1856,6 +2351,31 @@ fn render_status_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rec
 // ---- show view ----
 
 fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    // `load_show` applies `ctx.query.thresholds` through
+    // `prepare_exchanges`, so a threshold committed from inside Show
+    // can empty it. Whatever the `f` binding makes reachable, this
+    // view has to explain.
+    let is_empty = match &app.view {
+        View::Show { prepared, .. } => prepared.is_empty(),
+        View::List | View::ShowLoading { .. } | View::ShowError { .. } => false,
+    };
+    if is_empty {
+        let lines = empty_state_lines(
+            &app.ctx.query,
+            "exchanges",
+            &app.ctx.projects_dir,
+            view_scope(Tab::Sessions),
+        );
+        render_feedback_content(
+            app,
+            frame,
+            area,
+            lines,
+            " 1/2 tabs  Esc back  f filter  p pricing  q quit",
+        );
+        return;
+    }
+
     let [table_area, footer_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
 
@@ -1873,7 +2393,7 @@ fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
         app,
         frame,
         footer_area,
-        " 1/2 tabs  ↑↓ navigate  Esc back  p pricing  q quit",
+        " 1/2 tabs  ↑↓ navigate  Esc back  f filter  p pricing  q quit",
     );
 }
 
@@ -1956,6 +2476,31 @@ fn render_feedback_content(
 // ---- inputs view ----
 
 fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    // Checked before the `&mut app.inputs` borrow below, which would
+    // otherwise conflict with reading `app.ctx`. `run_inputs` has no
+    // startup empty guard, so this is the only explanation that
+    // launch path ever produces for an empty attribution table.
+    let is_empty = match &app.inputs {
+        Some(InputsData::Loaded(inputs)) => inputs.rows.is_empty(),
+        Some(InputsData::Loading | InputsData::Error(_)) | None => false,
+    };
+    if is_empty {
+        let lines = empty_state_lines(
+            &app.ctx.query,
+            "files",
+            &app.ctx.projects_dir,
+            view_scope(Tab::Inputs),
+        );
+        render_feedback_content(
+            app,
+            frame,
+            area,
+            lines,
+            " 1/2 tabs  f filter  p pricing  q quit",
+        );
+        return;
+    }
+
     match &mut app.inputs {
         Some(InputsData::Loaded(inputs)) => {
             let [table_area, coverage_area, footer_area] = Layout::vertical([
@@ -1971,7 +2516,7 @@ fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout
                 app,
                 frame,
                 footer_area,
-                " 1/2 tabs  ↑↓ navigate  p pricing  q quit",
+                " 1/2 tabs  ↑↓ navigate  f filter  p pricing  q quit",
             );
         }
         Some(InputsData::Loading) => {
@@ -2103,6 +2648,59 @@ fn render_pricing_overlay(app: &App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(footer), footer_area);
 }
 
+/// The filter editor popup. Centered over the underlying view rather
+/// than replacing it, so the rows the commit is about to change stay
+/// visible while the fields are edited.
+fn render_filter_overlay(editor: &FilterEditor, frame: &mut Frame) {
+    let area = frame.area();
+    // Wide enough that the `session` row — a 36-character UUID plus
+    // its `(clear-only)` marker — is not clipped, with headroom for a
+    // parse-error message beside a short value.
+    let popup_width = 72.min(area.width);
+    // Six field rows, a blank spacer, a footer, and two border rows.
+    let popup_height = 10.min(area.height);
+
+    let popup_area = centered_rect(popup_width, popup_height, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::bordered().title(" Filter ");
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let [fields_area, footer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, field) in editor.fields.iter().enumerate() {
+        let marker = if i == editor.focused { '>' } else { ' ' };
+        let label = field.kind.label();
+        let mut spans = vec![
+            Span::raw(format!(" {marker} {label:<10} ")),
+            Span::raw(field.input.clone()),
+        ];
+        match &field.parsed {
+            Err(message) => spans.push(Span::raw(format!("  {message}")).dim()),
+            // The marker explains why a visible UUID cannot be typed
+            // over. With the field empty there is nothing to explain,
+            // so it renders blank like the other five.
+            Ok(_) if !field.kind.accepts_text() && !field.input.is_empty() => {
+                spans.push(Span::raw("  (clear-only)").dim());
+            }
+            Ok(_) => {}
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::raw(""));
+    frame.render_widget(Paragraph::new(lines), fields_area);
+
+    let footer = if editor.is_committable() {
+        Line::from(" Tab move  Enter apply  Esc cancel").dim()
+    } else {
+        Line::from(" Tab move  fix errors to apply  Esc cancel").dim()
+    };
+    frame.render_widget(Paragraph::new(footer), footer_area);
+}
+
 fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -2133,6 +2731,8 @@ mod tests {
     use std::time::SystemTime;
 
     use chrono::{DateTime, Utc};
+
+    use crate::filter::{SessionFilter, ThresholdsFilter};
     use ratatui::backend::TestBackend;
 
     use super::*;
@@ -5331,5 +5931,634 @@ mod tests {
         );
         assert_eq!(sessions_state(&app).sessions.len(), 3);
         assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
+    }
+
+    // --- Filter editor: opening ---
+
+    fn filter_editor(app: &App) -> &FilterEditor {
+        match &app.overlay {
+            Some(Overlay::Filter(editor)) => editor,
+            Some(Overlay::Pricing) | None => panic!("filter overlay not open"),
+        }
+    }
+
+    fn populated_query() -> Query {
+        Query {
+            sessions: SessionFilter {
+                project_name: Some("alpha".to_string()),
+                since: Some(ts("2026-04-10T00:00:00Z")),
+                until: Some(ts("2026-04-20T14:33:00Z")),
+            },
+            thresholds: ThresholdsFilter {
+                min_tokens: Some(50_000),
+                min_cost: Some(0.5),
+            },
+            inputs_session_id: Some("aaaa1111-2222-3333-4444-555555555555".to_string()),
+        }
+    }
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse::<DateTime<Utc>>().unwrap()
+    }
+
+    #[test]
+    fn f_opens_filter_overlay_from_every_state() {
+        // The binding is global precisely so it works from a view the
+        // user filtered into a dead end — including one still loading.
+        let mut list = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut list, key_event(KeyCode::Char('f')));
+        assert!(matches!(list.overlay, Some(Overlay::Filter(_))));
+
+        let mut show = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut show);
+        handle_key_event(&mut show, key_event(KeyCode::Char('f')));
+        assert!(matches!(show.overlay, Some(Overlay::Filter(_))));
+
+        let mut inputs = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        inputs.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        handle_key_event(&mut inputs, key_event(KeyCode::Char('f')));
+        assert!(matches!(inputs.overlay, Some(Overlay::Filter(_))));
+
+        let mut loading = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        loading.sessions = SessionsData::Loading;
+        handle_key_event(&mut loading, key_event(KeyCode::Char('f')));
+        assert!(matches!(loading.overlay, Some(Overlay::Filter(_))));
+    }
+
+    #[test]
+    fn filter_editor_seeds_every_field_and_round_trips_to_the_same_query() {
+        let query = populated_query();
+        let editor = FilterEditor::from_query(&query);
+        assert!(
+            editor.fields.iter().all(|f| f.parsed.is_ok()),
+            "a seeded editor must start entirely Ok",
+        );
+        assert!(editor.is_committable());
+        assert_eq!(editor.to_query(), query);
+    }
+
+    #[test]
+    fn filter_editor_seeds_midnight_since_as_bare_date() {
+        // The shortest spelling that reparses to the same instant —
+        // otherwise the editor shows a value the user did not type.
+        let query = Query {
+            sessions: SessionFilter {
+                since: Some(ts("2026-04-10T00:00:00Z")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let editor = FilterEditor::from_query(&query);
+        let since = &editor.fields[2];
+        assert_eq!(since.kind, FilterFieldKind::Since);
+        assert_eq!(since.input, "2026-04-10");
+    }
+
+    #[test]
+    fn filter_editor_seeds_non_midnight_until_as_rfc3339() {
+        let editor = FilterEditor::from_query(&populated_query());
+        let until = &editor.fields[3];
+        assert_eq!(until.kind, FilterFieldKind::Until);
+        assert_eq!(until.input, "2026-04-20T14:33:00+00:00");
+    }
+
+    // --- Filter editor: key handling ---
+
+    #[test]
+    fn typing_q_into_project_field_appends_rather_than_quitting() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        // The editor opens focused on `project`, the first field that
+        // accepts text.
+        let quit = handle_key_event(&mut app, key_event(KeyCode::Char('q')));
+        assert!(!quit, "q must not quit while the editor owns the keyboard");
+        assert!(matches!(app.overlay, Some(Overlay::Filter(_))));
+        assert_eq!(filter_editor(&app).fields[1].input, "q");
+    }
+
+    #[test]
+    fn overlay_swallows_pricing_and_refresh_keys() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for c in ['p', 'r'] {
+            handle_key_event(&mut app, key_event(KeyCode::Char(c)));
+        }
+        assert!(matches!(app.overlay, Some(Overlay::Filter(_))));
+        assert!(app.pending_loads.is_empty(), "r must not trigger a refresh");
+        assert_eq!(filter_editor(&app).fields[1].input, "pr");
+    }
+
+    #[test]
+    fn backspace_pops_one_character_from_a_text_field() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = populated_query();
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        handle_key_event(&mut app, key_event(KeyCode::Backspace));
+        assert_eq!(filter_editor(&app).fields[1].input, "alph");
+    }
+
+    #[test]
+    fn backspace_clears_the_whole_session_field_in_one_press() {
+        // One key means "remove" throughout the editor; on the
+        // clear-only field it removes everything.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = populated_query();
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        handle_key_event(&mut app, key_event(KeyCode::BackTab)); // -> session
+        handle_key_event(&mut app, key_event(KeyCode::Backspace));
+        assert_eq!(filter_editor(&app).fields[0].input, "");
+    }
+
+    #[test]
+    fn char_input_into_the_session_field_is_ignored() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = populated_query();
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        handle_key_event(&mut app, key_event(KeyCode::BackTab)); // -> session
+        handle_key_event(&mut app, key_event(KeyCode::Char('x')));
+        assert_eq!(
+            filter_editor(&app).fields[0].input,
+            "aaaa1111-2222-3333-4444-555555555555",
+        );
+    }
+
+    #[test]
+    fn tab_and_backtab_move_focus_and_wrap_at_both_ends() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        assert_eq!(
+            filter_editor(&app).focused,
+            1,
+            "opens on the first text field"
+        );
+
+        for expected in 2..=5 {
+            handle_key_event(&mut app, key_event(KeyCode::Tab));
+            assert_eq!(filter_editor(&app).focused, expected);
+        }
+        handle_key_event(&mut app, key_event(KeyCode::Tab));
+        assert_eq!(filter_editor(&app).focused, 0, "Tab wraps forward");
+
+        handle_key_event(&mut app, key_event(KeyCode::BackTab));
+        assert_eq!(filter_editor(&app).focused, 5, "BackTab wraps backward");
+    }
+
+    // --- Filter editor: commit ---
+
+    #[test]
+    fn enter_is_inert_while_a_field_fails_to_parse() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let before = app.ctx_generation;
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for _ in 0..4 {
+            handle_key_event(&mut app, key_event(KeyCode::Tab)); // project -> min-cost
+        }
+        for c in ['a', 'b', 'c'] {
+            handle_key_event(&mut app, key_event(KeyCode::Char(c)));
+        }
+        assert!(!filter_editor(&app).is_committable());
+
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        assert!(
+            matches!(app.overlay, Some(Overlay::Filter(_))),
+            "the overlay stays open so the error text remains visible",
+        );
+        assert_eq!(app.ctx.query, Query::default());
+        assert_eq!(app.ctx_generation, before);
+    }
+
+    #[test]
+    fn enter_commits_the_query_and_reloads_the_visible_tab() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let before = app.ctx_generation;
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for c in "beta".chars() {
+            handle_key_event(&mut app, key_event(KeyCode::Char(c)));
+        }
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.ctx.query.sessions.project_name,
+            Some("beta".to_string()),
+        );
+        // `invalidate_data` owns the bump — exactly one, not two.
+        assert_eq!(app.ctx_generation, before + 1);
+        assert!(matches!(app.sessions, SessionsData::Loading));
+        assert_eq!(app.pending_loads.len(), 1);
+    }
+
+    #[test]
+    fn commit_from_show_renews_the_view_and_dispatches_show_detail() {
+        // Not a `Refresh { scope: Show }` — that carries
+        // `is_refresh: true`, which `apply_show_detail` refuses into
+        // the `ShowLoading` invalidation has just installed.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+
+        assert!(matches!(app.view, View::ShowLoading { .. }));
+        assert_eq!(app.pending_loads.len(), 1);
+        assert!(matches!(
+            app.pending_loads[0],
+            LoadRequest::ShowDetail { .. }
+        ));
+    }
+
+    #[test]
+    fn esc_discards_the_edit() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let before = app.ctx_generation;
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for c in "beta".chars() {
+            handle_key_event(&mut app, key_event(KeyCode::Char(c)));
+        }
+        handle_key_event(&mut app, key_event(KeyCode::Esc));
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.ctx.query, Query::default());
+        assert_eq!(app.ctx_generation, before);
+    }
+
+    #[test]
+    fn committing_an_unchanged_query_still_reloads() {
+        // Pressing Enter always reloads. A contract that silently did
+        // nothing when the query happened to match would be harder to
+        // explain than one that always costs a reload.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = populated_query();
+        let before = app.ctx_generation;
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+
+        assert_eq!(app.ctx.query, populated_query());
+        assert_eq!(app.ctx_generation, before + 1);
+        assert_eq!(app.pending_loads.len(), 1);
+    }
+
+    // --- Active-filter indicator ---
+
+    #[test]
+    fn fit_filter_components_keeps_whole_components_only() {
+        let components = vec![
+            FilterComponent {
+                text: "--project alpha".to_string(),
+                scoped_to: None,
+            },
+            FilterComponent {
+                text: "--min-tokens 50000".to_string(),
+                scoped_to: None,
+            },
+            FilterComponent {
+                text: "--min-cost 0.5".to_string(),
+                scoped_to: None,
+            },
+        ];
+
+        let (fitted, dropped) = fit_filter_components(&components, 200);
+        assert_eq!(fitted.len(), 3);
+        assert_eq!(dropped, 0);
+
+        // Room for the first component plus the ` +N` marker only.
+        let (fitted, dropped) = fit_filter_components(&components, 20);
+        assert_eq!(fitted.len(), 1);
+        assert_eq!(dropped, 2);
+
+        let (fitted, dropped) = fit_filter_components(&components, 3);
+        assert!(fitted.is_empty());
+        assert_eq!(dropped, 3);
+    }
+
+    #[test]
+    fn fit_filter_components_measures_scalars_not_bytes() {
+        // Each `é` is two bytes but one column. Measuring bytes would
+        // drop a component that fits.
+        let name = "é".repeat(10);
+        let components = vec![FilterComponent {
+            text: format!("--project {name}"),
+            scoped_to: None,
+        }];
+        assert_eq!(components[0].text.len(), 30, "20 bytes of accented text");
+        let (fitted, dropped) = fit_filter_components(&components, 20);
+        assert_eq!(fitted.len(), 1, "10 scalars + `--project ` fits in 20");
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn header_names_active_filters_and_omits_the_marker_when_none() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let unfiltered = render_app(&mut app, 120, 10);
+        assert!(
+            !unfiltered.lines().next().unwrap().contains("filter:"),
+            "an empty Query must render no marker",
+        );
+
+        app.ctx.query = Query {
+            sessions: SessionFilter {
+                project_name: Some("alpha".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let filtered = render_app(&mut app, 120, 10);
+        let header = filtered.lines().next().unwrap();
+        assert!(header.contains("filter:"), "got: {header}");
+        assert!(header.contains("--project alpha"), "got: {header}");
+    }
+
+    #[test]
+    fn header_renders_the_session_component_on_both_tabs() {
+        // The text is identical on both tabs — only the styling
+        // differs, which is what keeps the indicator from diverging
+        // from the CLI's flag-shaped hint.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = Query {
+            inputs_session_id: Some("abc".to_string()),
+            ..Default::default()
+        };
+        assert!(render_app(&mut app, 120, 10).contains("--session abc"));
+
+        app.tab = Tab::Inputs;
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        assert!(render_app(&mut app, 120, 10).contains("--session abc"));
+    }
+
+    // --- Empty-result states ---
+
+    #[test]
+    fn zero_row_list_with_a_filter_names_it_and_offers_f() {
+        let mut app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = Query {
+            sessions: SessionFilter {
+                project_name: Some("nope".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let output = render_app(&mut app, 100, 10);
+        assert!(output.contains("No sessions match"), "got: {output}");
+        assert!(output.contains("--project nope"), "got: {output}");
+        assert!(
+            output.contains("Press f to change filters."),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn zero_row_list_without_a_filter_names_the_projects_dir() {
+        // The genuinely-empty case, which no filter change fixes.
+        let mut app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
+        let output = render_app(&mut app, 100, 10);
+        assert!(output.contains("No sessions found in"), "got: {output}");
+        assert!(!output.contains("Press f"), "got: {output}");
+    }
+
+    #[test]
+    fn zero_row_inputs_with_a_filter_names_it_and_offers_f() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            vec![],
+            fixture_coverage_stats(),
+        )));
+        app.ctx.query = Query {
+            thresholds: ThresholdsFilter {
+                min_tokens: Some(999_999_999),
+                min_cost: None,
+            },
+            ..Default::default()
+        };
+        let output = render_app(&mut app, 100, 10);
+        assert!(output.contains("No files match"), "got: {output}");
+        assert!(output.contains("--min-tokens 999999999"), "got: {output}");
+        assert!(
+            output.contains("Press f to change filters."),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn zero_row_inputs_without_a_filter_names_the_projects_dir() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            vec![],
+            fixture_coverage_stats(),
+        )));
+        let output = render_app(&mut app, 100, 10);
+        assert!(output.contains("No files found in"), "got: {output}");
+        assert!(!output.contains("Press f"), "got: {output}");
+    }
+
+    #[test]
+    fn loading_sessions_slot_is_not_mistaken_for_an_empty_result() {
+        // Loaded-with-zero-rows and Loading share one render path;
+        // during the reload a commit opens they must stay
+        // distinguishable.
+        let mut app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Loading;
+        let output = render_app(&mut app, 100, 10);
+        assert!(output.contains("Loading sessions"), "got: {output}");
+        assert!(!output.contains("No sessions"), "got: {output}");
+    }
+
+    #[test]
+    fn commit_clears_a_standing_status_so_the_empty_state_is_not_masked() {
+        let mut app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
+        app.status = Some(StatusMessage {
+            text: "stale error".to_string(),
+            from_refresh_failure: true,
+        });
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        assert!(app.status.is_none());
+        assert_eq!(app.consecutive_refresh_failures, 0);
+    }
+
+    // --- Keybinding discoverability ---
+
+    #[test]
+    fn loaded_view_footers_advertise_f_filter() {
+        let mut list = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        assert!(render_app(&mut list, 100, 10).contains("f filter"));
+
+        let mut show = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut show);
+        assert!(render_app(&mut show, 100, 10).contains("f filter"));
+
+        let mut inputs = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        inputs.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        assert!(render_app(&mut inputs, 100, 10).contains("f filter"));
+    }
+
+    #[test]
+    fn feedback_view_footers_stay_terse() {
+        // Deliberately unchanged: the empty-state copy names `f`
+        // where it matters, and these rows are the narrow ones.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Loading;
+        let output = render_app(&mut app, 100, 10);
+        assert!(!output.contains("f filter"), "got: {output}");
+    }
+
+    // --- Filter overlay rendering ---
+
+    #[test]
+    fn filter_overlay_renders_every_label_and_the_apply_footer() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = populated_query();
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        let output = render_app(&mut app, 100, 20);
+        for label in [
+            "session",
+            "project",
+            "since",
+            "until",
+            "min-tokens",
+            "min-cost",
+        ] {
+            assert!(output.contains(label), "label `{label}` missing:\n{output}");
+        }
+        assert!(output.contains("Enter apply"), "got:\n{output}");
+        assert!(output.contains("(clear-only)"), "got:\n{output}");
+    }
+
+    #[test]
+    fn filter_overlay_replaces_apply_with_an_error_prompt_and_shows_the_message() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for _ in 0..3 {
+            handle_key_event(&mut app, key_event(KeyCode::Tab)); // project -> min-tokens
+        }
+        handle_key_event(&mut app, key_event(KeyCode::Char('x')));
+        let output = render_app(&mut app, 100, 20);
+        assert!(output.contains("expected a whole number"), "got:\n{output}");
+        assert!(output.contains("fix errors to apply"), "got:\n{output}");
+        assert!(!output.contains("Enter apply"), "got:\n{output}");
+    }
+
+    #[test]
+    fn filter_overlay_omits_the_clear_only_marker_when_the_session_field_is_empty() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        let output = render_app(&mut app, 100, 20);
+        assert!(!output.contains("(clear-only)"), "got:\n{output}");
+    }
+
+    #[test]
+    fn empty_state_omits_filters_that_cannot_constrain_the_view() {
+        // `load_sessions` never reads `inputs_session_id`, so naming
+        // `--session` here would blame a filter that provably excluded
+        // nothing — and offer a remedy that changes nothing.
+        let mut app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = Query {
+            inputs_session_id: Some("abc".to_string()),
+            ..Default::default()
+        };
+        let output = render_app(&mut app, 100, 10);
+        // The header still names it — that over-claim is deliberate,
+        // and it renders dimmed with the tab context to explain it.
+        // The empty state is what must not assert causation.
+        let body: String = output.lines().skip(1).collect::<Vec<_>>().join("\n");
+        assert!(!body.contains("--session abc"), "got: {body}");
+        assert!(
+            body.contains("No sessions found in"),
+            "with no view-constraining filter left, this is the genuinely-empty case; got: {body}",
+        );
+
+        // The same component is load-bearing on Inputs.
+        app.tab = Tab::Inputs;
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            vec![],
+            fixture_coverage_stats(),
+        )));
+        let output = render_app(&mut app, 100, 10);
+        assert!(
+            output.contains("No files match --session abc"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn zero_row_show_explains_the_threshold_that_emptied_it() {
+        // `load_show` applies `ctx.query.thresholds`, and `f` binds
+        // from inside Show — so this state is reachable in one commit.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        if let View::Show { prepared, .. } = &mut app.view {
+            prepared.clear();
+        }
+        app.ctx.query = Query {
+            thresholds: ThresholdsFilter {
+                min_tokens: Some(999_999_999),
+                min_cost: None,
+            },
+            ..Default::default()
+        };
+        let output = render_app(&mut app, 100, 10);
+        assert!(output.contains("No exchanges match"), "got: {output}");
+        assert!(output.contains("--min-tokens 999999999"), "got: {output}");
+        assert!(
+            output.contains("Press f to change filters."),
+            "got: {output}"
+        );
+        assert!(
+            output.contains("Esc back"),
+            "the way out must stay visible; got: {output}"
+        );
+    }
+
+    #[test]
+    fn ctrl_chords_do_not_insert_literal_characters() {
+        // Ctrl+W / Ctrl+U are habitual line-kills in a text field;
+        // inserting a literal `w` is worse than ignoring the chord.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for c in ['w', 'u'] {
+            handle_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+            );
+        }
+        assert_eq!(filter_editor(&app).fields[1].input, "");
+    }
+
+    #[test]
+    fn min_cost_field_rejects_non_finite_values() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let before = app.ctx_generation;
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for _ in 0..4 {
+            handle_key_event(&mut app, key_event(KeyCode::Tab)); // project -> min-cost
+        }
+        for c in "nan".chars() {
+            handle_key_event(&mut app, key_event(KeyCode::Char(c)));
+        }
+        assert!(!filter_editor(&app).is_committable());
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        // Committing NaN would empty every view with no error, since
+        // `cost >= NaN` is false for every row.
+        assert_eq!(app.ctx.query, Query::default());
+        assert_eq!(app.ctx_generation, before);
+    }
+
+    #[test]
+    fn empty_state_footers_keep_the_pricing_key() {
+        // `p` is still bound from these states; only navigation and
+        // open keys are meaningless with zero rows.
+        let mut app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
+        let output = render_app(&mut app, 100, 10);
+        let last = output.lines().last().unwrap();
+        assert!(last.contains("p pricing"), "got: {last}");
+        assert!(last.contains("f filter"), "got: {last}");
+        assert!(!last.contains("navigate"), "got: {last}");
     }
 }

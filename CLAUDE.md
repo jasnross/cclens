@@ -139,7 +139,8 @@ filter        ← ThresholdsFilter / SessionFilter value types — the
                 QueryScope, describe_active on both filter types, and
                 parse_filter_datetime / render_filter_datetime (the
                 lenient YYYY-MM-DD-or-RFC-3339 parser and its
-                shortest-spelling inverse)
+                shortest-spelling inverse) and parse_min_cost (rejects
+                negative / non-finite thresholds on both surfaces)
 ```
 
 Binary entry point (`src/main.rs`):

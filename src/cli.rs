@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 
-use cclens::filter::{SessionFilter, ThresholdsFilter, parse_filter_datetime};
+use cclens::filter::{SessionFilter, ThresholdsFilter, parse_filter_datetime, parse_min_cost};
 use cclens::loading::Query;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -127,7 +127,7 @@ pub(super) struct ThresholdsFilterArgs {
     #[arg(long)]
     min_tokens: Option<u64>,
     /// Show only rows costing at least USD, e.g. --min-cost 0.50; unknown-cost rows excluded
-    #[arg(long)]
+    #[arg(long, value_parser = parse_min_cost)]
     min_cost: Option<f64>,
 }
 
