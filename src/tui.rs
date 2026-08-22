@@ -182,6 +182,25 @@ enum LoadSlot {
     Pricing,
 }
 
+/// The loads currently holding one slot, split by whether each can
+/// answer for a view that is waiting.
+///
+/// A guarded load resolves to `NoChange` when the filesystem is
+/// unchanged, so it satisfies nobody; an unguarded one always produces
+/// a result an applier will consume. That difference is the whole
+/// reason both counts exist — see `App::try_reserve`.
+#[derive(Clone, Copy, Debug, Default)]
+struct Holders {
+    guarded: u32,
+    forced: u32,
+}
+
+impl Holders {
+    fn total(self) -> u32 {
+        self.guarded + self.forced
+    }
+}
+
 enum LoadRequest {
     ShowDetail {
         session_id: String,
@@ -236,6 +255,9 @@ enum LoadResult {
 struct StampedResult {
     generation: u64,
     slot: LoadSlot,
+    /// Whether the dispatch was guarded, so `handle_load_result`
+    /// releases the same holder `spawn_load` reserved.
+    guarded: bool,
     result: LoadResult,
 }
 
@@ -279,13 +301,13 @@ struct App {
     pricing: PricingData,
     pending_loads: Vec<LoadRequest>,
     refresh_fingerprint: RefreshFingerprint,
-    /// How many loads are currently running per slot. Reserved in
+    /// Which loads are currently running, per slot. Reserved in
     /// `spawn_load`, released in `handle_load_result`, and cleared
     /// wholesale by `bump_ctx_generation`. Counted rather than
-    /// flagged because an unguarded dispatch never yields, so two
-    /// loads can legitimately hold one slot — and the first result to
-    /// arrive must not free it out from under the second.
-    in_flight: HashMap<LoadSlot, u32>,
+    /// flagged because a guarded and an unguarded load can hold one
+    /// slot at once — and the first result to arrive must not free it
+    /// out from under the second.
+    in_flight: HashMap<LoadSlot, Holders>,
     /// Replaces the footer's keybinding hint when set. Cleared on any
     /// successful load, alongside `consecutive_refresh_failures`.
     status: Option<StatusMessage>,
@@ -339,30 +361,46 @@ impl App {
     /// Reserve `slot` for one dispatch, reporting whether it may
     /// proceed.
     ///
-    /// A guarded dispatch is background work that can resolve to
-    /// `NoChange`, which satisfies no view waiting on data — so it
-    /// yields when the slot is already held, and its only cost is a
-    /// tick's delay. An unguarded dispatch is one somebody is waiting
-    /// on: it always reserves, because dropping it strands a
-    /// `ShowLoading` or `SessionsData::Loading` that no timer tick
-    /// would ever re-dispatch (`current_scope` reports `None` for the
-    /// former, and a guarded tick answers `NoChange` for the latter).
+    /// A dispatch is redundant only when a load already running can
+    /// answer for it, and guardedness decides that. A guarded dispatch
+    /// is background work whose worst outcome is a tick's delay, so it
+    /// yields to any holder. An unguarded dispatch is one somebody is
+    /// waiting on, so it yields only to another unguarded load —
+    /// yielding to a guarded one would strand a `ShowLoading` or a
+    /// `SessionsData::Loading` the moment that load answered
+    /// `NoChange`, with no tick able to recover it (`current_scope`
+    /// reports `None` for the former and keeps answering `NoChange`
+    /// for the latter).
     fn try_reserve(&mut self, slot: LoadSlot, guarded: bool) -> bool {
-        let holders = self.in_flight.get(&slot).copied().unwrap_or(0);
-        if guarded && holders > 0 {
-            return false;
+        let holders = self.in_flight.entry(slot).or_default();
+        if guarded {
+            if holders.total() > 0 {
+                return false;
+            }
+            holders.guarded += 1;
+        } else {
+            if holders.forced > 0 {
+                return false;
+            }
+            holders.forced += 1;
         }
-        self.in_flight.insert(slot, holders + 1);
         true
     }
 
-    /// Release one holder of `slot`, symmetric with `try_reserve`.
-    fn release_slot(&mut self, slot: &LoadSlot) {
+    /// Release the holder `guarded` describes, symmetric with
+    /// `try_reserve`. The kind matters: freeing a forced holder when a
+    /// guarded one finished would let a later forced dispatch be
+    /// suppressed by a load that cannot answer for it.
+    fn release_slot(&mut self, slot: &LoadSlot, guarded: bool) {
         let Some(holders) = self.in_flight.get_mut(slot) else {
             return;
         };
-        *holders = holders.saturating_sub(1);
-        if *holders == 0 {
+        if guarded {
+            holders.guarded = holders.guarded.saturating_sub(1);
+        } else {
+            holders.forced = holders.forced.saturating_sub(1);
+        }
+        if holders.total() == 0 {
             self.in_flight.remove(slot);
         }
     }
@@ -391,11 +429,20 @@ impl App {
     }
 }
 
-/// Maps the current tab/view to the `RefreshScope` a refresh should
-/// target, or `None` when nothing on screen has loaded data to
-/// refresh. Shared by `build_refresh_request` (guarded, timer-driven)
-/// and `apply_pricing` (forced, after a catalog swap) so both refresh
-/// triggers agree on "what's on screen right now".
+/// Maps the current tab/view to the `RefreshScope` a timer refresh
+/// should target, or `None` when nothing on screen has loaded data to
+/// refresh. Its one caller is `build_refresh_request`; forced reloads
+/// go through `invalidate_data`, which branches on `tab`/`view`
+/// instead.
+///
+/// The two arms are deliberately asymmetric. `Inputs` is
+/// content-sensitive — it requires `InputsData::Loaded` — while
+/// `(Tab::Sessions, View::List, _)` ignores slot contents, so the
+/// timer keeps issuing guarded Sessions refreshes while that slot sits
+/// in `Loading` or `Error`. That is wanted: a guarded tick is the
+/// cheap path that lets a failed sessions load self-heal the moment
+/// the filesystem changes, and the in-flight ledger absorbs the ticks
+/// that would otherwise pile up.
 fn current_scope(app: &App) -> Option<RefreshScope> {
     match (&app.tab, &app.view, &app.inputs) {
         (Tab::Sessions, View::List, _) => Some(RefreshScope::Sessions),
@@ -522,7 +569,8 @@ fn spawn_load<T, L, M>(
     // for this slot — that would be redundant work on a single-
     // threaded loop. An unguarded one never yields; see
     // `App::try_reserve`. Released in `handle_load_result`.
-    if !app.try_reserve(slot.clone(), guard.is_some()) {
+    let guarded = guard.is_some();
+    if !app.try_reserve(slot.clone(), guarded) {
         return;
     }
     let ctx = app.ctx.clone();
@@ -560,6 +608,7 @@ fn spawn_load<T, L, M>(
         let _ = tx.send(StampedResult {
             generation,
             slot,
+            guarded,
             result,
         });
     });
@@ -674,7 +723,7 @@ fn handle_load_result(app: &mut App, stamped: StampedResult) {
     }
     // Release, symmetric with `spawn_load`'s reserve and reached
     // identically by every applier below.
-    app.release_slot(&stamped.slot);
+    app.release_slot(&stamped.slot, stamped.guarded);
     match stamped.result {
         LoadResult::ShowDetail {
             session_id,
@@ -800,11 +849,13 @@ fn apply_inputs_data(
 ) {
     let is_user_triggered =
         refresh_fingerprint.is_none() && matches!(&app.inputs, Some(InputsData::Loading));
-    // Not gated on `refresh_fingerprint.is_some()`: a forced reload
-    // (catalog swap) dispatches with `guard: None`, so a fingerprint-
-    // free result must still be treated as a refresh when the inputs
-    // table is already loaded — otherwise a pricing-catalog swap
-    // would never recompute costs on a visible Inputs tab.
+    // Not gated on `refresh_fingerprint.is_some()`, though the catalog
+    // swap that used to justify that no longer reaches here: a visible
+    // Inputs tab is routed through `InputsData::Loading` by
+    // `invalidate_data`, so its reload lands as `is_user_triggered`.
+    // The branch stays reachable from the guarded timer, and stays
+    // ungated because a fingerprint-free result must still apply to an
+    // already-loaded table rather than be silently dropped.
     let is_refresh_triggered = matches!(&app.inputs, Some(InputsData::Loaded(_)));
 
     if is_user_triggered {
@@ -902,16 +953,121 @@ fn apply_sessions_data(
     }
 }
 
+/// Dispatch whatever the Sessions tab's current view needs when its
+/// data is absent or errored.
+///
+/// Redundant calls are free, and the ledger is what makes them so:
+/// both dispatches here are unguarded, and `App::try_reserve` refuses
+/// an unguarded dispatch when another unguarded load already holds the
+/// slot — that one will produce a result an applier consumes. So
+/// key-repeat on `1` cannot queue a `load_sessions` walk per keypress,
+/// and callers ask only "is this slot loaded?", which the type forces
+/// them to handle, rather than "is a load already running?", which
+/// nothing forces anyone to ask. Keeping that question at the dispatch
+/// chokepoint instead of here is the whole point of the ledger.
+///
+/// Retrying from `Error` matches `try_switch_to_inputs`, which
+/// re-dispatches from its own error state, and enters `Loading` for
+/// the same reason it does: an invisible retry reads as a dead
+/// keypress.
+fn ensure_sessions_data(app: &mut App) {
+    match &app.view {
+        View::List => {
+            if !matches!(app.sessions, SessionsData::Loaded(_)) {
+                app.sessions = SessionsData::Loading;
+                app.pending_loads.push(LoadRequest::Refresh {
+                    scope: RefreshScope::Sessions,
+                    guard: None,
+                });
+            }
+        }
+        View::ShowLoading {
+            session_id,
+            header_label,
+        } => {
+            app.pending_loads.push(LoadRequest::ShowDetail {
+                session_id: session_id.clone(),
+                header_label: header_label.clone(),
+            });
+        }
+        View::Show { .. } | View::ShowError { .. } => {}
+    }
+}
+
+/// Leave a Show-family view for the list, reloading when the sessions
+/// slot was invalidated while the user was inside Show.
+fn return_to_list(app: &mut App) {
+    app.view = View::List;
+    ensure_sessions_data(app);
+}
+
+/// Empty every slot whose contents predate the new `ctx`, and
+/// re-dispatch what the user is currently looking at.
+///
+/// Called from every `ctx` mutation site, and owns the generation bump
+/// so the two cannot drift apart at a call site. That is a convention,
+/// not a type-level guarantee — `ctx` is a plain field — but it holds
+/// by there being exactly one mutation site, `apply_pricing`.
+/// Branches on `app.tab` / `app.view` rather than on
+/// `current_scope`, which derives the visible scope from slot
+/// *contents* and so reports `None` for an Inputs tab sitting in
+/// `Loading` or `Error` — clearing that tab with no re-dispatch leaves
+/// a blank screen that no navigation event recovers.
+///
+/// Off-screen slots are cleared but not reloaded: they refill through
+/// `ensure_sessions_data` and `try_switch_to_inputs` when the user
+/// navigates to them.
+fn invalidate_data(app: &mut App) {
+    app.bump_ctx_generation();
+    app.sessions = SessionsData::Loading;
+
+    // A `Show` holds costs baked in at load time, a `ShowLoading`
+    // holds a promise the bump has just doomed, and a `ShowError` was
+    // computed against a superseded context and may not reproduce.
+    // All three renew into `ShowLoading`; retrying is cheaper than
+    // explaining a stale failure.
+    let renewed = match &app.view {
+        View::List => None,
+        View::Show {
+            session_id,
+            header_label,
+            ..
+        }
+        | View::ShowLoading {
+            session_id,
+            header_label,
+        }
+        | View::ShowError {
+            session_id,
+            header_label,
+            ..
+        } => Some((session_id.clone(), header_label.clone())),
+    };
+    if let Some((session_id, header_label)) = renewed {
+        app.view = View::ShowLoading {
+            session_id,
+            header_label,
+        };
+    }
+
+    if app.tab == Tab::Inputs {
+        app.inputs = Some(InputsData::Loading);
+        app.pending_loads.push(LoadRequest::InputsRefresh);
+    } else {
+        app.inputs = None;
+    }
+
+    if app.tab == Tab::Sessions {
+        ensure_sessions_data(app);
+    }
+}
+
 fn apply_pricing(app: &mut App, result: anyhow::Result<(Arc<PricingCatalog>, PricingData)>) {
     match result {
         Ok((catalog, data)) => {
             app.pricing = data;
             app.ctx.catalog = catalog;
-            app.bump_ctx_generation();
-            if let Some(scope) = current_scope(app) {
-                app.pending_loads
-                    .push(LoadRequest::Refresh { scope, guard: None });
-            }
+            invalidate_data(app);
             app.clear_status();
         }
         Err(e) => {
@@ -1000,6 +1156,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('1') => {
             app.tab = Tab::Sessions;
+            ensure_sessions_data(app);
             return false;
         }
         KeyCode::Char('2') => {
@@ -1208,7 +1365,7 @@ fn handle_show_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') => true,
         KeyCode::Esc | KeyCode::Backspace => {
-            app.view = View::List;
+            return_to_list(app);
             false
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -1263,7 +1420,7 @@ fn handle_show_loading_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') => true,
         KeyCode::Esc | KeyCode::Backspace => {
-            app.view = View::List;
+            return_to_list(app);
             false
         }
         KeyCode::Enter
@@ -1298,7 +1455,7 @@ fn handle_show_error_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') => true,
         KeyCode::Esc | KeyCode::Backspace => {
-            app.view = View::List;
+            return_to_list(app);
             false
         }
         KeyCode::Enter | KeyCode::Char('r') => {
@@ -2019,7 +2176,11 @@ mod tests {
     /// when `try_recv` runs, so "nothing was sent" cannot distinguish
     /// suppression from a task that simply has not started.
     fn holders(app: &App, slot: &LoadSlot) -> u32 {
-        app.in_flight.get(slot).copied().unwrap_or(0)
+        app.in_flight.get(slot).map_or(0, |h| h.total())
+    }
+
+    fn forced_holders(app: &App, slot: &LoadSlot) -> u32 {
+        app.in_flight.get(slot).map_or(0, |h| h.forced)
     }
 
     /// Wraps `handle_load_result` for call sites that don't care about
@@ -2032,6 +2193,7 @@ mod tests {
             StampedResult {
                 generation,
                 slot,
+                guarded: false,
                 result,
             },
         );
@@ -3188,7 +3350,7 @@ mod tests {
         // `occupied_slot_skips_dispatch` for the suppression itself.
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.overlay = Some(Overlay::Pricing);
-        app.in_flight.insert(LoadSlot::Pricing, 1);
+        assert!(app.try_reserve(LoadSlot::Pricing, false));
         handle_key_event(&mut app, key_event(KeyCode::Char('r')));
         assert!(matches!(app.pending_loads[0], LoadRequest::RefreshPricing));
     }
@@ -3207,7 +3369,7 @@ mod tests {
     #[test]
     fn handle_load_result_pricing_success_updates_data() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.in_flight.insert(LoadSlot::Pricing, 1);
+        assert!(app.try_reserve(LoadSlot::Pricing, false));
         let new_pricing = PricingData {
             entries: vec![(
                 "claude-test".to_string(),
@@ -3234,7 +3396,7 @@ mod tests {
     #[test]
     fn handle_load_result_pricing_error_keeps_old_data() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.in_flight.insert(LoadSlot::Pricing, 1);
+        assert!(app.try_reserve(LoadSlot::Pricing, false));
         let original_len = app.pricing.entries.len();
         hlr(
             &mut app,
@@ -3260,7 +3422,7 @@ mod tests {
     fn pricing_overlay_footer_shows_refreshing_state() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.overlay = Some(Overlay::Pricing);
-        app.in_flight.insert(LoadSlot::Pricing, 1);
+        assert!(app.try_reserve(LoadSlot::Pricing, false));
         let output = render_app(&mut app, 100, 20);
         assert!(
             output.contains("refreshing"),
@@ -3427,6 +3589,7 @@ mod tests {
             &mut app,
             StampedResult {
                 generation: 0,
+                guarded: false,
                 slot: LoadSlot::Show("aaa".to_string()),
                 result: LoadResult::ShowDetail {
                     session_id: "aaa".to_string(),
@@ -3452,11 +3615,12 @@ mod tests {
         // duplicate load while that one is still running.
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         app.ctx_generation = 1;
-        app.in_flight.insert(LoadSlot::Sessions, 1);
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
         handle_load_result(
             &mut app,
             StampedResult {
                 generation: 0,
+                guarded: false,
                 slot: LoadSlot::Sessions,
                 result: LoadResult::NoChange,
             },
@@ -3479,6 +3643,7 @@ mod tests {
             &mut app,
             StampedResult {
                 generation,
+                guarded: false,
                 slot: LoadSlot::Show("aaa".to_string()),
                 result: LoadResult::ShowDetail {
                     session_id: "aaa".to_string(),
@@ -3595,6 +3760,7 @@ mod tests {
             &mut app,
             StampedResult {
                 generation,
+                guarded: false,
                 slot: LoadSlot::Sessions,
                 result: LoadResult::NoChange,
             },
@@ -3747,6 +3913,7 @@ mod tests {
             &mut app,
             StampedResult {
                 generation,
+                guarded: false,
                 slot: LoadSlot::Sessions,
                 result: LoadResult::NoChange,
             },
@@ -4033,7 +4200,7 @@ mod tests {
     #[test]
     fn handle_sessions_data_applies_in_list_view() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.in_flight.insert(LoadSlot::Sessions, 1);
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
         let mut updated = fixture_sessions();
         updated[0].total_billable = 9999;
         hlr(
@@ -4050,7 +4217,7 @@ mod tests {
     fn handle_sessions_data_discarded_in_show_view() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
-        app.in_flight.insert(LoadSlot::Sessions, 1);
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
         let original_count = sessions_state(&app).sessions.len();
         hlr(
             &mut app,
@@ -4065,7 +4232,7 @@ mod tests {
     #[test]
     fn handle_no_change_clears_in_flight() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.in_flight.insert(LoadSlot::Sessions, 1);
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
         hlr(&mut app, LoadResult::NoChange);
     }
 
@@ -4129,7 +4296,7 @@ mod tests {
         if let View::Show { table_state, .. } = &mut app.view {
             table_state.select(Some(2));
         }
-        app.in_flight.insert(LoadSlot::Show("aaa".to_string()), 1);
+        assert!(app.try_reserve(LoadSlot::Show("aaa".to_string()), false));
 
         let mut new_prepared = fixture_prepared_exchanges();
         new_prepared.push(PreparedExchange {
@@ -4189,7 +4356,7 @@ mod tests {
         if let View::Show { table_state, .. } = &mut app.view {
             table_state.select(Some(1));
         }
-        app.in_flight.insert(LoadSlot::Show("aaa".to_string()), 1);
+        assert!(app.try_reserve(LoadSlot::Show("aaa".to_string()), false));
 
         let mut new_prepared = fixture_prepared_exchanges();
         new_prepared.push(PreparedExchange {
@@ -4232,7 +4399,7 @@ mod tests {
     fn refresh_show_discarded_when_session_mismatch() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app); // viewing session "aaa"
-        app.in_flight.insert(LoadSlot::Show("bbb".to_string()), 1);
+        assert!(app.try_reserve(LoadSlot::Show("bbb".to_string()), false));
 
         hlr(
             &mut app,
@@ -4296,7 +4463,7 @@ mod tests {
         if let Some(InputsData::Loaded(state)) = &mut app.inputs {
             state.table_state.select(Some(1));
         }
-        app.in_flight.insert(LoadSlot::Inputs, 1);
+        assert!(app.try_reserve(LoadSlot::Inputs, false));
 
         let mut reordered = fixture_attribution_rows();
         reordered.reverse(); // project, skill, global → skill is now at index 1
@@ -4334,7 +4501,7 @@ mod tests {
         if let Some(InputsData::Loaded(state)) = &mut app.inputs {
             state.table_state.select(Some(2));
         }
-        app.in_flight.insert(LoadSlot::Inputs, 1);
+        assert!(app.try_reserve(LoadSlot::Inputs, false));
 
         // Refresh with only one row — the previously selected row is gone
         let single_row = vec![fixture_attribution_rows().remove(0)];
@@ -4348,6 +4515,337 @@ mod tests {
 
         // Old index 2 should fall back to min(2, 0) = 0
         assert_eq!(inputs_table_selected(&app), Some(0));
+    }
+
+    // --- Invalidation tests ---
+
+    fn swap_catalog(app: &mut App) {
+        apply_pricing(
+            app,
+            Ok((Arc::new(PricingCatalog::default()), fixture_pricing_data())),
+        );
+    }
+
+    fn pushed_sessions_refreshes(app: &App) -> usize {
+        app.pending_loads
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    LoadRequest::Refresh {
+                        scope: RefreshScope::Sessions,
+                        guard: None,
+                    }
+                )
+            })
+            .count()
+    }
+
+    fn pushed_show_detail_for(app: &App, id: &str) -> bool {
+        app.pending_loads
+            .iter()
+            .any(|r| matches!(r, LoadRequest::ShowDetail { session_id, .. } if session_id == id))
+    }
+
+    #[test]
+    fn stale_applied_data_does_not_survive_a_swap() {
+        // The first failure trace: an off-screen Sessions tab kept
+        // rendering rows priced against the superseded catalog,
+        // because `1` was a bare tab assignment with no re-dispatch.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+
+        swap_catalog(&mut app);
+        assert!(matches!(app.sessions, SessionsData::Loading));
+
+        app.pending_loads.clear();
+        handle_key_event(&mut app, key_event(KeyCode::Char('1')));
+        assert_eq!(pushed_sessions_refreshes(&app), 1);
+    }
+
+    #[test]
+    fn pending_show_is_renewed_not_stranded() {
+        // The second failure trace: the discard dropped the in-flight
+        // result and nothing re-dispatched, so `ShowLoading` hung.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.view = View::ShowLoading {
+            session_id: "aaa".to_string(),
+            header_label: "\"First session\" (alpha)".to_string(),
+        };
+
+        swap_catalog(&mut app);
+
+        assert!(
+            matches!(&app.view, View::ShowLoading { session_id, .. } if session_id == "aaa"),
+            "the pending view is renewed, not abandoned",
+        );
+        assert!(pushed_show_detail_for(&app, "aaa"));
+
+        // The doomed generation-0 result now lands.
+        assert!(app.try_reserve(LoadSlot::Show("aaa".to_string()), false));
+        handle_load_result(
+            &mut app,
+            StampedResult {
+                generation: 0,
+                guarded: false,
+                slot: LoadSlot::Show("aaa".to_string()),
+                result: LoadResult::ShowDetail {
+                    session_id: "aaa".to_string(),
+                    header_label: "test".to_string(),
+                    result: Ok(fixture_prepared_exchanges()),
+                    refresh_fingerprint: None,
+                    is_refresh: false,
+                },
+            },
+        );
+        assert!(matches!(app.view, View::ShowLoading { .. }));
+        assert!(
+            in_flight(&app, &LoadSlot::Show("aaa".to_string())),
+            "the renewal's reservation survives the stale result",
+        );
+    }
+
+    #[test]
+    fn show_view_is_renewed_on_swap() {
+        // `View::Show` is applied data with costs baked into
+        // `prepared`; leaving it alone reproduces the first trace.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+
+        swap_catalog(&mut app);
+
+        assert!(
+            matches!(&app.view, View::ShowLoading { session_id, .. } if session_id == "aaa"),
+            "a loaded Show view must be reloaded, not kept",
+        );
+        assert!(pushed_show_detail_for(&app, "aaa"));
+    }
+
+    #[test]
+    fn show_error_is_retried_on_swap() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.view = View::ShowError {
+            session_id: "aaa".to_string(),
+            header_label: "test".to_string(),
+            message: "load failed".to_string(),
+        };
+
+        swap_catalog(&mut app);
+
+        assert!(matches!(app.view, View::ShowLoading { .. }));
+        assert!(pushed_show_detail_for(&app, "aaa"));
+    }
+
+    #[test]
+    fn visible_inputs_tab_reloads_while_loading() {
+        // The hole a `current_scope`-driven invalidator leaves: it
+        // reports `None` here, so the tab would be cleared to `None`
+        // with no dispatch and `render_inputs_content` would paint
+        // nothing, with no navigation event able to recover it.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loading);
+
+        swap_catalog(&mut app);
+
+        assert!(matches!(app.inputs, Some(InputsData::Loading)));
+        assert!(
+            app.pending_loads
+                .iter()
+                .any(|r| matches!(r, LoadRequest::InputsRefresh))
+        );
+    }
+
+    #[test]
+    fn visible_inputs_tab_reloads_while_errored() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Error("boom".to_string()));
+
+        swap_catalog(&mut app);
+
+        assert!(matches!(app.inputs, Some(InputsData::Loading)));
+        assert!(
+            app.pending_loads
+                .iter()
+                .any(|r| matches!(r, LoadRequest::InputsRefresh))
+        );
+    }
+
+    #[test]
+    fn offscreen_inputs_is_cleared_and_refills_on_navigation() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+
+        swap_catalog(&mut app);
+        assert!(app.inputs.is_none(), "an off-screen slot is cleared");
+
+        app.pending_loads.clear();
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')));
+        assert!(matches!(app.inputs, Some(InputsData::Loading)));
+        assert!(
+            app.pending_loads
+                .iter()
+                .any(|r| matches!(r, LoadRequest::InputsRefresh))
+        );
+    }
+
+    #[test]
+    fn escaping_show_after_invalidation_reloads_sessions() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+
+        swap_catalog(&mut app);
+        app.pending_loads.clear();
+
+        handle_key_event(&mut app, key_event(KeyCode::Esc));
+        assert!(matches!(app.view, View::List));
+        assert_eq!(pushed_sessions_refreshes(&app), 1);
+    }
+
+    #[test]
+    fn swap_from_list_pushes_exactly_one_sessions_refresh() {
+        // Guards against double-dispatch between the view renewal and
+        // the tab branch.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        swap_catalog(&mut app);
+        assert_eq!(pushed_sessions_refreshes(&app), 1);
+        assert_eq!(app.pending_loads.len(), 1);
+    }
+
+    #[test]
+    fn pricing_failure_does_not_invalidate() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        set_show_view(&mut app);
+        let generation = app.ctx_generation;
+
+        apply_pricing(&mut app, Err(anyhow::anyhow!("network error")));
+
+        assert_eq!(app.ctx_generation, generation);
+        assert!(matches!(app.sessions, SessionsData::Loaded(_)));
+        assert!(matches!(app.inputs, Some(InputsData::Loaded(_))));
+        assert!(matches!(app.view, View::Show { .. }));
+        assert!(app.pending_loads.is_empty());
+    }
+
+    #[test]
+    fn failed_reload_after_invalidation_is_retryable() {
+        // Without an error state this leaves a permanent "Loading
+        // sessions..." screen: the timer's guarded ticks answer
+        // `NoChange` against an unchanged filesystem forever.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        swap_catalog(&mut app);
+        assert!(matches!(app.sessions, SessionsData::Loading));
+
+        hlr(
+            &mut app,
+            LoadResult::SessionsData {
+                result: Err(anyhow::anyhow!("boom")),
+                fingerprint: None,
+            },
+        );
+        assert!(matches!(app.sessions, SessionsData::Error(_)));
+        assert!(app.status.is_some());
+
+        app.pending_loads.clear();
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        assert_eq!(pushed_sessions_refreshes(&app), 1);
+        assert!(matches!(app.sessions, SessionsData::Loading));
+    }
+
+    #[test]
+    fn tab_switch_during_a_forced_load_self_heals() {
+        // The forced result lands while the user is on Inputs, where
+        // `apply_sessions_data` discards it — so the Sessions tab must
+        // re-dispatch when they come back, or it stays empty.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        swap_catalog(&mut app);
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')));
+        hlr(
+            &mut app,
+            LoadResult::SessionsData {
+                result: Ok(fixture_sessions()),
+                fingerprint: None,
+            },
+        );
+        assert!(
+            matches!(app.sessions, SessionsData::Loading),
+            "the result is discarded off-tab",
+        );
+
+        app.pending_loads.clear();
+        handle_key_event(&mut app, key_event(KeyCode::Char('1')));
+        assert_eq!(pushed_sessions_refreshes(&app), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_tab_switches_do_not_queue_duplicate_sessions_loads() {
+        // Both of `ensure_sessions_data`'s dispatches are unguarded,
+        // which the ledger never suppresses — so without its own
+        // check, key-repeat on `1` during a post-swap reload queues a
+        // full `load_sessions` walk per keypress.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let (tx, _rx) = load_channel();
+        swap_catalog(&mut app);
+        drain_pending_loads(&mut app, &tx);
+        assert_eq!(holders(&app, &LoadSlot::Sessions), 1);
+
+        for _ in 0..4 {
+            handle_key_event(&mut app, key_event(KeyCode::Char('1')));
+            drain_pending_loads(&mut app, &tx);
+        }
+        assert_eq!(holders(&app, &LoadSlot::Sessions), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_tab_switches_do_not_queue_duplicate_show_loads() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let (tx, _rx) = load_channel();
+        app.view = View::ShowLoading {
+            session_id: "aaa".to_string(),
+            header_label: "test".to_string(),
+        };
+        for _ in 0..3 {
+            handle_key_event(&mut app, key_event(KeyCode::Char('1')));
+            drain_pending_loads(&mut app, &tx);
+        }
+        assert_eq!(holders(&app, &LoadSlot::Show("aaa".to_string())), 1);
+    }
+
+    #[test]
+    fn show_view_on_the_inputs_tab_renews_and_refills_on_navigation() {
+        // `try_switch_to_inputs` leaves `app.view` alone, so
+        // (Tab::Inputs, View::Show) is reachable. Invalidation renews
+        // that view but dispatches nothing for it — the Sessions
+        // branch is gated on `app.tab` — so the renewal is only made
+        // good when the user navigates back.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        handle_key_event(&mut app, key_event(KeyCode::Char('2')));
+        assert_eq!(app.tab, Tab::Inputs);
+
+        swap_catalog(&mut app);
+        assert!(
+            matches!(app.view, View::ShowLoading { .. }),
+            "the off-screen Show view is still renewed",
+        );
+        assert!(
+            !pushed_show_detail_for(&app, "aaa"),
+            "but nothing is dispatched for an off-screen tab",
+        );
+
+        app.pending_loads.clear();
+        handle_key_event(&mut app, key_event(KeyCode::Char('1')));
+        assert!(pushed_show_detail_for(&app, "aaa"));
     }
 
     // --- In-flight ledger tests ---
@@ -4364,9 +4862,9 @@ mod tests {
     #[test]
     fn bump_ctx_generation_clears_the_ledger() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.in_flight.insert(LoadSlot::Sessions, 1);
-        app.in_flight.insert(LoadSlot::Inputs, 1);
-        app.in_flight.insert(LoadSlot::Show("aaa".to_string()), 1);
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
+        assert!(app.try_reserve(LoadSlot::Inputs, false));
+        assert!(app.try_reserve(LoadSlot::Show("aaa".to_string()), false));
         let before = app.ctx_generation;
 
         app.bump_ctx_generation();
@@ -4391,7 +4889,7 @@ mod tests {
     async fn guarded_dispatch_yields_to_an_occupied_slot() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let (tx, mut rx) = load_channel();
-        app.in_flight.insert(LoadSlot::Sessions, 1);
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
         app.pending_loads.push(LoadRequest::Refresh {
             scope: RefreshScope::Sessions,
             guard: Some(RefreshFingerprint::default()),
@@ -4406,19 +4904,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unguarded_dispatch_is_never_suppressed() {
+    async fn unguarded_dispatch_is_not_suppressed_by_a_guarded_load() {
         // A guarded load can answer `NoChange`, which satisfies no
         // waiting view — so it must never stand in for a load somebody
         // is waiting on.
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let (tx, _rx) = load_channel();
-        app.in_flight.insert(LoadSlot::Sessions, 1);
+        assert!(app.try_reserve(LoadSlot::Sessions, true));
         app.pending_loads.push(LoadRequest::Refresh {
             scope: RefreshScope::Sessions,
             guard: None,
         });
         drain_pending_loads(&mut app, &tx);
-        assert_eq!(holders(&app, &LoadSlot::Sessions), 2);
+        assert_eq!(
+            holders(&app, &LoadSlot::Sessions),
+            2,
+            "the forced load runs alongside the guarded one",
+        );
+    }
+
+    #[tokio::test]
+    async fn unguarded_dispatch_yields_to_another_unguarded_load() {
+        // That one *will* produce a result an applier consumes, so a
+        // second is pure duplicated work.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let (tx, _rx) = load_channel();
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
+        app.pending_loads.push(LoadRequest::Refresh {
+            scope: RefreshScope::Sessions,
+            guard: None,
+        });
+        drain_pending_loads(&mut app, &tx);
+        assert_eq!(holders(&app, &LoadSlot::Sessions), 1);
     }
 
     #[tokio::test]
@@ -4432,7 +4949,7 @@ mod tests {
         // so no tick would ever retry it.
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let (tx, _rx) = load_channel();
-        app.in_flight.insert(LoadSlot::Show("aaa".to_string()), 1);
+        assert!(app.try_reserve(LoadSlot::Show("aaa".to_string()), true));
 
         handle_key_event(&mut app, key_event(KeyCode::Enter));
         assert!(matches!(app.view, View::ShowLoading { .. }));
@@ -4448,23 +4965,40 @@ mod tests {
     #[test]
     fn a_shared_slot_frees_only_when_every_holder_releases() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        assert!(app.try_reserve(LoadSlot::Sessions, false));
+        assert!(app.try_reserve(LoadSlot::Sessions, true));
         assert!(app.try_reserve(LoadSlot::Sessions, false));
 
-        app.release_slot(&LoadSlot::Sessions);
+        app.release_slot(&LoadSlot::Sessions, true);
         assert!(
             in_flight(&app, &LoadSlot::Sessions),
             "the first result must not free the slot the second load still holds",
         );
 
-        app.release_slot(&LoadSlot::Sessions);
+        app.release_slot(&LoadSlot::Sessions, false);
         assert!(!in_flight(&app, &LoadSlot::Sessions));
+    }
+
+    #[test]
+    fn releasing_the_wrong_holder_kind_does_not_free_a_forced_load() {
+        // Releasing by count alone would free the forced holder when a
+        // guarded load finished, and a later forced dispatch would
+        // then be suppressed by a load that cannot answer for it.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
+
+        app.release_slot(&LoadSlot::Sessions, true);
+
+        assert_eq!(
+            forced_holders(&app, &LoadSlot::Sessions),
+            1,
+            "a guarded release must leave the forced holder standing",
+        );
     }
 
     #[test]
     fn releasing_an_unheld_slot_is_a_noop() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.release_slot(&LoadSlot::Sessions);
+        app.release_slot(&LoadSlot::Sessions, false);
         assert!(app.in_flight.is_empty());
     }
 
@@ -4473,7 +5007,7 @@ mod tests {
         // Opening B while A's load runs is two loads, not a duplicate.
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         let (tx, _rx) = load_channel();
-        app.in_flight.insert(LoadSlot::Show("aaa".to_string()), 1);
+        assert!(app.try_reserve(LoadSlot::Show("aaa".to_string()), false));
         app.pending_loads.push(LoadRequest::ShowDetail {
             session_id: "bbb".to_string(),
             header_label: "test".to_string(),
@@ -4492,15 +5026,16 @@ mod tests {
         // doing so would let the very next timer tick start a second
         // guarded load alongside the one still running.
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.in_flight.insert(LoadSlot::Sessions, 1);
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
 
         app.bump_ctx_generation();
-        app.in_flight.insert(LoadSlot::Sessions, 1);
+        assert!(app.try_reserve(LoadSlot::Sessions, false));
 
         handle_load_result(
             &mut app,
             StampedResult {
                 generation: 0,
+                guarded: false,
                 slot: LoadSlot::Sessions,
                 result: LoadResult::NoChange,
             },
@@ -4555,7 +5090,7 @@ mod tests {
         ];
         for (slot, result) in cases {
             let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-            app.in_flight.insert(slot.clone(), 1);
+            assert!(app.try_reserve(slot.clone(), false));
             hlr_with_slot(&mut app, slot.clone(), result);
             assert!(
                 !in_flight(&app, &slot),
