@@ -1116,42 +1116,11 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
-    if app.overlay.is_some() {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('p' | 'q') => {
-                app.overlay = None;
-            }
-            KeyCode::Char('r') => {
-                app.pending_loads.push(LoadRequest::RefreshPricing);
-            }
-            KeyCode::Backspace
-            | KeyCode::Enter
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::Home
-            | KeyCode::End
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-            | KeyCode::Tab
-            | KeyCode::BackTab
-            | KeyCode::Delete
-            | KeyCode::Insert
-            | KeyCode::F(_)
-            | KeyCode::Char(_)
-            | KeyCode::Null
-            | KeyCode::CapsLock
-            | KeyCode::ScrollLock
-            | KeyCode::NumLock
-            | KeyCode::PrintScreen
-            | KeyCode::Pause
-            | KeyCode::Menu
-            | KeyCode::KeypadBegin
-            | KeyCode::Media(_)
-            | KeyCode::Modifier(_) => {}
-        }
-        return false;
+    // The match binds nothing out of the scrutinee, so the borrow of
+    // `app.overlay` ends at the arm and the handler can take `&mut App`.
+    match &app.overlay {
+        Some(Overlay::Pricing) => return handle_pricing_overlay_key(app, key),
+        None => {}
     }
     match key.code {
         KeyCode::Char('1') => {
@@ -1204,6 +1173,46 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         },
         Tab::Inputs => handle_inputs_key(app, key),
     }
+}
+
+/// Keys while the pricing overlay is open. Swallows everything the
+/// overlay does not bind, so no global binding fires behind it.
+fn handle_pricing_overlay_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('p' | 'q') => {
+            app.overlay = None;
+        }
+        KeyCode::Char('r') => {
+            app.pending_loads.push(LoadRequest::RefreshPricing);
+        }
+        KeyCode::Backspace
+        | KeyCode::Enter
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => {}
+    }
+    false
 }
 
 fn handle_list_loading_key(key: KeyEvent) -> bool {
@@ -1673,8 +1682,9 @@ fn render(app: &mut App, frame: &mut Frame) {
         Tab::Inputs => render_inputs_content(app, frame, content_area),
     }
 
-    if app.overlay.is_some() {
-        render_pricing_overlay(app, frame);
+    match &app.overlay {
+        Some(Overlay::Pricing) => render_pricing_overlay(app, frame),
+        None => {}
     }
 }
 
