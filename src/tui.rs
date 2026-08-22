@@ -25,7 +25,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -380,6 +380,15 @@ impl FilterEditor {
             return;
         }
         field.input.push(c);
+        field.parsed = parse_filter_field(field.kind, &field.input);
+    }
+
+    /// Empty the focused field. The one shell chord an append-only
+    /// editor can honor literally — without it, correcting the front
+    /// of an RFC 3339 timestamp costs 25 backspaces.
+    fn clear_field(&mut self) {
+        let field = &mut self.fields[self.focused];
+        field.input.clear();
         field.parsed = parse_filter_field(field.kind, &field.input);
     }
 
@@ -789,7 +798,13 @@ async fn run_event_loop(
             biased;
             event = event_stream.next() => {
                 match event {
-                    Some(Ok(Event::Key(key))) => {
+                    // Press only: Windows consoles and terminals with
+                    // crossterm's keyboard-enhancement flags active
+                    // also deliver Release, which would insert every
+                    // character typed into a filter field twice.
+                    Some(Ok(Event::Key(key)))
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
                         if handle_key_event(&mut app, key) {
                             break;
                         }
@@ -1280,8 +1295,9 @@ fn return_to_list(app: &mut App) {
 ///
 /// Called from every `ctx` mutation site, and owns the generation bump
 /// so the two cannot drift apart at a call site. That is a convention,
-/// not a type-level guarantee — `ctx` is a plain field — but it holds
-/// by there being exactly one mutation site, `apply_pricing`.
+/// not a type-level guarantee — `ctx` is a plain field — held today by
+/// there being two mutation sites, `apply_pricing` and
+/// `commit_filter_edit`, each of which ends by calling this.
 /// Branches on `app.tab` / `app.view` rather than on
 /// `current_scope`, which derives the visible scope from slot
 /// *contents* and so reports `None` for an Inputs tab sitting in
@@ -1520,10 +1536,16 @@ fn handle_filter_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Backspace => editor.backspace(),
         KeyCode::Char(c) => {
             // Ctrl-chords are habitual in a text field (Ctrl+W and
-            // Ctrl+U kill a word / the line in most shells). Inserting
-            // a literal `w` is worse than doing nothing. Ctrl-C never
-            // reaches here — `handle_key_event` intercepts it.
-            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Ctrl+U kill a word / the line in most shells). Ctrl+U is
+            // the one this editor can honor literally, since clearing
+            // needs no cursor; the rest do nothing, because inserting
+            // a literal `w` is worse. Ctrl-C never reaches here —
+            // `handle_key_event` intercepts it.
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if matches!(c, 'u' | 'U') {
+                    editor.clear_field();
+                }
+            } else {
                 editor.push_char(c);
             }
         }
@@ -1572,8 +1594,8 @@ fn commit_filter_edit(app: &mut App) {
     // the Show-view renewal, and the re-dispatch for the visible tab.
     // Do not bump `ctx_generation` here (it would double-count) and do
     // not push a `Refresh` (it carries `is_refresh: true`, which
-    // `apply_show_detail` refuses into the `ShowLoading` invalidation
-    // has just installed).
+    // `apply_show_detail` refuses into the `ShowLoading` state that
+    // invalidation has just installed).
     let Some(Overlay::Filter(editor)) = app.overlay.take() else {
         return;
     };
@@ -2430,7 +2452,7 @@ fn render_status_footer(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
     hint: &str,
-    derived: Option<&str>,
+    derived: Option<DerivedHint>,
 ) {
     let line = if let Some(status) = &app.status {
         match status.kind {
@@ -2444,9 +2466,16 @@ fn render_status_footer(
         // loaded view — evicting them permanently costs the user the
         // way out. The derived half is what drops when the row is too
         // narrow for both.
-        let combined = derived.map(|d| format!("{hint}  {d}"));
-        let text = combined
-            .filter(|c| c.chars().count() <= area.width as usize)
+        // Longest spelling that fits, rather than all-or-nothing:
+        // the full remedy needs 114 columns beside the list hints, so
+        // an 80-column terminal would never see the condition at all.
+        let text = derived
+            .and_then(|d| {
+                [d.long, d.short]
+                    .into_iter()
+                    .map(|form| format!("{hint}  {form}"))
+                    .find(|combined| combined.chars().count() <= area.width as usize)
+            })
             .unwrap_or_else(|| hint.to_string());
         Line::from(text).dim()
     };
@@ -2463,7 +2492,22 @@ fn render_status_footer(
 /// `press p then r` outright would advertise a remedy that, for those
 /// sessions, can never work — permanently, since the condition is
 /// recomputed from the same rows every frame.
-const MISSING_MODEL_HINT: &str = "some rows unpriced — p then r if catalog is stale";
+const MISSING_MODEL_HINT: DerivedHint = DerivedHint {
+    long: "some rows unpriced — p then r if catalog is stale",
+    // Sized to fit: the list hints are 63 columns, leaving 15 at an
+    // 80-column terminal once the two-space separator is paid for.
+    short: "unpriced rows",
+};
+
+/// A standing condition the footer reports beside the key hints, in
+/// two spellings. `long` names the remedy; `short` names only the
+/// condition, so a narrow row still says that something is unpriced
+/// instead of silently saying nothing.
+#[derive(Clone, Copy)]
+struct DerivedHint {
+    long: &'static str,
+    short: &'static str,
+}
 
 // ---- show view ----
 
@@ -2788,6 +2832,9 @@ fn render_pricing_overlay(app: &App, frame: &mut Frame) {
 /// than replacing it, so the rows the commit is about to change stay
 /// visible while the fields are edited.
 fn render_filter_overlay(editor: &FilterEditor, frame: &mut Frame) {
+    // ` > ` plus the 10-column label and its trailing space.
+    const PREFIX_WIDTH: usize = 14;
+
     let area = frame.area();
     // Wide enough that the `session` row — a 36-character UUID plus
     // its `(clear-only)` marker — is not clipped, with headroom for a
@@ -2806,28 +2853,53 @@ fn render_filter_overlay(editor: &FilterEditor, frame: &mut Frame) {
     let [fields_area, footer_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
 
+    let row_width = fields_area.width as usize;
+
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, field) in editor.fields.iter().enumerate() {
         let marker = if i == editor.focused { '>' } else { ' ' };
         let label = field.kind.label();
-        let mut spans = vec![
-            Span::raw(format!(" {marker} {label:<10} ")),
-            Span::raw(field.input.clone()),
-        ];
-        match &field.parsed {
-            Err(message) => spans.push(Span::raw(format!("  {message}")).dim()),
+        let suffix = match &field.parsed {
+            Err(message) => Some(format!("  {message}")),
             // The marker explains why a visible UUID cannot be typed
             // over. With the field empty there is nothing to explain,
             // so it renders blank like the other five.
             Ok(_) if !field.kind.accepts_text() && !field.input.is_empty() => {
-                spans.push(Span::raw("  (clear-only)").dim());
+                Some("  (clear-only)".to_string())
             }
-            Ok(_) => {}
+            Ok(_) => None,
+        };
+        // The suffix keeps its place and the value gives ground: a
+        // value long enough to push the parse error off the row would
+        // leave "fix errors to apply" pointing at nothing. The tail is
+        // what survives, being what the user just typed.
+        let budget = row_width
+            .saturating_sub(PREFIX_WIDTH + suffix.as_ref().map_or(0, |s| s.chars().count()));
+        let mut spans = vec![
+            Span::raw(format!(" {marker} {label:<10} ")),
+            Span::raw(elide_front(&field.input, budget)),
+        ];
+        if let Some(suffix) = suffix {
+            spans.push(Span::raw(suffix).dim());
         }
         lines.push(Line::from(spans));
     }
     lines.push(Line::raw(""));
-    frame.render_widget(Paragraph::new(lines), fields_area);
+    // The popup is capped to the terminal height, so on a short
+    // terminal the six field rows outnumber the rows they have.
+    // Scroll to keep the focused field — and the parse error rendered
+    // beside it — on screen: the footer's "fix errors to apply" is a
+    // dead end while the field it refers to is clipped away.
+    let visible = fields_area.height as usize;
+    let offset = if visible == 0 || editor.focused < visible {
+        0
+    } else {
+        editor.focused + 1 - visible
+    };
+    frame.render_widget(
+        Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(0), 0)),
+        fields_area,
+    );
 
     let footer = if editor.is_committable() {
         Line::from(" Tab move  Enter apply  Esc cancel").dim()
@@ -2835,6 +2907,22 @@ fn render_filter_overlay(editor: &FilterEditor, frame: &mut Frame) {
         Line::from(" Tab move  fix errors to apply  Esc cancel").dim()
     };
     frame.render_widget(Paragraph::new(footer), footer_area);
+}
+
+/// The last `width` scalars of `s`, marked with a leading `…` when
+/// anything was dropped. Scalar-counted, like every other width
+/// decision here — filter values are user-authored text.
+fn elide_front(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    std::iter::once('…')
+        .chain(s.chars().skip(count - (width - 1)))
+        .collect()
 }
 
 fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
@@ -6731,18 +6819,108 @@ mod tests {
     }
 
     #[test]
+    fn zero_row_show_without_a_filter_names_the_session_not_the_directory() {
+        // A session can hold no substantive exchanges with no filter
+        // active. The `projects_dir` is not what emptied it, so the
+        // explanation the other views share does not fit here.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        if let View::Show { prepared, .. } = &mut app.view {
+            prepared.clear();
+        }
+        let output = render_app(&mut app, 100, 10);
+        assert!(
+            output.contains("No exchanges in this session."),
+            "got: {output}"
+        );
+        assert!(
+            !output.contains("Press f to change filters."),
+            "no filter is active, so `f` is not the remedy; got: {output}",
+        );
+    }
+
+    #[test]
+    fn zero_row_show_never_blames_a_filter_it_does_not_load_under() {
+        // `load_show` is handed one session id and applies thresholds
+        // only. Naming `--project` here would assert a causation that
+        // did not happen and offer a remedy that changes nothing.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        if let View::Show { prepared, .. } = &mut app.view {
+            prepared.clear();
+        }
+        app.ctx.query = populated_query();
+        let output = render_app(&mut app, 100, 12);
+        assert!(output.contains("No exchanges match"), "got: {output}");
+        assert!(output.contains("--min-tokens 50000"), "got: {output}");
+        assert!(
+            !output.contains("--project"),
+            "scope filters never reach `load_show`; got: {output}",
+        );
+        assert!(
+            !output.contains("--session"),
+            "`--session` is read by the inputs loader alone; got: {output}",
+        );
+    }
+
+    #[test]
     fn ctrl_chords_do_not_insert_literal_characters() {
-        // Ctrl+W / Ctrl+U are habitual line-kills in a text field;
-        // inserting a literal `w` is worse than ignoring the chord.
+        // Ctrl+W is a habitual line-kill in a text field; inserting a
+        // literal `w` is worse than ignoring the chord.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        // The editor opens focused on `project`, the first field that
+        // accepts text.
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for c in "alpha".chars() {
+            handle_key_event(&mut app, key_event(KeyCode::Char(c)));
+        }
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(filter_editor(&app).fields[1].input, "alpha");
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_focused_field() {
+        // The editor is append-only, so without this the only way back
+        // from a long mistyped value is one backspace per character.
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('f')));
-        for c in ['w', 'u'] {
-            handle_key_event(
-                &mut app,
-                KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
-            );
+        for c in "alpha".chars() {
+            handle_key_event(&mut app, key_event(KeyCode::Char(c)));
         }
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
         assert_eq!(filter_editor(&app).fields[1].input, "");
+        // Clearing re-parses: an emptied field is an inactive filter,
+        // not a parse error that blocks the commit.
+        assert!(filter_editor(&app).is_committable());
+    }
+
+    #[test]
+    fn short_terminal_keeps_the_focused_filter_field_visible() {
+        // The popup is capped to the terminal height. Without a scroll
+        // offset the focused field and its parse error are clipped,
+        // and the footer's "fix errors to apply" points at nothing the
+        // user can see.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for _ in 0..4 {
+            handle_key_event(&mut app, key_event(KeyCode::Tab)); // project -> min-cost
+        }
+        for c in "nope".chars() {
+            handle_key_event(&mut app, key_event(KeyCode::Char(c)));
+        }
+        let output = render_app(&mut app, 100, 8);
+        assert!(output.contains("min-cost"), "got: {output}");
+        assert!(
+            output.contains("nope"),
+            "the typed value must stay visible; got: {output}",
+        );
+        assert!(output.contains("fix errors to apply"), "got: {output}");
     }
 
     #[test]
@@ -6803,6 +6981,65 @@ mod tests {
             .unwrap()
             .trim_end()
             .to_string()
+    }
+
+    #[test]
+    fn footer_reports_the_unpriced_condition_at_eighty_columns() {
+        // The full remedy needs 114 columns beside the list hints. An
+        // all-or-nothing drop made a hint this branch adds inert on
+        // the most common terminal width.
+        let mut app = new_app(unpriced_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let output = render_app(&mut app, 80, 10);
+        let footer = output.lines().last().unwrap();
+        assert!(footer.contains("unpriced rows"), "got: {footer}");
+        assert!(
+            !footer.contains("p then r"),
+            "the remedy does not fit at 80; the condition still must show: {footer}",
+        );
+        assert!(
+            footer.contains("q quit"),
+            "the key hints keep their place: {footer}",
+        );
+
+        let wide = render_app(&mut app, 130, 10);
+        let wide_footer = wide.lines().last().unwrap();
+        assert!(wide_footer.contains("p then r"), "got: {wide_footer}");
+    }
+
+    #[test]
+    fn elide_front_keeps_the_tail_and_marks_the_cut() {
+        assert_eq!(elide_front("alpha", 10), "alpha");
+        assert_eq!(elide_front("alpha", 5), "alpha");
+        assert_eq!(elide_front("alphabet", 5), "…abet");
+        assert_eq!(elide_front("alpha", 1), "…");
+        assert_eq!(elide_front("alpha", 0), "");
+        // Scalars, not bytes: each `é` is two bytes but one column.
+        assert_eq!(elide_front(&"é".repeat(6), 4), "…ééé");
+    }
+
+    #[test]
+    fn a_long_filter_value_cannot_push_its_parse_error_off_the_row() {
+        // The overlay has no cursor and no horizontal scroll, so an
+        // unbounded value would run past the border and take the error
+        // message with it — while the footer still says "fix errors".
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        for _ in 0..4 {
+            handle_key_event(&mut app, key_event(KeyCode::Tab)); // project -> min-cost
+        }
+        for c in "9".repeat(80).chars().chain("x".chars()) {
+            handle_key_event(&mut app, key_event(KeyCode::Char(c)));
+        }
+        let output = render_app(&mut app, 100, 14);
+        assert!(
+            output.contains("expected a number"),
+            "the parse error keeps its place: {output}",
+        );
+        assert!(
+            output.contains('…'),
+            "the value gives ground and marks the cut: {output}",
+        );
+        assert!(output.contains("fix errors to apply"), "got: {output}");
     }
 
     #[test]
