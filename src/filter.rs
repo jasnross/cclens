@@ -8,8 +8,81 @@
 //!   `(project_name, since, until)`.
 //! - `SessionFilter::accepts` — predicate over
 //!   `(project_short_name, started_at)`.
+//! - `QueryScope` — the views a filter component can be confined to.
+//! - `FilterComponent` — one rendered, flag-shaped filter component
+//!   plus the scope it constrains.
+//! - `ThresholdsFilter::describe_active` /
+//!   `SessionFilter::describe_active` — the active flags as
+//!   `Vec<FilterComponent>`, in display order.
+//! - `parse_filter_datetime` — lenient `--since` / `--until` parser
+//!   (bare `YYYY-MM-DD` or full RFC 3339), shared by clap and the TUI.
+//! - `render_filter_datetime` — its inverse, in the shortest spelling
+//!   that reparses to the same instant.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+
+/// The views a filter component can be confined to. `--session` is
+/// the only view-scoped component today; every other component
+/// constrains all three loaders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryScope {
+    Inputs,
+}
+
+/// One rendered filter component and the scope it constrains, in
+/// display order. `text` is flag-shaped on every surface — the CLI
+/// joins components with spaces, the TUI header styles each one by
+/// whether it applies to the visible tab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterComponent {
+    pub text: String,
+    /// `None` when the component constrains every view.
+    pub scoped_to: Option<QueryScope>,
+}
+
+/// Parse a filter timestamp, accepting a bare `YYYY-MM-DD` (midnight
+/// UTC) in addition to full RFC 3339. Shared by clap's `--since` /
+/// `--until` and the TUI filter editor so one date vocabulary serves
+/// both surfaces.
+///
+/// A bare date means midnight UTC on both flags — the same instant,
+/// whichever flag consumed it. Because `SessionFilter::accepts` is
+/// inclusive at both ends, the two flags then read asymmetrically:
+/// `--since 2026-04-15` admits all of the 15th, while
+/// `--until 2026-04-15` admits only sessions starting at midnight
+/// exactly. That asymmetry is what lets one `value_parser` serve
+/// both flags, since it never learns which flag it is parsing for.
+///
+/// # Errors
+/// Returns a human-readable message when the text matches neither
+/// accepted form.
+pub fn parse_filter_datetime(s: &str) -> Result<DateTime<Utc>, String> {
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(date.and_time(NaiveTime::MIN).and_utc());
+    }
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|_| "expected YYYY-MM-DD or an RFC 3339 timestamp".to_string())
+}
+
+/// Render an instant in the shortest spelling that `parse_filter_datetime`
+/// maps back to it: `2026-04-15` for midnight UTC, full RFC 3339
+/// otherwise. Never a reinterpretation — emitting a bare date for a
+/// non-midnight instant would silently widen the filter on the next
+/// commit.
+///
+/// Paired with `parse_filter_datetime`'s one-instant-per-date rule: a
+/// bare date denotes midnight on both flags, so this renderer emits a
+/// bare date for exactly the instants that rule maps back. Change one
+/// and the other must change with it, or the round-trip breaks.
+#[must_use]
+pub fn render_filter_datetime(dt: DateTime<Utc>) -> String {
+    if dt.time() == NaiveTime::MIN {
+        dt.format("%Y-%m-%d").to_string()
+    } else {
+        dt.to_rfc3339()
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ThresholdsFilter {
@@ -29,6 +102,29 @@ impl ThresholdsFilter {
         let tokens_ok = self.min_tokens.is_none_or(|t| tokens >= t);
         let cost_ok = self.min_cost.is_none_or(|c| cost.is_some_and(|n| n >= c));
         tokens_ok && cost_ok
+    }
+
+    /// The active threshold flags, in flag order, as components that
+    /// constrain every view. Cost is formatted with `{c}` — Rust's
+    /// shortest round-trip float formatter — so a small threshold like
+    /// `--min-cost 0.0001` round-trips; `{:.2}` would truncate it to
+    /// `--min-cost 0.00`.
+    #[must_use]
+    pub fn describe_active(&self) -> Vec<FilterComponent> {
+        let mut components = Vec::new();
+        if let Some(t) = self.min_tokens {
+            components.push(FilterComponent {
+                text: format!("--min-tokens {t}"),
+                scoped_to: None,
+            });
+        }
+        if let Some(c) = self.min_cost {
+            components.push(FilterComponent {
+                text: format!("--min-cost {c}"),
+                scoped_to: None,
+            });
+        }
+        components
     }
 }
 
@@ -75,6 +171,34 @@ impl SessionFilter {
     #[must_use]
     pub fn any_active(&self) -> bool {
         self.project_name.is_some() || self.since.is_some() || self.until.is_some()
+    }
+
+    /// The active scope flags, in flag order, as components that
+    /// constrain every view. Dates render through
+    /// `render_filter_datetime`, so what a surface displays always
+    /// reparses to what the filter holds.
+    #[must_use]
+    pub fn describe_active(&self) -> Vec<FilterComponent> {
+        let mut components = Vec::new();
+        if let Some(p) = &self.project_name {
+            components.push(FilterComponent {
+                text: format!("--project {p}"),
+                scoped_to: None,
+            });
+        }
+        if let Some(s) = self.since {
+            components.push(FilterComponent {
+                text: format!("--since {}", render_filter_datetime(s)),
+                scoped_to: None,
+            });
+        }
+        if let Some(u) = self.until {
+            components.push(FilterComponent {
+                text: format!("--until {}", render_filter_datetime(u)),
+                scoped_to: None,
+            });
+        }
+        components
     }
 }
 
@@ -261,5 +385,106 @@ mod tests {
             }
             .any_active()
         );
+    }
+
+    #[test]
+    fn parse_filter_datetime_accepts_bare_date_as_midnight_utc() {
+        assert_eq!(
+            parse_filter_datetime("2026-04-15").unwrap(),
+            ts("2026-04-15T00:00:00Z"),
+        );
+    }
+
+    #[test]
+    fn parse_filter_datetime_converts_non_utc_offset_to_utc() {
+        // 09:30 at +02:00 is 07:30Z — the parser normalizes rather
+        // than preserving the offset, so downstream comparisons are
+        // always against a single timeline.
+        assert_eq!(
+            parse_filter_datetime("2026-04-15T09:30:00+02:00").unwrap(),
+            ts("2026-04-15T07:30:00Z"),
+        );
+    }
+
+    #[test]
+    fn parse_filter_datetime_rejects_unparseable_text() {
+        assert!(parse_filter_datetime("last tuesday").is_err());
+        assert!(parse_filter_datetime("2026-13-45").is_err());
+        assert!(parse_filter_datetime("").is_err());
+    }
+
+    #[test]
+    fn filter_datetime_round_trips_through_shortest_spelling() {
+        // The invariant the editor and the header both depend on:
+        // whatever a surface displays reparses to the same instant.
+        let midnight = ts("2026-04-15T00:00:00Z");
+        assert_eq!(render_filter_datetime(midnight), "2026-04-15");
+        assert_eq!(parse_filter_datetime("2026-04-15").unwrap(), midnight);
+
+        let mid_day = ts("2026-04-15T14:33:00Z");
+        let rendered = render_filter_datetime(mid_day);
+        assert_eq!(rendered, "2026-04-15T14:33:00+00:00");
+        assert_eq!(parse_filter_datetime(&rendered).unwrap(), mid_day);
+    }
+
+    #[test]
+    fn thresholds_describe_active_emits_components_in_flag_order() {
+        assert!(ThresholdsFilter::default().describe_active().is_empty());
+
+        let both = ThresholdsFilter {
+            min_tokens: Some(50_000),
+            min_cost: Some(0.5),
+        };
+        let components = both.describe_active();
+        assert_eq!(
+            components
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["--min-tokens 50000", "--min-cost 0.5"],
+        );
+        assert!(components.iter().all(|c| c.scoped_to.is_none()));
+
+        let tokens_only = ThresholdsFilter {
+            min_tokens: Some(50_000),
+            min_cost: None,
+        };
+        assert_eq!(tokens_only.describe_active().len(), 1);
+    }
+
+    #[test]
+    fn thresholds_describe_active_renders_small_cost_without_truncation() {
+        // `{:.2}` would render this as `--min-cost 0.00`, which
+        // reparses to a different filter than the one in effect.
+        let small = ThresholdsFilter {
+            min_tokens: None,
+            min_cost: Some(0.0001),
+        };
+        assert_eq!(small.describe_active()[0].text, "--min-cost 0.0001");
+    }
+
+    #[test]
+    fn session_filter_describe_active_emits_components_in_flag_order() {
+        assert!(SessionFilter::default().describe_active().is_empty());
+
+        let all = SessionFilter {
+            project_name: Some("alpha".to_string()),
+            since: Some(ts("2026-04-10T00:00:00Z")),
+            until: Some(ts("2026-04-20T14:33:00Z")),
+        };
+        let components = all.describe_active();
+        assert_eq!(
+            components
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "--project alpha",
+                // Midnight renders bare; a non-midnight instant does not.
+                "--since 2026-04-10",
+                "--until 2026-04-20T14:33:00+00:00",
+            ],
+        );
+        assert!(components.iter().all(|c| c.scoped_to.is_none()));
     }
 }

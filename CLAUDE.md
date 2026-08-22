@@ -117,6 +117,9 @@ loading       ← composes discovery/parsing/aggregation/attribution/
                 projects_dir, catalog: Arc<PricingCatalog>, query };
                 load_sessions / load_show / load_inputs /
                 build_fingerprint / pricing_data / refresh_pricing;
+                Query::describe_active composes the filter components
+                in display order (--session, scope, thresholds) for
+                both the CLI hint and the TUI header;
                 consumed by both the TUI (src/tui.rs) and the binary's
                 plain/JSON CLI paths — one loader definition per view,
                 not one per entry point
@@ -128,9 +131,15 @@ rendering     ← comfy-table render_table (list view), render_session
                 rows, subagent → single `subagent` row inline by
                 timestamp), and render_inputs (inputs view) with
                 per-tier coverage line; per-row formatters
-filter        ← Thresholds value type — the cross-boundary primitive
-                that lets rendering accept --min-tokens / --min-cost
-                without depending on clap
+filter        ← ThresholdsFilter / SessionFilter value types — the
+                cross-boundary primitives that let rendering accept
+                --min-tokens / --min-cost / --project / --since /
+                --until without depending on clap; plus the filter
+                vocabulary both surfaces render: FilterComponent,
+                QueryScope, describe_active on both filter types, and
+                parse_filter_datetime / render_filter_datetime (the
+                lenient YYYY-MM-DD-or-RFC-3339 parser and its
+                shortest-spelling inverse)
 ```
 
 Binary entry point (`src/main.rs`):

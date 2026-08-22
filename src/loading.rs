@@ -17,6 +17,9 @@
 //! - `load_sessions(&DataContext) -> anyhow::Result<Vec<Session>>`
 //! - `load_show(&DataContext, &str) -> anyhow::Result<Vec<PreparedExchange>>`
 //! - `load_inputs(&DataContext) -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>`
+//! - `Query::describe_active` — every active filter as a flag-shaped
+//!   `FilterComponent`, in display order (`--session`, scope,
+//!   thresholds). One producer for the CLI hint and the TUI header.
 //! - `build_fingerprint(&Path) -> anyhow::Result<RefreshFingerprint>`
 //! - `pricing_data(&PricingCatalog) -> PricingData`
 //! - `refresh_pricing() -> anyhow::Result<(Arc<PricingCatalog>, PricingData)>`
@@ -37,7 +40,7 @@ use crate::discovery::{
     ProjectSessions, SessionPaths, SubagentPaths, discover, read_subagent_meta,
 };
 use crate::domain::{Session, Turn, TurnOrigin};
-use crate::filter::{SessionFilter, ThresholdsFilter};
+use crate::filter::{FilterComponent, QueryScope, SessionFilter, ThresholdsFilter};
 use crate::inventory::{InventoryConfig, discover_inventory};
 use crate::parsing::parse_jsonl;
 use crate::pricing::{self, ClaudePricing, PricingCatalog};
@@ -46,11 +49,32 @@ use crate::pricing::{self, ClaudePricing, PricingCatalog};
 /// three loaders — `load_inputs` builds its own `InputsFilter` from
 /// `sessions` + `inputs_session_id` rather than taking one pre-built,
 /// so a single `Query` is the sole source of filter semantics.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct Query {
     pub sessions: SessionFilter,
     pub thresholds: ThresholdsFilter,
     pub inputs_session_id: Option<String>,
+}
+
+impl Query {
+    /// Every active filter as a flag-shaped component, in display
+    /// order: `--session`, then scope, then thresholds. An empty
+    /// vector means no filter is active — which is how both the CLI
+    /// hint and the TUI empty states distinguish "filtered to nothing"
+    /// from "nothing to show".
+    #[must_use]
+    pub fn describe_active(&self) -> Vec<FilterComponent> {
+        let mut components = Vec::new();
+        if let Some(id) = &self.inputs_session_id {
+            components.push(FilterComponent {
+                text: format!("--session {id}"),
+                scoped_to: Some(QueryScope::Inputs),
+            });
+        }
+        components.extend(self.sessions.describe_active());
+        components.extend(self.thresholds.describe_active());
+        components
+    }
 }
 
 /// Everything a load needs. Cloned into each dispatched load — a
@@ -792,5 +816,49 @@ mod tests {
         let sessions = load_sessions(&ctx(projects_dir)).expect("load_sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s1");
+    }
+
+    #[test]
+    fn query_describe_active_orders_session_scope_then_thresholds() {
+        let query = Query {
+            sessions: SessionFilter {
+                project_name: Some("alpha".to_string()),
+                since: Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-04-10T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                until: None,
+            },
+            thresholds: ThresholdsFilter {
+                min_tokens: Some(50_000),
+                min_cost: None,
+            },
+            inputs_session_id: Some("abc".to_string()),
+        };
+        let components = query.describe_active();
+        assert_eq!(
+            components
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "--session abc",
+                "--project alpha",
+                "--since 2026-04-10",
+                "--min-tokens 50000",
+            ],
+        );
+        // Only `--session` is view-scoped; every other component
+        // constrains all three loaders.
+        assert_eq!(
+            components.iter().map(|c| c.scoped_to).collect::<Vec<_>>(),
+            vec![Some(QueryScope::Inputs), None, None, None],
+        );
+    }
+
+    #[test]
+    fn query_describe_active_is_empty_when_no_filter_is_set() {
+        assert!(Query::default().describe_active().is_empty());
     }
 }

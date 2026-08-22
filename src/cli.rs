@@ -24,7 +24,8 @@
 
 use std::path::PathBuf;
 
-use cclens::filter::{SessionFilter, ThresholdsFilter};
+use cclens::filter::{SessionFilter, ThresholdsFilter, parse_filter_datetime};
+use cclens::loading::Query;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -143,30 +144,6 @@ impl ThresholdsFilterArgs {
             min_cost: self.min_cost,
         }
     }
-
-    /// True iff at least one threshold flag is active. Used to gate
-    /// the empty-result stderr hint — when no filter is active, an
-    /// empty result is just an empty `projects_dir` and gets no hint.
-    fn any_active(&self) -> bool {
-        self.min_tokens.is_some() || self.min_cost.is_some()
-    }
-
-    /// Format the active flags for the empty-result stderr hint:
-    /// `--min-tokens 50000`, `--min-cost 0.50`, or both joined by a
-    /// space. Cost is formatted with `{}` (Rust's default float
-    /// formatter, shortest round-trip representation) so small
-    /// thresholds like `--min-cost 0.0001` round-trip faithfully —
-    /// `{:.2}` would truncate them to `--min-cost 0.00`.
-    fn describe_active(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(t) = self.min_tokens {
-            parts.push(format!("--min-tokens {t}"));
-        }
-        if let Some(c) = self.min_cost {
-            parts.push(format!("--min-cost {c}"));
-        }
-        parts.join(" ")
-    }
 }
 
 /// Shared `--project` / `--since` / `--until` scope flags for `cclens
@@ -180,12 +157,14 @@ pub(super) struct SessionFilterArgs {
     #[arg(long)]
     project: Option<String>,
     /// Include only sessions whose `started_at` is at or after this
-    /// ISO-8601 timestamp (inclusive).
-    #[arg(long)]
+    /// time (inclusive). Accepts `YYYY-MM-DD`, which means midnight
+    /// UTC, or a full RFC 3339 timestamp.
+    #[arg(long, value_parser = parse_filter_datetime)]
     since: Option<DateTime<Utc>>,
     /// Include only sessions whose `started_at` is at or before this
-    /// ISO-8601 timestamp (inclusive).
-    #[arg(long)]
+    /// time (inclusive). Accepts `YYYY-MM-DD`, which means midnight
+    /// UTC, or a full RFC 3339 timestamp.
+    #[arg(long, value_parser = parse_filter_datetime)]
     until: Option<DateTime<Utc>>,
 }
 
@@ -199,24 +178,6 @@ impl SessionFilterArgs {
             since: self.since,
             until: self.until,
         }
-    }
-
-    fn any_active(&self) -> bool {
-        self.project.is_some() || self.since.is_some() || self.until.is_some()
-    }
-
-    fn describe_active(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(p) = &self.project {
-            parts.push(format!("--project {p}"));
-        }
-        if let Some(s) = &self.since {
-            parts.push(format!("--since {}", s.to_rfc3339()));
-        }
-        if let Some(u) = &self.until {
-            parts.push(format!("--until {}", u.to_rfc3339()));
-        }
-        parts.join(" ")
     }
 }
 
@@ -237,66 +198,51 @@ impl InputsArgs {
     pub(super) fn session_id(&self) -> Option<String> {
         self.session.clone()
     }
-
-    fn any_active(&self) -> bool {
-        self.session.is_some()
-    }
-
-    fn describe_active(&self) -> String {
-        match &self.session {
-            Some(s) => format!("--session {s}"),
-            None => String::new(),
-        }
-    }
 }
 
 /// Emit `note: no rows matched <flags>` to stderr when the `list` /
 /// `show` filters dropped every row. No-op when no filter is active so
 /// the pre-existing "empty `projects_dir` produces no stderr" contract
-/// is preserved. Composes scope-flag and threshold-flag descriptions
-/// in display order: scope first, thresholds second.
+/// is preserved. Delegates the description to `Query::describe_active`,
+/// the one producer both this hint and the TUI header read from.
 pub(super) fn emit_empty_result_hint(scope: &SessionFilterArgs, thresholds: &ThresholdsFilterArgs) {
-    if !scope.any_active() && !thresholds.any_active() {
-        return;
-    }
-    let mut combined = scope.describe_active();
-    if thresholds.any_active() {
-        if !combined.is_empty() {
-            combined.push(' ');
-        }
-        combined.push_str(&thresholds.describe_active());
-    }
-    eprintln!("note: no rows matched {combined}");
+    emit_hint(&Query {
+        sessions: scope.session_filter(),
+        thresholds: thresholds.thresholds_filter(),
+        inputs_session_id: None,
+    });
 }
 
-/// Sibling of `emit_empty_result_hint` for `cclens inputs`: surfaces
-/// the inputs-side, scope, and threshold filter sets in one stderr
-/// line. Suppresses the hint when no filter is active. Display order
-/// is `inputs` (--session), then `scope` (--project/--since/--until),
-/// then `thresholds` (--min-tokens/--min-cost) — matching how the
-/// pre-split `InputsFilterArgs::describe_active` ordered them.
+/// Sibling of `emit_empty_result_hint` for `cclens inputs`: adds the
+/// inputs-only `--session` constraint to the same `Query`, which puts
+/// it first in the rendered order structurally rather than by
+/// hand-ordered concatenation.
 pub(super) fn emit_inputs_empty_hint(
     scope: &SessionFilterArgs,
     inputs: &InputsArgs,
     thresholds: &ThresholdsFilterArgs,
 ) {
-    if !scope.any_active() && !inputs.any_active() && !thresholds.any_active() {
+    emit_hint(&Query {
+        sessions: scope.session_filter(),
+        thresholds: thresholds.thresholds_filter(),
+        inputs_session_id: inputs.session_id(),
+    });
+}
+
+/// Shared tail of both empty-result hints: one producer of the
+/// description text, joined with spaces. Suppressed when no filter is
+/// active, preserving the "empty `projects_dir` produces no stderr"
+/// contract.
+fn emit_hint(query: &Query) {
+    let components = query.describe_active();
+    if components.is_empty() {
         return;
     }
-    let mut combined = inputs.describe_active();
-    let scope_str = scope.describe_active();
-    if !scope_str.is_empty() {
-        if !combined.is_empty() {
-            combined.push(' ');
-        }
-        combined.push_str(&scope_str);
-    }
-    if thresholds.any_active() {
-        if !combined.is_empty() {
-            combined.push(' ');
-        }
-        combined.push_str(&thresholds.describe_active());
-    }
+    let combined = components
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     eprintln!("note: no rows matched {combined}");
 }
 
@@ -371,40 +317,6 @@ mod tests {
         assert_eq!(empty.thresholds_filter(), ThresholdsFilter::default());
     }
 
-    #[test]
-    fn thresholds_filter_args_describe_active_formats_each_combination() {
-        let tokens_only = ThresholdsFilterArgs {
-            min_tokens: Some(50_000),
-            min_cost: None,
-        };
-        assert_eq!(tokens_only.describe_active(), "--min-tokens 50000");
-
-        let cost_only = ThresholdsFilterArgs {
-            min_tokens: None,
-            min_cost: Some(0.50),
-        };
-        assert_eq!(cost_only.describe_active(), "--min-cost 0.5");
-
-        let both = ThresholdsFilterArgs {
-            min_tokens: Some(50_000),
-            min_cost: Some(0.50),
-        };
-        assert_eq!(both.describe_active(), "--min-tokens 50000 --min-cost 0.5",);
-
-        // Regression guard: the default `{}` formatter must round-trip
-        // small values faithfully — `{:.2}` would truncate this to
-        // `--min-cost 0.00`.
-        let small = ThresholdsFilterArgs {
-            min_tokens: None,
-            min_cost: Some(0.0001),
-        };
-        assert!(
-            small.describe_active().contains("--min-cost 0.0001"),
-            "expected 0.0001 to round-trip; got: {}",
-            small.describe_active(),
-        );
-    }
-
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
@@ -448,66 +360,6 @@ mod tests {
 
         let empty = SessionFilterArgs::default();
         assert_eq!(empty.session_filter(), SessionFilter::default());
-    }
-
-    #[test]
-    fn session_filter_args_describe_active_formats_each_combination() {
-        let empty = SessionFilterArgs::default();
-        assert_eq!(empty.describe_active(), "");
-
-        let project_only = SessionFilterArgs {
-            project: Some("alpha".to_string()),
-            since: None,
-            until: None,
-        };
-        assert_eq!(project_only.describe_active(), "--project alpha");
-
-        let since_only = SessionFilterArgs {
-            project: None,
-            since: Some(ts("2026-04-15T00:00:00Z")),
-            until: None,
-        };
-        // `to_rfc3339()` round-trips back to the input string.
-        assert_eq!(
-            since_only.describe_active(),
-            "--since 2026-04-15T00:00:00+00:00"
-        );
-
-        let until_only = SessionFilterArgs {
-            project: None,
-            since: None,
-            until: Some(ts("2026-04-20T00:00:00Z")),
-        };
-        assert_eq!(
-            until_only.describe_active(),
-            "--until 2026-04-20T00:00:00+00:00"
-        );
-
-        let all = SessionFilterArgs {
-            project: Some("alpha".to_string()),
-            since: Some(ts("2026-04-10T00:00:00Z")),
-            until: Some(ts("2026-04-20T00:00:00Z")),
-        };
-        assert_eq!(
-            all.describe_active(),
-            "--project alpha --since 2026-04-10T00:00:00+00:00 --until 2026-04-20T00:00:00+00:00",
-        );
-    }
-
-    #[test]
-    fn inputs_args_describe_active_formats_session() {
-        let empty = InputsArgs::default();
-        assert_eq!(empty.describe_active(), "");
-        assert!(!empty.any_active());
-
-        let with_session = InputsArgs {
-            session: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
-        };
-        assert_eq!(
-            with_session.describe_active(),
-            "--session aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-        );
-        assert!(with_session.any_active());
     }
 
     #[test]

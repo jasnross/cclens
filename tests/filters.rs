@@ -755,16 +755,61 @@ fn list_project_combined_with_min_tokens_logical_and() {
 }
 
 #[test]
-fn list_invalid_date_format_clap_error() {
-    // Bare `YYYY-MM-DD` (no time, no offset) is rejected by chrono's
-    // RFC 3339 parser at clap parse time. The flag name appears in
-    // stderr (anchoring on the offending flag is more stable across
-    // clap/chrono error-template versions).
+fn list_bare_date_since_equals_midnight_utc_timestamp() {
+    // `--since 2026-04-15` and `--since 2026-04-15T00:00:00Z` denote
+    // the same instant, so they must select the same sessions. This
+    // inverts the prior contract, where chrono's RFC 3339 `FromStr`
+    // rejected a bare date at clap parse time.
+    let run = |value: &str| {
+        let cache = isolated_cache();
+        cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+            .env("TZ", "UTC")
+            .args(["--projects-dir"])
+            .arg(projects_fixture_dir())
+            .args(["list", "--since", value])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    assert_eq!(run("2026-04-15"), run("2026-04-15T00:00:00Z"));
+}
+
+#[test]
+fn list_bare_date_until_resolves_to_midnight_utc() {
+    // `--until 2026-04-15` means midnight, matching how `git log
+    // --until <date>` resolves a bare date. Because
+    // `SessionFilter::accepts` is inclusive at both ends, that admits
+    // only sessions starting at exactly 00:00:00Z — the day named is
+    // a boundary, not a window. Pinned here so the shared parser's
+    // one-instant-per-date rule cannot drift into an end-of-day
+    // reinterpretation without this failing.
+    let run = |value: &str| {
+        let cache = isolated_cache();
+        cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+            .env("TZ", "UTC")
+            .args(["--projects-dir"])
+            .arg(projects_fixture_dir())
+            .args(["list", "--until", value])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    assert_eq!(run("2026-04-15"), run("2026-04-15T00:00:00Z"));
+    // ...and that is strictly narrower than the whole day.
+    assert_ne!(run("2026-04-15"), run("2026-04-15T23:59:59Z"));
+}
+
+#[test]
+fn list_unparseable_date_clap_error() {
     let cache = isolated_cache();
     cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
         .args(["--projects-dir"])
         .arg(projects_fixture_dir())
-        .args(["list", "--since", "2026-04-15"])
+        .args(["list", "--since", "last tuesday"])
         .assert()
         .failure()
         .stderr(predicates::str::contains("--since"));
