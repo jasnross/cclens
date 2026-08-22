@@ -513,16 +513,34 @@ struct StampedResult {
     result: LoadResult,
 }
 
-/// The status footer's only content today is a failure — every
-/// producer in this phase is an error path (`apply_show_detail`,
-/// `apply_inputs_data`, `apply_pricing`, `apply_refresh_failed`), so
-/// `render_status_footer` styles every message the same way. A
-/// severity field (e.g. for a future non-error status like an
-/// active-filter indicator) is a one-line addition to make when a
-/// second kind of message actually exists — see CLAUDE.md's Project
-/// Status on not pre-widening pre-1.0 types speculatively.
+/// The severity of a status message, which decides both its styling
+/// and its rank in `render_status_footer`'s precedence.
+enum StatusKind {
+    Error,
+    /// No producer yet — the variant exists so that adding one does not
+    /// reopen the precedence question in `render_status_footer`. Scoped
+    /// to the non-test build because `clippy --all-targets` compiles the
+    /// lib twice, and a variant constructed only under `#[cfg(test)]` is
+    /// genuinely unreachable in the other build. A plain `expect` would
+    /// be unfulfilled in the test build and trip
+    /// `unfulfilled_lint_expectation` instead.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reserved for the first Info-severity producer")
+    )]
+    Info,
+}
+
+/// One message for the status footer. Every producer today is an error
+/// path (`apply_show_detail`, `apply_inputs_data`, `apply_sessions_data`,
+/// `apply_pricing`, `note_refresh_failure`), so `kind` is uniformly
+/// `Error` — but the footer now has a second content source (the
+/// derived missing-model hint), which is what makes the severity
+/// ordering a question the row has to answer regardless of how many
+/// producers exist. See `render_status_footer` for the precedence.
 struct StatusMessage {
     text: String,
+    kind: StatusKind,
     /// Set only by `apply_refresh_failed`. A later `NoChange` proves
     /// the *guarded-refresh pipeline* recovered — that is meaningful
     /// evidence only against a status this same mechanism raised.
@@ -1062,6 +1080,7 @@ fn apply_show_detail(
                 app.status = Some(StatusMessage {
                     text: message.clone(),
                     from_refresh_failure: false,
+                    kind: StatusKind::Error,
                 });
                 app.view = View::ShowError {
                     session_id,
@@ -1121,6 +1140,7 @@ fn apply_inputs_data(
                 app.status = Some(StatusMessage {
                     text: message.clone(),
                     from_refresh_failure: false,
+                    kind: StatusKind::Error,
                 });
                 app.inputs = Some(InputsData::Error(message));
             }
@@ -1198,6 +1218,7 @@ fn apply_sessions_data(
                 app.status = Some(StatusMessage {
                     text: message.clone(),
                     from_refresh_failure: false,
+                    kind: StatusKind::Error,
                 });
                 app.sessions = SessionsData::Error(message);
             }
@@ -1328,6 +1349,7 @@ fn apply_pricing(app: &mut App, result: anyhow::Result<(Arc<PricingCatalog>, Pri
             app.status = Some(StatusMessage {
                 text: format!("{e}"),
                 from_refresh_failure: false,
+                kind: StatusKind::Error,
             });
         }
     }
@@ -1356,6 +1378,7 @@ fn note_refresh_failure(app: &mut App, message: &str) {
             // worth reading before the boilerplate, not after it.
             text: format!("{message} — refresh failing, data may be stale"),
             from_refresh_failure: true,
+            kind: StatusKind::Error,
         });
     }
 }
@@ -2267,15 +2290,26 @@ fn render_loaded_list_content(app: &mut App, frame: &mut Frame, area: ratatui::l
     ])
     .areas(area);
 
-    if let SessionsData::Loaded(state) = &mut app.sessions {
+    // Derived over the same rows the table just rendered:
+    // `load_sessions` applies the thresholds before the slot is
+    // filled, so this is never a superset of what is on screen.
+    let derived = if let SessionsData::Loaded(state) = &mut app.sessions {
         render_sessions_table(state, frame, table_area);
         render_totals(state, frame, totals_area);
-    }
+        state
+            .sessions
+            .iter()
+            .any(|s| s.cost_breakdown.is_none())
+            .then_some(MISSING_MODEL_HINT)
+    } else {
+        None
+    };
     render_status_footer(
         app,
         frame,
         footer_area,
         " 1/2 tabs  ↑↓ navigate  Enter open  f filter  p pricing  q quit",
+        derived,
     );
 }
 
@@ -2335,18 +2369,58 @@ fn render_totals(state: &SessionsState, frame: &mut Frame, area: ratatui::layout
     frame.render_widget(table, area);
 }
 
-/// Renders `app.status` (styled red — see `StatusMessage`'s doc
-/// comment on why there's no severity field yet) in place of `hint`
-/// when set. Shared by every footer row so error/refresh-failure
-/// feedback surfaces uniformly across List, Show, Inputs, and the
-/// loading/error feedback views — one status slot, four render sites.
-fn render_status_footer(app: &App, frame: &mut Frame, area: ratatui::layout::Rect, hint: &str) {
-    let line = match &app.status {
-        Some(status) => Line::from(format!(" {}", status.text)).red(),
-        None => Line::from(hint).dim(),
+/// One footer row, four possible producers, in this precedence:
+/// 1. `app.status` with `StatusKind::Error` — red, takes the row
+/// 2. `app.status` with `StatusKind::Info` — dim, takes the row
+/// 3. `hint` plus `derived`, when both fit — dim
+/// 4. `hint` alone — dim
+///
+/// A status outranks the row because it is the newer, user-triggered
+/// fact, and because it clears. `derived` describes a standing
+/// condition that will still be true after the status clears, so it
+/// shares the row with the key hints rather than evicting them.
+/// `derived` is computed by the callers that render priced rows and
+/// passed in, not derived here — a feedback view has no rows and
+/// correctly reports nothing.
+fn render_status_footer(
+    app: &App,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    hint: &str,
+    derived: Option<&str>,
+) {
+    let line = if let Some(status) = &app.status {
+        match status.kind {
+            StatusKind::Error => Line::from(format!(" {}", status.text)).red(),
+            StatusKind::Info => Line::from(format!(" {}", status.text)).dim(),
+        }
+    } else {
+        // A standing condition shares the row rather than taking it.
+        // A status clears; this does not, and the key hints are the
+        // only place `q quit` and `f filter` are advertised on a
+        // loaded view — evicting them permanently costs the user the
+        // way out. The derived half is what drops when the row is too
+        // narrow for both.
+        let combined = derived.map(|d| format!("{hint}  {d}"));
+        let text = combined
+            .filter(|c| c.chars().count() <= area.width as usize)
+            .unwrap_or_else(|| hint.to_string());
+        Line::from(text).dim()
     };
     frame.render_widget(Paragraph::new(line), area);
 }
+
+/// Named once and rendered from two views.
+///
+/// The remedy is stated conditionally because the condition has causes
+/// a refresh cannot fix: `cost_for_components` returns `None` both when
+/// the catalog lacks the model *and* when the transcript's model string
+/// is absent or unpriceable (Claude Code writes `<synthetic>` on
+/// API-error turns, which no catalog will ever carry). Promising
+/// `press p then r` outright would advertise a remedy that, for those
+/// sessions, can never work — permanently, since the condition is
+/// recomputed from the same rows every frame.
+const MISSING_MODEL_HINT: &str = "some rows unpriced — p then r if catalog is stale";
 
 // ---- show view ----
 
@@ -2389,11 +2463,14 @@ fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
     };
     render_show_table(prepared, table_state, frame, table_area);
 
+    // Deliberately `None`: a `PreparedExchange` is a per-turn exchange
+    // rather than a priced session, so "unpriced" is undefined here.
     render_status_footer(
         app,
         frame,
         footer_area,
         " 1/2 tabs  ↑↓ navigate  Esc back  f filter  p pricing  q quit",
+        None,
     );
 }
 
@@ -2470,7 +2547,9 @@ fn render_feedback_content(
     let [content_area, footer_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     frame.render_widget(Paragraph::new(message_lines), content_area);
-    render_status_footer(app, frame, footer_area, footer_text);
+    // A feedback view has no rows, so it has no standing condition to
+    // report — the derived slot is correctly empty here.
+    render_status_footer(app, frame, footer_area, footer_text, None);
 }
 
 // ---- inputs view ----
@@ -2512,11 +2591,21 @@ fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout
 
             render_inputs_table(inputs, frame, table_area);
             render_inputs_coverage(inputs, frame, coverage_area);
+            // Bound before the call for the same borrow reason the
+            // `Error` arm's comment below documents: `inputs` borrows
+            // this match's scrutinee, and that borrow must end before
+            // `app` is reborrowed for the footer.
+            let derived = inputs
+                .rows
+                .iter()
+                .any(|r| r.attributed_cost.is_none())
+                .then_some(MISSING_MODEL_HINT);
             render_status_footer(
                 app,
                 frame,
                 footer_area,
                 " 1/2 tabs  ↑↓ navigate  f filter  p pricing  q quit",
+                derived,
             );
         }
         Some(InputsData::Loading) => {
@@ -3503,6 +3592,18 @@ mod tests {
         ]
     }
 
+    /// `fixture_attribution_rows` deliberately includes one row with
+    /// `attributed_cost: None`. Tests about the footer's *static* hint
+    /// need rows that are all priced, since an unpriced row is a
+    /// standing condition that outranks the key hints.
+    fn priced_attribution_rows() -> Vec<AttributionRow> {
+        let mut rows = fixture_attribution_rows();
+        for row in &mut rows {
+            row.attributed_cost = Some(0.001);
+        }
+        rows
+    }
+
     fn fixture_coverage_stats() -> CoverageStats {
         CoverageStats {
             long_1h: TierCoverage {
@@ -3734,7 +3835,7 @@ mod tests {
     fn inputs_tab_renders_footer_with_tab_hint() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         app.inputs = Some(InputsData::Loaded(InputsState::new(
-            fixture_attribution_rows(),
+            priced_attribution_rows(),
             fixture_coverage_stats(),
         )));
         app.tab = Tab::Inputs;
@@ -4406,6 +4507,7 @@ mod tests {
         app.status = Some(StatusMessage {
             text: "something went wrong".to_string(),
             from_refresh_failure: false,
+            kind: StatusKind::Error,
         });
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
@@ -4429,6 +4531,7 @@ mod tests {
         app.status = Some(StatusMessage {
             text: "show refresh failed".to_string(),
             from_refresh_failure: false,
+            kind: StatusKind::Error,
         });
         let output = render_app(&mut app, 120, 20);
         let last_line = output.lines().last().unwrap();
@@ -4448,6 +4551,7 @@ mod tests {
         app.status = Some(StatusMessage {
             text: "inputs refresh failed".to_string(),
             from_refresh_failure: false,
+            kind: StatusKind::Error,
         });
         let output = render_app(&mut app, 120, 10);
         let last_line = output.lines().last().unwrap();
@@ -6373,6 +6477,7 @@ mod tests {
         app.status = Some(StatusMessage {
             text: "stale error".to_string(),
             from_refresh_failure: true,
+            kind: StatusKind::Error,
         });
         handle_key_event(&mut app, key_event(KeyCode::Char('f')));
         handle_key_event(&mut app, key_event(KeyCode::Enter));
@@ -6393,7 +6498,7 @@ mod tests {
 
         let mut inputs = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
         inputs.inputs = Some(InputsData::Loaded(InputsState::new(
-            fixture_attribution_rows(),
+            priced_attribution_rows(),
             fixture_coverage_stats(),
         )));
         assert!(render_app(&mut inputs, 100, 10).contains("f filter"));
@@ -6560,5 +6665,151 @@ mod tests {
         assert!(last.contains("p pricing"), "got: {last}");
         assert!(last.contains("f filter"), "got: {last}");
         assert!(!last.contains("navigate"), "got: {last}");
+    }
+
+    // --- Status severity and the missing-model hint ---
+
+    /// `fixture_sessions` with its precondition asserted rather than
+    /// assumed: every session priced, so the derived hint stays silent
+    /// unless a test deliberately unprices one.
+    fn fixture_sessions_asserted_priced() -> Vec<Session> {
+        let sessions = fixture_sessions();
+        assert!(
+            sessions.iter().all(|s| s.cost_breakdown.is_some()),
+            "fixture must start fully priced",
+        );
+        sessions
+    }
+
+    fn unpriced_sessions() -> Vec<Session> {
+        let mut sessions = fixture_sessions();
+        sessions[1].cost_breakdown = None;
+        sessions
+    }
+
+    fn footer_of(app: &mut App) -> String {
+        render_app(app, 120, 10)
+            .lines()
+            .last()
+            .unwrap()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn footer_precedence_orders_error_info_derived_then_hint() {
+        let mut app = new_app(unpriced_sessions(), fixture_pricing_data(), Tab::Sessions);
+
+        // 4. Nothing set — the static key hints.
+        let mut priced = new_app(
+            fixture_sessions_asserted_priced(),
+            fixture_pricing_data(),
+            Tab::Sessions,
+        );
+        let hint = footer_of(&mut priced);
+        assert!(hint.contains("q quit"), "got: {hint}");
+        assert!(!hint.contains("unpriced"), "got: {hint}");
+
+        // 3. A derived hint shares the row with the key hints rather
+        // than evicting them — it never clears, so taking the row
+        // would cost the user `q quit` permanently.
+        let derived = footer_of(&mut app);
+        assert!(derived.contains("some rows unpriced"), "got: {derived}");
+        assert!(derived.contains("q quit"), "got: {derived}");
+
+        // 2. An Info status outranks the derived hint.
+        app.status = Some(StatusMessage {
+            text: "an informational note".to_string(),
+            kind: StatusKind::Info,
+            from_refresh_failure: false,
+        });
+        let info = footer_of(&mut app);
+        assert!(info.contains("an informational note"), "got: {info}");
+        assert!(!info.contains("unpriced"), "got: {info}");
+
+        // 1. An error outranks everything — it is the newer,
+        // user-triggered fact, while the derived condition will still
+        // be true once it clears.
+        app.status = Some(StatusMessage {
+            text: "a hard failure".to_string(),
+            kind: StatusKind::Error,
+            from_refresh_failure: false,
+        });
+        let error = footer_of(&mut app);
+        assert!(error.contains("a hard failure"), "got: {error}");
+        assert!(!error.contains("unpriced"), "got: {error}");
+    }
+
+    #[test]
+    fn list_footer_reports_unpriced_sessions_and_stays_silent_when_all_are_priced() {
+        let mut unpriced = new_app(unpriced_sessions(), fixture_pricing_data(), Tab::Sessions);
+        assert!(footer_of(&mut unpriced).contains("some rows unpriced"));
+
+        let mut priced = new_app(
+            fixture_sessions_asserted_priced(),
+            fixture_pricing_data(),
+            Tab::Sessions,
+        );
+        assert!(!footer_of(&mut priced).contains("some rows unpriced"));
+    }
+
+    #[test]
+    fn inputs_footer_reports_unpriced_rows() {
+        // The shipped fixture already carries one `attributed_cost:
+        // None` row.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Inputs);
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            fixture_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        assert!(footer_of(&mut app).contains("some rows unpriced"));
+
+        app.inputs = Some(InputsData::Loaded(InputsState::new(
+            priced_attribution_rows(),
+            fixture_coverage_stats(),
+        )));
+        assert!(!footer_of(&mut app).contains("some rows unpriced"));
+    }
+
+    #[test]
+    fn feedback_view_reports_no_missing_model_hint() {
+        // True by construction — `render_feedback_content` passes
+        // `None` because it has no rows to derive from.
+        let mut app = new_app(unpriced_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Loading;
+        assert!(!footer_of(&mut app).contains("unpriced"));
+    }
+
+    #[test]
+    fn show_view_reports_no_missing_model_hint() {
+        // A `PreparedExchange` is a per-turn exchange rather than a
+        // priced session, so "unpriced" is undefined over Show's rows
+        // even when the underlying sessions are unpriced.
+        let mut app = new_app(unpriced_sessions(), fixture_pricing_data(), Tab::Sessions);
+        set_show_view(&mut app);
+        assert!(!footer_of(&mut app).contains("unpriced"));
+    }
+
+    #[test]
+    fn narrow_footer_drops_the_derived_half_not_the_key_hints() {
+        // The key hints are the only place `q quit` is advertised, so
+        // when both cannot fit, the standing condition is what yields.
+        let mut app = new_app(unpriced_sessions(), fixture_pricing_data(), Tab::Sessions);
+
+        let wide = render_app(&mut app, 130, 10)
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert!(wide.contains("some rows unpriced"), "got: {wide}");
+        assert!(wide.contains("q quit"), "got: {wide}");
+
+        let narrow = render_app(&mut app, 70, 10)
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert!(!narrow.contains("unpriced"), "got: {narrow}");
+        assert!(narrow.contains("q quit"), "got: {narrow}");
     }
 }
