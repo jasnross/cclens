@@ -72,6 +72,72 @@ enum InputsData {
     Error(String),
 }
 
+/// The Sessions tab's data and everything recomputed alongside it.
+/// Mirrors `InputsState`: rows plus the selection state that indexes
+/// them, constructed together so a selection cannot outlive its rows.
+struct SessionsState {
+    sessions: Vec<Session>,
+    list_state: TableState,
+    total_tokens: u64,
+    total_cost: Option<f64>,
+}
+
+impl SessionsState {
+    fn new(sessions: Vec<Session>) -> Self {
+        let (total_tokens, total_cost) =
+            session_totals(&sessions).map_or((0, None), |t| (t.total_tokens, t.total_cost));
+        let mut list_state = TableState::default();
+        if !sessions.is_empty() {
+            list_state.select_first();
+        }
+        Self {
+            sessions,
+            list_state,
+            total_tokens,
+            total_cost,
+        }
+    }
+
+    fn selected_session_id(&self) -> Option<&str> {
+        let idx = self.list_state.selected()?;
+        self.sessions.get(idx).map(|s| s.id.as_str())
+    }
+
+    fn apply_refresh(&mut self, new_sessions: Vec<Session>) {
+        let prev_id = self.selected_session_id().map(str::to_owned);
+        let prev_idx = self.list_state.selected();
+
+        let (total_tokens, total_cost) =
+            session_totals(&new_sessions).map_or((0, None), |t| (t.total_tokens, t.total_cost));
+        self.sessions = new_sessions;
+        self.total_tokens = total_tokens;
+        self.total_cost = total_cost;
+
+        if let Some(prev_id) = prev_id {
+            if let Some(new_idx) = self.sessions.iter().position(|s| s.id == prev_id) {
+                self.list_state.select(Some(new_idx));
+            } else if self.sessions.is_empty() {
+                self.list_state.select(None);
+            } else {
+                let fallback = prev_idx.unwrap_or(0).min(self.sessions.len() - 1);
+                self.list_state.select(Some(fallback));
+            }
+        } else if !self.sessions.is_empty() {
+            self.list_state.select_first();
+        }
+    }
+}
+
+/// The Sessions tab's data slot. `Loading` means the slot was
+/// invalidated or never filled and a load is expected; `Error` carries
+/// a failure the user can retry. Mirrors `InputsData` minus its
+/// `Option` wrapper — startup always loads sessions.
+enum SessionsData {
+    Loading,
+    Loaded(SessionsState),
+    Error(String),
+}
+
 enum Overlay {
     Pricing,
 }
@@ -191,10 +257,7 @@ struct App {
     /// carry the generation they were dispatched with.
     ctx_generation: u64,
     tab: Tab,
-    sessions: Vec<Session>,
-    list_state: TableState,
-    total_tokens: u64,
-    total_cost: Option<f64>,
+    sessions: SessionsData,
     view: View,
     inputs: Option<InputsData>,
     overlay: Option<Overlay>,
@@ -226,20 +289,11 @@ impl App {
         pricing: PricingData,
         default_tab: Tab,
     ) -> Self {
-        let (total_tokens, total_cost) =
-            session_totals(&sessions).map_or((0, None), |t| (t.total_tokens, t.total_cost));
-        let mut list_state = TableState::default();
-        if !sessions.is_empty() {
-            list_state.select_first();
-        }
         Self {
             ctx,
             ctx_generation: 0,
             tab: default_tab,
-            sessions,
-            list_state,
-            total_tokens,
-            total_cost,
+            sessions: SessionsData::Loaded(SessionsState::new(sessions)),
             view: View::List,
             inputs: None,
             overlay: None,
@@ -270,40 +324,6 @@ impl App {
     /// nothing changed, or it would vanish within one ~3s cycle.
     fn reset_refresh_failures(&mut self) {
         self.consecutive_refresh_failures = 0;
-    }
-
-    fn selected_session_id(&self) -> Option<&str> {
-        let idx = self.list_state.selected()?;
-        self.sessions.get(idx).map(|s| s.id.as_str())
-    }
-
-    fn apply_sessions_refresh(
-        &mut self,
-        new_sessions: Vec<Session>,
-        new_fingerprint: RefreshFingerprint,
-    ) {
-        let prev_id = self.selected_session_id().map(str::to_owned);
-        let prev_idx = self.list_state.selected();
-
-        let (total_tokens, total_cost) =
-            session_totals(&new_sessions).map_or((0, None), |t| (t.total_tokens, t.total_cost));
-        self.sessions = new_sessions;
-        self.total_tokens = total_tokens;
-        self.total_cost = total_cost;
-        self.refresh_fingerprint = new_fingerprint;
-
-        if let Some(prev_id) = prev_id {
-            if let Some(new_idx) = self.sessions.iter().position(|s| s.id == prev_id) {
-                self.list_state.select(Some(new_idx));
-            } else if self.sessions.is_empty() {
-                self.list_state.select(None);
-            } else {
-                let fallback = prev_idx.unwrap_or(0).min(self.sessions.len() - 1);
-                self.list_state.select(Some(fallback));
-            }
-        } else if !self.sessions.is_empty() {
-            self.list_state.select_first();
-        }
     }
 }
 
@@ -790,12 +810,42 @@ fn apply_sessions_data(
         }
         return;
     }
-    if let Ok(sessions) = result {
-        // A forced reload (catalog swap) carries no fresh fingerprint
-        // — the filesystem didn't change, so the existing one stands.
-        let fp = fingerprint.unwrap_or_else(|| app.refresh_fingerprint.clone());
-        app.apply_sessions_refresh(sessions, fp);
-        app.clear_status();
+    match result {
+        Ok(sessions) => {
+            match &mut app.sessions {
+                SessionsData::Loaded(state) => state.apply_refresh(sessions),
+                SessionsData::Loading | SessionsData::Error(_) => {
+                    app.sessions = SessionsData::Loaded(SessionsState::new(sessions));
+                }
+            }
+            // A forced reload (catalog swap) carries no fresh
+            // fingerprint — the filesystem didn't change, so the
+            // existing one stands.
+            app.refresh_fingerprint =
+                fingerprint.unwrap_or_else(|| app.refresh_fingerprint.clone());
+            app.clear_status();
+        }
+        Err(e) => {
+            let message = format!("{e}");
+            if matches!(app.sessions, SessionsData::Loaded(_)) {
+                // A background refresh that fails must not discard
+                // rows the user is reading — that is the prior
+                // design's silent-refresh rationale, narrowed to where
+                // it still applies. It is not owed an immediate footer
+                // message either: it is a failure of the same refresh
+                // pipeline `apply_refresh_failed` accounts for, so it
+                // gets the same silence budget.
+                note_refresh_failure(app, &message);
+            } else {
+                // An empty slot has nothing left to render, so the
+                // user is owed an answer now, with no threshold.
+                app.status = Some(StatusMessage {
+                    text: message.clone(),
+                    from_refresh_failure: false,
+                });
+                app.sessions = SessionsData::Error(message);
+            }
+        }
     }
     if was_guarded {
         app.refresh_in_flight = false;
@@ -826,13 +876,21 @@ fn apply_pricing(app: &mut App, result: anyhow::Result<(Arc<PricingCatalog>, Pri
     app.pricing_refresh_in_flight = false;
 }
 
-fn apply_refresh_failed(app: &mut App, message: &str) {
-    app.refresh_in_flight = false;
+/// Account one background-refresh failure against the consecutive
+/// threshold, breaking silence only once "wait for the next tick" has
+/// stopped being a credible remedy.
+///
+/// Shared by the two ways a background refresh can fail: the guarded
+/// fingerprint build (`apply_refresh_failed`) and the data load behind
+/// it (`apply_sessions_data`'s `Err` arm, when rows are already on
+/// screen). Both are failures of the same pipeline, so both are owed
+/// the same silence budget and the same `from_refresh_failure` stamp —
+/// which is what lets a later `NoChange` clear the message.
+fn note_refresh_failure(app: &mut App, message: &str) {
     // Single transient failures stay silent — the prior design's
     // rationale holds: valid data is still displayed and the next
     // tick retries. Only a persistent, repeated failure breaks
-    // silence, since by then "wait for the next tick" has stopped
-    // being a credible remedy.
+    // silence.
     app.consecutive_refresh_failures = app.consecutive_refresh_failures.saturating_add(1);
     if app.consecutive_refresh_failures >= CONSECUTIVE_REFRESH_FAILURE_THRESHOLD {
         app.status = Some(StatusMessage {
@@ -843,6 +901,11 @@ fn apply_refresh_failed(app: &mut App, message: &str) {
             from_refresh_failure: true,
         });
     }
+}
+
+fn apply_refresh_failed(app: &mut App, message: &str) {
+    app.refresh_in_flight = false;
+    note_refresh_failure(app, message);
 }
 
 fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
@@ -941,30 +1004,116 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
-fn handle_list_key(app: &mut App, key: KeyEvent) -> bool {
+fn handle_list_loading_key(key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => true,
-        KeyCode::Enter => {
-            try_open_show(app);
-            false
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.list_state.select_next();
-            false
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.list_state.select_previous();
-            false
-        }
-        KeyCode::Home | KeyCode::Char('g') => {
-            app.list_state.select_first();
-            false
-        }
-        KeyCode::End | KeyCode::Char('G') => {
-            app.list_state.select_last();
+        KeyCode::Enter
+        | KeyCode::Backspace
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => false,
+    }
+}
+
+fn handle_list_error_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Enter | KeyCode::Char('r') => {
+            // Enter `Loading` before dispatching, mirroring
+            // `handle_show_error_key` and `try_switch_to_inputs`: the
+            // retry is otherwise invisible, and the loading handler
+            // ignores a second Enter while it runs.
+            app.sessions = SessionsData::Loading;
+            app.pending_loads.push(LoadRequest::Refresh {
+                scope: RefreshScope::Sessions,
+                guard: None,
+            });
             false
         }
         KeyCode::Backspace
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => false,
+    }
+}
+
+fn handle_list_key(app: &mut App, key: KeyEvent) -> bool {
+    match &app.sessions {
+        SessionsData::Loading => return handle_list_loading_key(key),
+        SessionsData::Error(_) => return handle_list_error_key(app, key),
+        SessionsData::Loaded(_) => {}
+    }
+    // Handled before the mutable borrow below: `try_open_show` needs
+    // `&mut App`, which cannot coexist with a borrow of `app.sessions`.
+    if key.code == KeyCode::Enter {
+        try_open_show(app);
+        return false;
+    }
+    let SessionsData::Loaded(state) = &mut app.sessions else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.list_state.select_next();
+            false
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.list_state.select_previous();
+            false
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            state.list_state.select_first();
+            false
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            state.list_state.select_last();
+            false
+        }
+        KeyCode::Enter
+        | KeyCode::Backspace
         | KeyCode::Left
         | KeyCode::Right
         | KeyCode::PageUp
@@ -989,14 +1138,17 @@ fn handle_list_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn try_open_show(app: &mut App) {
-    let Some(idx) = app.list_state.selected() else {
+    let SessionsData::Loaded(state) = &app.sessions else {
         return;
     };
-    let session_id = app.sessions[idx].id.clone();
-    let header_label = format!(
-        "\"{}\" ({})",
-        app.sessions[idx].title, app.sessions[idx].project_short_name,
-    );
+    let Some(idx) = state.list_state.selected() else {
+        return;
+    };
+    let Some(session) = state.sessions.get(idx) else {
+        return;
+    };
+    let session_id = session.id.clone();
+    let header_label = format!("\"{}\" ({})", session.title, session.project_short_name);
     app.pending_loads.push(LoadRequest::ShowDetail {
         session_id: session_id.clone(),
         header_label: header_label.clone(),
@@ -1341,11 +1493,15 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
             View::Show { header_label, .. }
             | View::ShowLoading { header_label, .. }
             | View::ShowError { header_label, .. } => header_label.clone(),
-            View::List => {
-                let count = app.sessions.len();
-                let label = if count == 1 { "session" } else { "sessions" };
-                format!("{count} {label}")
-            }
+            View::List => match &app.sessions {
+                SessionsData::Loaded(state) => {
+                    let count = state.sessions.len();
+                    let label = if count == 1 { "session" } else { "sessions" };
+                    format!("{count} {label}")
+                }
+                SessionsData::Loading => "...".to_string(),
+                SessionsData::Error(_) => "!".to_string(),
+            },
         },
         Tab::Inputs => match &app.inputs {
             Some(InputsData::Loaded(inputs)) => {
@@ -1371,6 +1527,32 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
 }
 
 fn render_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    // Each arm yields owned `Line<'static>`s rather than rendering in
+    // place, so the borrow of `app.sessions` ends with the match and
+    // `app` is free to be reborrowed for the status footer below.
+    let (message_lines, footer) = match &app.sessions {
+        SessionsData::Loaded(_) => {
+            render_loaded_list_content(app, frame, area);
+            return;
+        }
+        SessionsData::Loading => (
+            vec![Line::raw(""), Line::from(" Loading sessions...")],
+            " 1/2 tabs  q quit",
+        ),
+        SessionsData::Error(msg) => (
+            vec![
+                Line::raw(""),
+                Line::from(format!(" Error: {msg}")),
+                Line::raw(""),
+                Line::from(" Press Enter or r to retry.").dim(),
+            ],
+            " 1/2 tabs  Enter retry  q quit",
+        ),
+    };
+    render_feedback_content(app, frame, area, message_lines, footer);
+}
+
+fn render_loaded_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
     let [table_area, totals_area, footer_area] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(1),
@@ -1378,8 +1560,10 @@ fn render_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
     ])
     .areas(area);
 
-    render_sessions_table(app, frame, table_area);
-    render_totals(app, frame, totals_area);
+    if let SessionsData::Loaded(state) = &mut app.sessions {
+        render_sessions_table(state, frame, table_area);
+        render_totals(state, frame, totals_area);
+    }
     render_status_footer(
         app,
         frame,
@@ -1388,8 +1572,12 @@ fn render_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
     );
 }
 
-fn render_sessions_table(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let rows: Vec<Row> = app
+fn render_sessions_table(
+    state: &mut SessionsState,
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+) {
+    let rows: Vec<Row> = state
         .sessions
         .iter()
         .map(|s| {
@@ -1411,7 +1599,7 @@ fn render_sessions_table(app: &mut App, frame: &mut Frame, area: ratatui::layout
         .header(header)
         .row_highlight_style(Style::new().reversed());
 
-    frame.render_stateful_widget(table, area, &mut app.list_state);
+    frame.render_stateful_widget(table, area, &mut state.list_state);
 }
 
 fn session_table_widths() -> [Constraint; 5] {
@@ -1424,16 +1612,16 @@ fn session_table_widths() -> [Constraint; 5] {
     ]
 }
 
-fn render_totals(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    if app.sessions.len() < 2 {
+fn render_totals(state: &SessionsState, frame: &mut Frame, area: ratatui::layout::Rect) {
+    if state.sessions.len() < 2 {
         return;
     }
     let row = Row::new(vec![
         Line::raw(""),
         Line::raw(""),
         Line::raw("total").right_aligned(),
-        Line::raw(format_tokens(app.total_tokens)).right_aligned(),
-        Line::raw(format_cost_opt(app.total_cost)).right_aligned(),
+        Line::raw(format_tokens(state.total_tokens)).right_aligned(),
+        Line::raw(format_cost_opt(state.total_cost)).right_aligned(),
     ]);
 
     let table = Table::new(vec![row], session_table_widths());
@@ -1758,6 +1946,24 @@ mod tests {
         App::new(fixture_ctx(), sessions, pricing, default_tab)
     }
 
+    /// Reach the loaded sessions slot. Every test that touches rows,
+    /// totals, or the selection expects a `Loaded` slot — an empty one
+    /// at that point is the test's own setup being wrong, so this
+    /// panics rather than silently returning a default.
+    fn sessions_state(app: &App) -> &SessionsState {
+        match &app.sessions {
+            SessionsData::Loaded(state) => state,
+            SessionsData::Loading | SessionsData::Error(_) => panic!("sessions slot not loaded"),
+        }
+    }
+
+    fn sessions_state_mut(app: &mut App) -> &mut SessionsState {
+        match &mut app.sessions {
+            SessionsData::Loaded(state) => state,
+            SessionsData::Loading | SessionsData::Error(_) => panic!("sessions slot not loaded"),
+        }
+    }
+
     /// Wraps `handle_load_result` for call sites that don't care about
     /// generation staleness — stamps with the app's current
     /// generation, which is never considered stale.
@@ -1946,24 +2152,24 @@ mod tests {
     #[test]
     fn app_new_selects_first_when_non_empty() {
         let app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
     }
 
     #[test]
     fn app_new_no_selection_when_empty() {
         let app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
-        assert_eq!(app.list_state.selected(), None);
+        assert_eq!(sessions_state(&app).list_state.selected(), None);
     }
 
     #[test]
     fn app_new_computes_totals() {
         let app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        assert_eq!(app.total_tokens, 1500 + 2500 + 3000);
+        assert_eq!(sessions_state(&app).total_tokens, 1500 + 2500 + 3000);
         let expected_cost = 0.01 + 0.02 + 0.03;
         assert!(
-            (app.total_cost.unwrap() - expected_cost).abs() < 1e-10,
+            (sessions_state(&app).total_cost.unwrap() - expected_cost).abs() < 1e-10,
             "expected {expected_cost}, got {:?}",
-            app.total_cost,
+            sessions_state(&app).total_cost,
         );
     }
 
@@ -2020,10 +2226,10 @@ mod tests {
     #[test]
     fn list_selection_preserved_after_roundtrip() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.list_state.select(Some(2));
+        sessions_state_mut(&mut app).list_state.select(Some(2));
         set_show_view(&mut app);
         handle_key_event(&mut app, key_event(KeyCode::Esc));
-        assert_eq!(app.list_state.selected(), Some(2));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(2));
     }
 
     // --- List key handling tests ---
@@ -2050,41 +2256,41 @@ mod tests {
     #[test]
     fn handle_key_down_advances_selection() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::Down));
-        assert_eq!(app.list_state.selected(), Some(1));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(1));
     }
 
     #[test]
     fn handle_key_up_retreats_selection() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.list_state.select(Some(1));
+        sessions_state_mut(&mut app).list_state.select(Some(1));
         handle_key_event(&mut app, key_event(KeyCode::Up));
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
     }
 
     #[test]
     fn handle_key_j_advances_like_down() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::Char('j')));
-        assert_eq!(app.list_state.selected(), Some(1));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(1));
     }
 
     #[test]
     fn handle_key_k_retreats_like_up() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.list_state.select(Some(1));
+        sessions_state_mut(&mut app).list_state.select(Some(1));
         handle_key_event(&mut app, key_event(KeyCode::Char('k')));
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
     }
 
     #[test]
     fn handle_key_home_selects_first() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.list_state.select(Some(2));
+        sessions_state_mut(&mut app).list_state.select(Some(2));
         handle_key_event(&mut app, key_event(KeyCode::Home));
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
     }
 
     #[test]
@@ -2092,19 +2298,19 @@ mod tests {
         let sessions = fixture_sessions();
         let last = sessions.len() - 1;
         let mut app = new_app(sessions, fixture_pricing_data(), Tab::Sessions);
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
         handle_key_event(&mut app, key_event(KeyCode::End));
         render_app(&mut app, 80, 10);
-        assert_eq!(app.list_state.selected(), Some(last));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(last));
     }
 
     #[test]
     fn handle_key_unknown_is_noop() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
         let quit = handle_key_event(&mut app, key_event(KeyCode::Char('x')));
         assert!(!quit);
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
     }
 
     // --- Show view key handling tests ---
@@ -2793,7 +2999,7 @@ mod tests {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         handle_key_event(&mut app, key_event(KeyCode::Char('p')));
         let original_tab = app.tab;
-        let original_selected = app.list_state.selected();
+        let original_selected = sessions_state(&app).list_state.selected();
         for code in [
             KeyCode::Down,
             KeyCode::Char('1'),
@@ -2804,7 +3010,10 @@ mod tests {
         }
         assert!(app.overlay.is_some());
         assert_eq!(app.tab, original_tab);
-        assert_eq!(app.list_state.selected(), original_selected);
+        assert_eq!(
+            sessions_state(&app).list_state.selected(),
+            original_selected
+        );
         assert!(matches!(app.view, View::List));
     }
 
@@ -3670,14 +3879,14 @@ mod tests {
     #[test]
     fn selected_session_id_returns_id() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.list_state.select(Some(1));
-        assert_eq!(app.selected_session_id(), Some("bbb"));
+        sessions_state_mut(&mut app).list_state.select(Some(1));
+        assert_eq!(sessions_state(&app).selected_session_id(), Some("bbb"));
     }
 
     #[test]
     fn selected_session_id_none_when_empty() {
         let app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
-        assert_eq!(app.selected_session_id(), None);
+        assert_eq!(sessions_state(&app).selected_session_id(), None);
     }
 
     // --- apply_sessions_refresh tests ---
@@ -3685,26 +3894,26 @@ mod tests {
     #[test]
     fn apply_sessions_refresh_preserves_selection_by_id() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.list_state.select(Some(1)); // "bbb"
+        sessions_state_mut(&mut app).list_state.select(Some(1)); // "bbb"
 
         let mut reordered = fixture_sessions();
         reordered.reverse(); // ccc, bbb, aaa
-        app.apply_sessions_refresh(reordered, RefreshFingerprint::default());
+        sessions_state_mut(&mut app).apply_refresh(reordered);
 
-        assert_eq!(app.list_state.selected(), Some(1)); // "bbb" is now at index 1
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(1)); // "bbb" is now at index 1
     }
 
     #[test]
     fn apply_sessions_refresh_falls_back_on_removed_session() {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
-        app.list_state.select(Some(2)); // "ccc"
+        sessions_state_mut(&mut app).list_state.select(Some(2)); // "ccc"
 
         let mut shorter = fixture_sessions();
         shorter.retain(|s| s.id != "ccc");
-        app.apply_sessions_refresh(shorter, RefreshFingerprint::default());
+        sessions_state_mut(&mut app).apply_refresh(shorter);
 
         // Old index 2 is clamped to new_len - 1 = 1
-        assert_eq!(app.list_state.selected(), Some(1));
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(1));
     }
 
     #[test]
@@ -3716,14 +3925,14 @@ mod tests {
             output: 0.05,
             ..CostBreakdown::default()
         });
-        app.apply_sessions_refresh(updated, RefreshFingerprint::default());
+        sessions_state_mut(&mut app).apply_refresh(updated);
 
-        assert_eq!(app.total_tokens, 5000 + 2500 + 3000);
+        assert_eq!(sessions_state(&app).total_tokens, 5000 + 2500 + 3000);
         let expected = 0.05 + 0.02 + 0.03;
         assert!(
-            (app.total_cost.unwrap() - expected).abs() < 1e-10,
+            (sessions_state(&app).total_cost.unwrap() - expected).abs() < 1e-10,
             "expected {expected}, got {:?}",
-            app.total_cost,
+            sessions_state(&app).total_cost,
         );
     }
 
@@ -3742,7 +3951,7 @@ mod tests {
                 fingerprint: Some(RefreshFingerprint::default()),
             },
         );
-        assert_eq!(app.sessions[0].total_billable, 9999);
+        assert_eq!(sessions_state(&app).sessions[0].total_billable, 9999);
         assert!(!app.refresh_in_flight);
     }
 
@@ -3751,7 +3960,7 @@ mod tests {
         let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
         set_show_view(&mut app);
         app.refresh_in_flight = true;
-        let original_count = app.sessions.len();
+        let original_count = sessions_state(&app).sessions.len();
         hlr(
             &mut app,
             LoadResult::SessionsData {
@@ -3759,7 +3968,7 @@ mod tests {
                 fingerprint: Some(RefreshFingerprint::default()),
             },
         );
-        assert_eq!(app.sessions.len(), original_count);
+        assert_eq!(sessions_state(&app).sessions.len(), original_count);
         assert!(!app.refresh_in_flight);
     }
 
@@ -4055,5 +4264,229 @@ mod tests {
         // Old index 2 should fall back to min(2, 0) = 0
         assert_eq!(inputs_table_selected(&app), Some(0));
         assert!(!app.refresh_in_flight);
+    }
+
+    // --- Sessions slot state tests ---
+
+    #[test]
+    fn try_open_show_while_loading_is_noop() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Loading;
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        assert!(app.pending_loads.is_empty());
+        assert!(matches!(app.view, View::List));
+    }
+
+    #[test]
+    fn try_open_show_with_out_of_range_selection_is_noop() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        // A selection retained past the end of a shortened list — the
+        // shape that used to panic on `app.sessions[idx]`.
+        let state = sessions_state_mut(&mut app);
+        state.sessions.truncate(1);
+        state.list_state.select(Some(2));
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        assert!(app.pending_loads.is_empty());
+        assert!(matches!(app.view, View::List));
+    }
+
+    #[test]
+    fn loading_sessions_renders_feedback() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Loading;
+        let output = render_app(&mut app, 80, 10);
+        assert!(
+            output.contains("Loading sessions..."),
+            "should render the loading message; got:\n{output}",
+        );
+        let first_line = output.lines().next().unwrap();
+        assert!(
+            first_line.contains("cclens — ..."),
+            "header should show '...' while loading; got: {first_line}",
+        );
+    }
+
+    #[test]
+    fn errored_sessions_renders_message_and_retry_hint() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Error("boom".to_string());
+        let output = render_app(&mut app, 80, 10);
+        assert!(
+            output.contains("Error: boom"),
+            "should render the error message; got:\n{output}",
+        );
+        assert!(
+            output.contains("Enter retry"),
+            "should render the retry hint; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn sessions_error_retries_on_enter() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Error("boom".to_string());
+        handle_key_event(&mut app, key_event(KeyCode::Enter));
+        assert!(matches!(
+            app.pending_loads[0],
+            LoadRequest::Refresh {
+                scope: RefreshScope::Sessions,
+                guard: None,
+            }
+        ));
+        assert!(
+            matches!(app.sessions, SessionsData::Loading),
+            "the retry must be visible, matching Show's and Inputs' error retries",
+        );
+    }
+
+    #[test]
+    fn sessions_error_retries_on_r() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Error("boom".to_string());
+        handle_key_event(&mut app, key_event(KeyCode::Char('r')));
+        assert!(matches!(
+            app.pending_loads[0],
+            LoadRequest::Refresh {
+                scope: RefreshScope::Sessions,
+                guard: None,
+            }
+        ));
+        assert!(matches!(app.sessions, SessionsData::Loading));
+    }
+
+    #[test]
+    fn loading_sessions_ignores_navigation_keys() {
+        // The point of splitting `handle_list_key` is that a slot with
+        // no rows cannot be navigated — there is no selection to move.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Loading;
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('G'),
+            KeyCode::Enter,
+        ] {
+            assert!(!handle_key_event(&mut app, key_event(code)));
+        }
+        assert!(app.pending_loads.is_empty());
+        assert!(matches!(app.sessions, SessionsData::Loading));
+        assert!(matches!(app.view, View::List));
+    }
+
+    #[test]
+    fn loading_sessions_still_quits_on_q() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Loading;
+        assert!(handle_key_event(&mut app, key_event(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn errored_sessions_ignores_navigation_keys() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Error("boom".to_string());
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('G'),
+        ] {
+            assert!(!handle_key_event(&mut app, key_event(code)));
+        }
+        assert!(
+            app.pending_loads.is_empty(),
+            "only Enter/r retry from the error state",
+        );
+    }
+
+    #[test]
+    fn errored_sessions_still_quits_on_q() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Error("boom".to_string());
+        assert!(handle_key_event(&mut app, key_event(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn sessions_load_failure_into_empty_slot_sets_error() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Loading;
+        hlr(
+            &mut app,
+            LoadResult::SessionsData {
+                result: Err(anyhow::anyhow!("boom")),
+                fingerprint: None,
+            },
+        );
+        assert!(matches!(app.sessions, SessionsData::Error(_)));
+        assert!(
+            app.status.is_some(),
+            "a failed load into an empty slot must also reach the status footer",
+        );
+    }
+
+    #[test]
+    fn sessions_load_failure_preserves_loaded_rows() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        hlr(
+            &mut app,
+            LoadResult::SessionsData {
+                result: Err(anyhow::anyhow!("boom")),
+                fingerprint: Some(RefreshFingerprint::default()),
+            },
+        );
+        assert!(
+            matches!(app.sessions, SessionsData::Loaded(_)),
+            "a failed background refresh must not discard rows the user is reading",
+        );
+        assert_eq!(sessions_state(&app).sessions.len(), 3);
+        assert!(
+            app.status.is_none(),
+            "one transient background failure stays silent, like every other refresh failure",
+        );
+        assert_eq!(app.consecutive_refresh_failures, 1);
+    }
+
+    #[test]
+    fn repeated_sessions_load_failures_break_silence_and_clear_on_no_change() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        for _ in 0..CONSECUTIVE_REFRESH_FAILURE_THRESHOLD {
+            hlr(
+                &mut app,
+                LoadResult::SessionsData {
+                    result: Err(anyhow::anyhow!("boom")),
+                    fingerprint: Some(RefreshFingerprint::default()),
+                },
+            );
+        }
+        assert!(
+            app.status.is_some(),
+            "a persistent background failure must eventually speak up",
+        );
+
+        // Stamped `from_refresh_failure`, so the same signal that
+        // proves the pipeline healthy can retire the warning.
+        hlr(&mut app, LoadResult::NoChange);
+        assert!(
+            app.status.is_none(),
+            "NoChange must clear a status this pipeline itself raised",
+        );
+        assert_eq!(app.consecutive_refresh_failures, 0);
+    }
+
+    #[test]
+    fn sessions_data_into_empty_slot_constructs_state() {
+        let mut app = new_app(vec![], fixture_pricing_data(), Tab::Sessions);
+        app.sessions = SessionsData::Loading;
+        hlr(
+            &mut app,
+            LoadResult::SessionsData {
+                result: Ok(fixture_sessions()),
+                fingerprint: Some(RefreshFingerprint::default()),
+            },
+        );
+        assert_eq!(sessions_state(&app).sessions.len(), 3);
+        assert_eq!(sessions_state(&app).list_state.selected(), Some(0));
     }
 }
