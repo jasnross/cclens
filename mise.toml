@@ -2,4 +2,4 @@
 "cargo:cargo-sort-derives" = "latest"
 just = "latest"
 prettier = "latest"
-rust = "latest"
+rust = { version = "latest", components = ["rust-analyzer"] }
