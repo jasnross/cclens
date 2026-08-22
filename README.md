@@ -51,12 +51,12 @@ Two groups of flags shared across subcommands narrow the result set (`inputs` ad
 **Scope** — apply to `list` and `inputs` (not `show`, which already pins a single session via its `<session-id>` argument):
 
 - `--project <NAME>` — exact match against the short project name shown in the `project` column. Case-sensitive; substring / glob / regex matching is not supported.
-- `--since <RFC3339>` / `--until <RFC3339>` — inclusive bounds on the session's `started_at`. ISO 8601 / RFC 3339 timestamps with an explicit timezone offset (e.g. `2026-04-15T00:00:00Z`). Bare `YYYY-MM-DD` is not accepted.
+- `--since <WHEN>` / `--until <WHEN>` — inclusive bounds on the session's `started_at`. Accepts a full RFC 3339 timestamp with an explicit offset (e.g. `2026-04-15T00:00:00Z`) or a bare `YYYY-MM-DD`, which means the **start of that day in local time** — the same timeline the `datetime` column displays, and the same rule `git log --since` uses.
 
 **Thresholds** — apply to `list`, `show`, and `inputs`:
 
 - `--min-tokens <N>` — show only rows with at least N billable tokens (e.g. `--min-tokens 50000`).
-- `--min-cost <USD>` — show only rows costing at least USD (e.g. `--min-cost 0.50`).
+- `--min-cost <USD>` — show only rows costing at least USD (e.g. `--min-cost 0.50`). Must be a finite number at or above zero; negative and non-finite values are rejected.
 
 When multiple flags are passed, all must clear (logical AND) — for example, `cclens list --project beta --min-tokens 100` keeps only sessions in project `beta` whose total billable tokens are also at least 100. Rows whose cost is unknown (renders `—` in the `cost` column — i.e. an unknown-model row) are excluded by any active `--min-cost`. Orphan user exchanges in `show` (whose `tokens` cell renders `—`) are excluded by any `--min-tokens >= 1`.
 

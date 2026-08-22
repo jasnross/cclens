@@ -136,7 +136,9 @@ filter        ← ThresholdsFilter / SessionFilter value types — the
                 --min-tokens / --min-cost / --project / --since /
                 --until without depending on clap; plus the filter
                 vocabulary both surfaces render: FilterComponent,
-                QueryScope, describe_active on both filter types, and
+                QueryScope (one of the three loaders) + HonoredBy
+                (which loaders honor a component), describe_active on
+                both filter types, and
                 parse_filter_datetime / render_filter_datetime (the
                 lenient YYYY-MM-DD-or-RFC-3339 parser and its
                 shortest-spelling inverse) and parse_min_cost (rejects

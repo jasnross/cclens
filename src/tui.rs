@@ -41,6 +41,7 @@ use crate::filter::{
     FilterComponent, QueryScope, parse_filter_datetime, parse_min_cost, render_filter_datetime,
 };
 use crate::formatting::{coverage_line, format_cost_opt, format_tokens, tiers_differ};
+use crate::inventory::InventoryConfig;
 use crate::loading::{self, DataContext, PricingData, Query, RefreshFingerprint};
 use crate::pricing::{CacheInfo, PricingCatalog};
 use crate::views::{
@@ -2134,8 +2135,21 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
         },
     };
 
+    // The right label claims what it needs rather than half the row.
+    // An even split leaves the left half too narrow at 80 columns —
+    // the common terminal width — to fit even `--project alpha`,
+    // while the right half renders mostly blanks.
+    //
+    // Capped at half, because `context` is Show's `header_label` and
+    // carries an untruncated session title: unclamped, `Length` is
+    // satisfied first and `Fill` gets zero columns, taking the tabs
+    // and the whole filter indicator off screen.
+    let right_text = format!("cclens — {context} ");
+    let right_width = u16::try_from(right_text.chars().count())
+        .unwrap_or(u16::MAX)
+        .min(area.width / 2);
     let [left_area, right_area] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(area);
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
 
     let tabs = format!(" {sessions_label}  {inputs_label}");
     let mut left_spans = vec![Span::raw(tabs.clone()).bold()];
@@ -2151,8 +2165,21 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
         let available = (left_area.width as usize)
             .saturating_sub(tabs.chars().count() + MARKER.chars().count());
         let (fitted, dropped) = fit_filter_components(&components, available);
-        if !fitted.is_empty() {
-            left_spans.push(Span::raw(MARKER).dim());
+        // `+N` on its own still renders when no component fits: a
+        // narrow terminal is exactly where a silently hidden filter
+        // does the most damage. Below the width that fits the marker
+        // too, the count goes on alone — it is the information; the
+        // word `filter:` is only the label, and pushing both would
+        // have ratatui clip the count off the end of the row.
+        let room_for_marker = (left_area.width as usize).saturating_sub(tabs.chars().count())
+            >= MARKER.chars().count() + format!("+{dropped}").chars().count();
+        let count_alone = fitted.is_empty() && !room_for_marker;
+        if !fitted.is_empty() || dropped > 0 {
+            if count_alone {
+                left_spans.push(Span::raw(format!(" +{dropped}")).dim());
+            } else {
+                left_spans.push(Span::raw(MARKER).dim());
+            }
             for (i, component) in fitted.iter().enumerate() {
                 if i > 0 {
                     left_spans.push(Span::raw(" "));
@@ -2161,46 +2188,59 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
                 // differs, which is what keeps the TUI's indicator
                 // from diverging from the CLI's flag-shaped hint.
                 let span = Span::raw(component.text.clone());
-                let applies = match component.scoped_to {
-                    None => true,
-                    Some(QueryScope::Inputs) => app.tab == Tab::Inputs,
-                };
+                let applies = component.honored_by.honors(tab_scope(app.tab));
                 left_spans.push(if applies { span } else { span.dim() });
             }
-            if dropped > 0 {
-                left_spans.push(Span::raw(format!(" +{dropped}")).dim());
+            if dropped > 0 && !count_alone {
+                // The separating space has nothing to separate when
+                // every component dropped. `fit_filter_components`
+                // reserved room for it either way, so spending one
+                // less column here can only help.
+                let lead = if fitted.is_empty() { "" } else { " " };
+                left_spans.push(Span::raw(format!("{lead}+{dropped}")).dim());
             }
         }
     }
 
     let left = Line::from(left_spans);
-    let right = Line::from(format!("cclens — {context} "))
-        .bold()
-        .right_aligned();
+    let right = Line::from(right_text).bold().right_aligned();
     frame.render_widget(Paragraph::new(left), left_area);
     frame.render_widget(Paragraph::new(right), right_area);
 }
 
-/// What a zero-row view says. Branches on whether any filter is
-/// active, because the two cases have different remedies: a filtered
-/// view is fixed by pressing `f`, a genuinely empty `projects_dir` is
-/// not fixed by any filter change.
-/// The scope a rendered view loads under, for deciding which filter
-/// components could have emptied it. Sessions and Show load without
-/// `--session`, so naming it there would blame a filter that provably
-/// excluded nothing — and offer a remedy that changes nothing.
-fn view_scope(tab: Tab) -> Option<QueryScope> {
+/// The loader behind a tab, for styling the header indicator. Only
+/// the header goes through this: Show renders under the Sessions tab
+/// but loads by session id, so the empty states name their own
+/// `QueryScope` rather than deriving one from the tab.
+fn tab_scope(tab: Tab) -> QueryScope {
     match tab {
-        Tab::Sessions => None,
-        Tab::Inputs => Some(QueryScope::Inputs),
+        Tab::Sessions => QueryScope::Sessions,
+        Tab::Inputs => QueryScope::Inputs,
     }
 }
 
+/// Where a view's emptiness comes from when no filter caused it. The
+/// views differ: List and Inputs really are reading an empty
+/// `projects_dir`, while a Show with no exchanges is one session that
+/// has none — naming the directory there explains nothing.
+#[derive(Clone, Copy)]
+enum EmptySource<'a> {
+    ProjectsDir(&'a Path),
+    /// The `~/.claude` tree. Inputs rows come one per inventory file
+    /// (`compute_rows`), so `projects_dir` cannot be what emptied it.
+    Inventory(&'a Path),
+    Session,
+}
+
+/// What a zero-row view says. Branches on whether any filter is
+/// active, because the two cases have different remedies: a filtered
+/// view is fixed by pressing `f`, an empty `EmptySource` is not fixed
+/// by any filter change.
 fn empty_state_lines(
     query: &Query,
     noun: &str,
-    projects_dir: &Path,
-    scope: Option<QueryScope>,
+    source: EmptySource<'_>,
+    scope: QueryScope,
 ) -> Vec<Line<'static>> {
     // Unlike the header indicator, which over-claims deliberately (a
     // dimmed component the tab context explains), the empty state
@@ -2209,13 +2249,16 @@ fn empty_state_lines(
     let components: Vec<FilterComponent> = query
         .describe_active()
         .into_iter()
-        .filter(|c| c.scoped_to.is_none() || c.scoped_to == scope)
+        .filter(|c| c.honored_by.honors(scope))
         .collect();
     if components.is_empty() {
-        return vec![
-            Line::raw(""),
-            Line::from(format!(" No {noun} found in {}.", projects_dir.display())),
-        ];
+        let explanation = match source {
+            EmptySource::ProjectsDir(dir) | EmptySource::Inventory(dir) => {
+                format!(" No {noun} found in {}.", dir.display())
+            }
+            EmptySource::Session => format!(" No {noun} in this session."),
+        };
+        return vec![Line::raw(""), Line::from(explanation)];
     }
     let joined = components
         .iter()
@@ -2268,8 +2311,8 @@ fn render_loaded_list_content(app: &mut App, frame: &mut Frame, area: ratatui::l
         let lines = empty_state_lines(
             &app.ctx.query,
             "sessions",
-            &app.ctx.projects_dir,
-            view_scope(Tab::Sessions),
+            EmptySource::ProjectsDir(&app.ctx.projects_dir),
+            QueryScope::Sessions,
         );
         // Navigation and open keys are omitted — there is nothing to
         // navigate or open.
@@ -2437,8 +2480,8 @@ fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
         let lines = empty_state_lines(
             &app.ctx.query,
             "exchanges",
-            &app.ctx.projects_dir,
-            view_scope(Tab::Sessions),
+            EmptySource::Session,
+            QueryScope::Show,
         );
         render_feedback_content(
             app,
@@ -2564,11 +2607,15 @@ fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout
         Some(InputsData::Loading | InputsData::Error(_)) | None => false,
     };
     if is_empty {
+        // Resolved here rather than carried on `ctx`: this is the
+        // only site that needs it, and only on a path that renders no
+        // rows.
+        let claude_home = InventoryConfig::default().claude_home;
         let lines = empty_state_lines(
             &app.ctx.query,
             "files",
-            &app.ctx.projects_dir,
-            view_scope(Tab::Inputs),
+            EmptySource::Inventory(&claude_home),
+            QueryScope::Inputs,
         );
         render_feedback_content(
             app,
@@ -2821,7 +2868,7 @@ mod tests {
 
     use chrono::{DateTime, Utc};
 
-    use crate::filter::{SessionFilter, ThresholdsFilter};
+    use crate::filter::{HonoredBy, SessionFilter, ThresholdsFilter};
     use ratatui::backend::TestBackend;
 
     use super::*;
@@ -6050,7 +6097,9 @@ mod tests {
         Query {
             sessions: SessionFilter {
                 project_name: Some("alpha".to_string()),
-                since: Some(ts("2026-04-10T00:00:00Z")),
+                // The instant that renders as a bare date is the
+                // local day start, not midnight UTC.
+                since: parse_filter_datetime("2026-04-10").ok(),
                 until: Some(ts("2026-04-20T14:33:00Z")),
             },
             thresholds: ThresholdsFilter {
@@ -6110,7 +6159,7 @@ mod tests {
         // otherwise the editor shows a value the user did not type.
         let query = Query {
             sessions: SessionFilter {
-                since: Some(ts("2026-04-10T00:00:00Z")),
+                since: parse_filter_datetime("2026-04-10").ok(),
                 ..Default::default()
             },
             ..Default::default()
@@ -6126,7 +6175,17 @@ mod tests {
         let editor = FilterEditor::from_query(&populated_query());
         let until = &editor.fields[3];
         assert_eq!(until.kind, FilterFieldKind::Until);
-        assert_eq!(until.input, "2026-04-20T14:33:00+00:00");
+        // Asserted as a property, not a fixed spelling: the offset is
+        // the local one, which differs per zone the test runs in.
+        assert!(
+            until.input.starts_with("2026-04-20T"),
+            "got: {}",
+            until.input
+        );
+        assert_eq!(
+            parse_filter_datetime(&until.input).ok(),
+            populated_query().sessions.until,
+        );
     }
 
     // --- Filter editor: key handling ---
@@ -6311,15 +6370,15 @@ mod tests {
         let components = vec![
             FilterComponent {
                 text: "--project alpha".to_string(),
-                scoped_to: None,
+                honored_by: HonoredBy::EVERY_LOADER,
             },
             FilterComponent {
                 text: "--min-tokens 50000".to_string(),
-                scoped_to: None,
+                honored_by: HonoredBy::EVERY_LOADER,
             },
             FilterComponent {
                 text: "--min-cost 0.5".to_string(),
-                scoped_to: None,
+                honored_by: HonoredBy::EVERY_LOADER,
             },
         ];
 
@@ -6344,7 +6403,7 @@ mod tests {
         let name = "é".repeat(10);
         let components = vec![FilterComponent {
             text: format!("--project {name}"),
-            scoped_to: None,
+            honored_by: HonoredBy::EVERY_LOADER,
         }];
         assert_eq!(components[0].text.len(), 30, "20 bytes of accented text");
         let (fitted, dropped) = fit_filter_components(&components, 20);
@@ -6372,6 +6431,56 @@ mod tests {
         let header = filtered.lines().next().unwrap();
         assert!(header.contains("filter:"), "got: {header}");
         assert!(header.contains("--project alpha"), "got: {header}");
+    }
+
+    #[test]
+    fn header_keeps_an_indicator_at_eighty_columns() {
+        // 80 columns is the common terminal width, and the width an
+        // even left/right split starved: the whole marker vanished,
+        // `+N` included, leaving a filtered view with nothing on
+        // screen to say so.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = populated_query();
+        let output = render_app(&mut app, 80, 10);
+        let header = output.lines().next().unwrap();
+        assert!(header.contains("filter:"), "got: {header}");
+        assert!(
+            header.contains("--session") || header.contains('+'),
+            "either a component or the dropped count must survive; got: {header}",
+        );
+    }
+
+    #[test]
+    fn a_long_show_title_cannot_starve_the_header_indicator() {
+        // `header_label` carries an untruncated session title. An
+        // unclamped `Length` for the right label satisfies it first
+        // and hands `Fill` zero columns, taking the tabs and the
+        // filter indicator off screen entirely.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = populated_query();
+        set_show_view(&mut app);
+        if let View::Show { header_label, .. } = &mut app.view {
+            *header_label = format!("\"{}\" (alpha)", "x".repeat(120));
+        }
+        let output = render_app(&mut app, 80, 10);
+        let header = output.lines().next().unwrap();
+        assert!(header.contains("[Sessions]"), "got: {header}");
+        assert!(header.contains("filter:"), "got: {header}");
+    }
+
+    #[test]
+    fn a_very_narrow_header_still_reports_the_dropped_count() {
+        // At 50 columns the marker and the count cannot both fit, and
+        // pushing both had ratatui clip exactly the count — the row
+        // read `filter:` and said nothing about how many.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = populated_query();
+        let output = render_app(&mut app, 50, 10);
+        let header = output.lines().next().unwrap();
+        assert!(
+            header.contains('+'),
+            "the count is the information and must survive: {header}",
+        );
     }
 
     #[test]

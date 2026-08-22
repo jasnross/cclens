@@ -777,9 +777,10 @@ fn list_bare_date_since_equals_midnight_utc_timestamp() {
 }
 
 #[test]
-fn list_bare_date_until_resolves_to_midnight_utc() {
-    // `--until 2026-04-15` means midnight, matching how `git log
-    // --until <date>` resolves a bare date. Because
+fn list_bare_date_until_resolves_to_the_local_day_start() {
+    // `--until 2026-04-15` means the start of that day locally (here
+    // pinned to UTC), matching how `git log --until <date>` resolves
+    // a bare date. Because
     // `SessionFilter::accepts` is inclusive at both ends, that admits
     // only sessions starting at exactly 00:00:00Z — the day named is
     // a boundary, not a window. Pinned here so the shared parser's
@@ -801,6 +802,59 @@ fn list_bare_date_until_resolves_to_midnight_utc() {
     assert_eq!(run("2026-04-15"), run("2026-04-15T00:00:00Z"));
     // ...and that is strictly narrower than the whole day.
     assert_ne!(run("2026-04-15"), run("2026-04-15T23:59:59Z"));
+}
+
+#[test]
+fn list_bare_date_is_read_on_the_timeline_the_table_displays() {
+    // The regression this pins: with a UTC reading, a session the
+    // table shows at `2026-04-16 00:33` local was dropped by
+    // `--since 2026-04-16`, silently, because the same instant is
+    // 2026-04-15T14:33Z.
+    let run = |args: &[&str]| {
+        let cache = isolated_cache();
+        cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+            .env("TZ", "Australia/Sydney")
+            .args(["--projects-dir"])
+            .arg(projects_fixture_dir())
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    let baseline = String::from_utf8(run(&["list"])).unwrap();
+    assert!(
+        baseline.contains("2026-04-16 00:33"),
+        "fixture precondition — the row must display on the 16th locally:\n{baseline}",
+    );
+    let filtered = String::from_utf8(run(&["list", "--since", "2026-04-16"])).unwrap();
+    assert!(
+        filtered.contains(BETA_PROSE_UUID),
+        "a row the table shows on the 16th must survive `--since 2026-04-16`:\n{filtered}",
+    );
+}
+
+#[test]
+fn list_min_cost_rejects_negative_and_non_finite_values() {
+    // `parse_min_cost` guards both surfaces; this pins the CLI side.
+    // `nan` is the motivating case: it would otherwise commit as a
+    // filter that silently empties every view.
+    // `--min-cost=-1`, not `--min-cost -1`: clap reads a bare `-1` as
+    // a flag and rejects it before any value parser runs.
+    for (arg, message) in [
+        ("--min-cost=-1", "at or above zero"),
+        ("--min-cost=nan", "finite"),
+    ] {
+        let cache = isolated_cache();
+        cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+            .args(["--projects-dir"])
+            .arg(projects_fixture_dir())
+            .args(["list", arg])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(message));
+    }
 }
 
 #[test]

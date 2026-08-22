@@ -8,9 +8,11 @@
 //!   `(project_name, since, until)`.
 //! - `SessionFilter::accepts` — predicate over
 //!   `(project_short_name, started_at)`.
-//! - `QueryScope` — the views a filter component can be confined to.
+//! - `QueryScope` — one of the three loaders a filter component can
+//!   constrain.
+//! - `HonoredBy` — which loaders honor a given component.
 //! - `FilterComponent` — one rendered, flag-shaped filter component
-//!   plus the scope it constrains.
+//!   plus the loaders it constrains.
 //! - `ThresholdsFilter::describe_active` /
 //!   `SessionFilter::describe_active` — the active flags as
 //!   `Vec<FilterComponent>`, in display order.
@@ -18,51 +20,117 @@
 //!   (bare `YYYY-MM-DD` or full RFC 3339), shared by clap and the TUI.
 //! - `render_filter_datetime` — its inverse, in the shortest spelling
 //!   that reparses to the same instant.
+//! - `quote_filter_value` — single-quotes a component value that
+//!   would not otherwise reparse as one shell word.
 //! - `parse_min_cost` — `--min-cost` parser rejecting negative and
 //!   non-finite values, shared by clap and the TUI filter editor.
 
 use std::str::FromStr;
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 
-/// The views a filter component can be confined to. `--session` is
-/// the only view-scoped component today; every other component
-/// constrains all three loaders.
+/// One of the three loaders a filter component can constrain. Named
+/// per loader rather than per view because that is the granularity
+/// causation needs: `load_show` resolves its session by id and applies
+/// thresholds only, so a Show empty state naming `--project` would
+/// blame a filter that provably excluded nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryScope {
+    Sessions,
+    Show,
     Inputs,
 }
 
-/// One rendered filter component and the scope it constrains, in
+/// Which loaders honor a filter component. The three constants below
+/// are the whole vocabulary — a component is built from one of them,
+/// never from arbitrary flags, so adding a loader-scoped filter means
+/// naming its shape here rather than leaving a call site to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HonoredBy {
+    sessions: bool,
+    show: bool,
+    inputs: bool,
+}
+
+impl HonoredBy {
+    /// `--min-tokens` / `--min-cost`: thresholds every loader applies.
+    pub const EVERY_LOADER: Self = Self {
+        sessions: true,
+        show: true,
+        inputs: true,
+    };
+    /// `--project` / `--since` / `--until`: honored wherever sessions
+    /// are *selected*. `load_show` is handed one session id, so these
+    /// never narrow it.
+    pub const SESSION_SCOPED: Self = Self {
+        sessions: true,
+        show: false,
+        inputs: true,
+    };
+    /// `--session`: the inputs view is the only reader.
+    pub const INPUTS_ONLY: Self = Self {
+        sessions: false,
+        show: false,
+        inputs: true,
+    };
+
+    /// Whether the loader behind `scope` applies this component.
+    #[must_use]
+    pub fn honors(self, scope: QueryScope) -> bool {
+        match scope {
+            QueryScope::Sessions => self.sessions,
+            QueryScope::Show => self.show,
+            QueryScope::Inputs => self.inputs,
+        }
+    }
+}
+
+/// One rendered filter component and the loaders it constrains, in
 /// display order. `text` is flag-shaped on every surface — the CLI
 /// joins components with spaces, the TUI header styles each one by
 /// whether it applies to the visible tab.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilterComponent {
     pub text: String,
-    /// `None` when the component constrains every view.
-    pub scoped_to: Option<QueryScope>,
+    pub honored_by: HonoredBy,
 }
 
-/// Parse a filter timestamp, accepting a bare `YYYY-MM-DD` (midnight
-/// UTC) in addition to full RFC 3339. Shared by clap's `--since` /
-/// `--until` and the TUI filter editor so one date vocabulary serves
-/// both surfaces.
+/// The first instant of `date` in the local zone. Not always
+/// midnight: on a spring-forward day the local clock skips it, so the
+/// day begins at the first hour that exists.
+fn local_day_start(date: NaiveDate) -> Option<DateTime<Utc>> {
+    (0..3).find_map(|hour| {
+        let naive = date.and_hms_opt(hour, 0, 0)?;
+        Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .map(|dt| dt.with_timezone(&Utc))
+    })
+}
+
+/// Parse a filter timestamp, accepting a bare `YYYY-MM-DD` (the start
+/// of that day, *locally*) in addition to full RFC 3339. Shared by
+/// clap's `--since` / `--until` and the TUI filter editor so one date
+/// vocabulary serves both surfaces.
 ///
-/// A bare date means midnight UTC on both flags — the same instant,
+/// Local, not UTC, because every timestamp cclens renders is local: a
+/// UTC reading silently drops rows the table visibly shows on the day
+/// the user named. `git log --since` resolves bare dates the same way.
+///
+/// A bare date means one instant on both flags — the same one,
 /// whichever flag consumed it. Because `SessionFilter::accepts` is
 /// inclusive at both ends, the two flags then read asymmetrically:
 /// `--since 2026-04-15` admits all of the 15th, while
-/// `--until 2026-04-15` admits only sessions starting at midnight
-/// exactly. That asymmetry is what lets one `value_parser` serve
-/// both flags, since it never learns which flag it is parsing for.
+/// `--until 2026-04-15` admits only sessions starting at exactly that
+/// instant. That asymmetry is what lets one `value_parser` serve both
+/// flags, since it never learns which flag it is parsing for.
 ///
 /// # Errors
 /// Returns a human-readable message when the text matches neither
-/// accepted form.
+/// accepted form, or names a date with no local start instant.
 pub fn parse_filter_datetime(s: &str) -> Result<DateTime<Utc>, String> {
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Ok(date.and_time(NaiveTime::MIN).and_utc());
+        return local_day_start(date).ok_or_else(|| "no such local date".to_string());
     }
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
@@ -86,29 +154,58 @@ pub fn parse_min_cost(s: &str) -> Result<f64, String> {
     if !value.is_finite() {
         return Err("expected a finite number".to_string());
     }
-    if value < 0.0 {
+    if value < 0.0 || (value == 0.0 && value.is_sign_negative()) {
+        // `-0.0` is not `< 0.0`, but it renders as `--min-cost -0`,
+        // which clap rejects as a flag before this parser ever sees
+        // it — the one input that would not survive its own round trip.
         return Err("expected a number at or above zero".to_string());
     }
     Ok(value)
 }
 
-/// Render an instant in the shortest spelling that `parse_filter_datetime`
-/// maps back to it: `2026-04-15` for midnight UTC, full RFC 3339
-/// otherwise. Never a reinterpretation — emitting a bare date for a
-/// non-midnight instant would silently widen the filter on the next
-/// commit.
+/// Render an instant in the shortest spelling that
+/// `parse_filter_datetime` maps back to it: a bare `2026-04-15` when
+/// that date starts at exactly this instant locally, otherwise a full
+/// RFC 3339 timestamp at the local offset. Never a reinterpretation — emitting a bare date for any
+/// other instant would silently widen the filter on the next commit.
 ///
-/// Paired with `parse_filter_datetime`'s one-instant-per-date rule: a
-/// bare date denotes midnight on both flags, so this renderer emits a
-/// bare date for exactly the instants that rule maps back. Change one
-/// and the other must change with it, or the round-trip breaks.
+/// Defined as the literal inverse rather than by re-deriving the rule:
+/// the candidate is offered to `parse_filter_datetime` and kept only
+/// if it round-trips. The two cannot drift apart, whatever the local
+/// zone does with midnight.
 #[must_use]
 pub fn render_filter_datetime(dt: DateTime<Utc>) -> String {
-    if dt.time() == NaiveTime::MIN {
-        dt.format("%Y-%m-%d").to_string()
+    let bare = dt.with_timezone(&Local).format("%Y-%m-%d").to_string();
+    if parse_filter_datetime(&bare) == Ok(dt) {
+        bare
     } else {
-        dt.to_rfc3339()
+        // Local, like the bare form and like every timestamp cclens
+        // displays. Reparses to the same instant either way, so this
+        // is a spelling choice, not a semantic one.
+        dt.with_timezone(&Local).to_rfc3339()
     }
+}
+
+/// Characters that survive a paste into a shell unquoted and un-glob-
+/// expanded. Everything else — whitespace, quotes, `$`, backtick, `|`,
+/// `&`, `;`, `*`, `(`, `)`, `\`, `!`, `#`, `~`, redirection — is
+/// something the shell would act on.
+const SHELL_SAFE_PUNCTUATION: &str = "-_./:@+=,";
+
+/// Wrap a filter value in single quotes unless every character is
+/// known safe to paste. Every surface renders components flag-shaped
+/// and claims they reparse; an allowlist is what makes that true for
+/// values the author never anticipated, where a denylist only covers
+/// the metacharacters someone remembered to name.
+#[must_use]
+pub fn quote_filter_value(value: &str) -> String {
+    let is_safe = |c: char| c.is_ascii_alphanumeric() || SHELL_SAFE_PUNCTUATION.contains(c);
+    if !value.is_empty() && value.chars().all(is_safe) {
+        return value.to_string();
+    }
+    // The POSIX escape for a single quote inside single quotes: close,
+    // emit an escaped quote, reopen.
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -142,13 +239,13 @@ impl ThresholdsFilter {
         if let Some(t) = self.min_tokens {
             components.push(FilterComponent {
                 text: format!("--min-tokens {t}"),
-                scoped_to: None,
+                honored_by: HonoredBy::EVERY_LOADER,
             });
         }
         if let Some(c) = self.min_cost {
             components.push(FilterComponent {
                 text: format!("--min-cost {c}"),
-                scoped_to: None,
+                honored_by: HonoredBy::EVERY_LOADER,
             });
         }
         components
@@ -209,20 +306,20 @@ impl SessionFilter {
         let mut components = Vec::new();
         if let Some(p) = &self.project_name {
             components.push(FilterComponent {
-                text: format!("--project {p}"),
-                scoped_to: None,
+                text: format!("--project {}", quote_filter_value(p)),
+                honored_by: HonoredBy::SESSION_SCOPED,
             });
         }
         if let Some(s) = self.since {
             components.push(FilterComponent {
                 text: format!("--since {}", render_filter_datetime(s)),
-                scoped_to: None,
+                honored_by: HonoredBy::SESSION_SCOPED,
             });
         }
         if let Some(u) = self.until {
             components.push(FilterComponent {
                 text: format!("--until {}", render_filter_datetime(u)),
-                scoped_to: None,
+                honored_by: HonoredBy::SESSION_SCOPED,
             });
         }
         components
@@ -415,10 +512,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_filter_datetime_accepts_bare_date_as_midnight_utc() {
+    fn parse_filter_datetime_resolves_a_bare_date_to_the_local_day_start() {
+        // Local, not UTC: every timestamp cclens renders is local, so
+        // a UTC reading drops rows the table shows on the named day.
+        // Asserted as a property rather than a fixed instant, so the
+        // test says the same thing in every zone it runs in.
+        let parsed = parse_filter_datetime("2026-04-15").unwrap();
+        let local = parsed.with_timezone(&Local);
+        assert_eq!(local.format("%Y-%m-%d").to_string(), "2026-04-15");
+        let one_earlier = (parsed - chrono::Duration::seconds(1)).with_timezone(&Local);
         assert_eq!(
-            parse_filter_datetime("2026-04-15").unwrap(),
-            ts("2026-04-15T00:00:00Z"),
+            one_earlier.format("%Y-%m-%d").to_string(),
+            "2026-04-14",
+            "the instant before must fall on the previous local day",
         );
     }
 
@@ -444,14 +550,45 @@ mod tests {
     fn filter_datetime_round_trips_through_shortest_spelling() {
         // The invariant the editor and the header both depend on:
         // whatever a surface displays reparses to the same instant.
-        let midnight = ts("2026-04-15T00:00:00Z");
-        assert_eq!(render_filter_datetime(midnight), "2026-04-15");
-        assert_eq!(parse_filter_datetime("2026-04-15").unwrap(), midnight);
+        let day_start = parse_filter_datetime("2026-04-15").unwrap();
+        assert_eq!(render_filter_datetime(day_start), "2026-04-15");
 
-        let mid_day = ts("2026-04-15T14:33:00Z");
+        let mid_day = day_start + chrono::Duration::minutes(893);
         let rendered = render_filter_datetime(mid_day);
-        assert_eq!(rendered, "2026-04-15T14:33:00+00:00");
+        assert_ne!(
+            rendered, "2026-04-15",
+            "only the day start may render bare; anything else would widen the filter",
+        );
         assert_eq!(parse_filter_datetime(&rendered).unwrap(), mid_day);
+    }
+
+    #[test]
+    fn quote_filter_value_quotes_only_what_would_not_reparse() {
+        assert_eq!(quote_filter_value("alpha"), "alpha");
+        assert_eq!(quote_filter_value("my project"), "'my project'");
+        assert_eq!(quote_filter_value(""), "''");
+        assert_eq!(quote_filter_value("it's"), r"'it'\''s'");
+        // An allowlist, so metacharacters no one thought to name are
+        // quoted too — pasting these unquoted would run a second
+        // command, expand a glob, or substitute a subshell.
+        assert_eq!(quote_filter_value("my;project"), "'my;project'");
+        assert_eq!(quote_filter_value("$(id)"), "'$(id)'");
+        assert_eq!(quote_filter_value("a*b"), "'a*b'");
+        // ...while the punctuation real project names carry does not
+        // get quoted for nothing.
+        assert_eq!(quote_filter_value("my-project_2.0"), "my-project_2.0");
+    }
+
+    #[test]
+    fn session_filter_describe_active_quotes_a_project_name_with_a_space() {
+        // The hint is meant to be copy-pasteable; unquoted, this one
+        // reparses as `--project my` plus a stray argument.
+        let spaced = SessionFilter {
+            project_name: Some("my project".to_string()),
+            since: None,
+            until: None,
+        };
+        assert_eq!(spaced.describe_active()[0].text, "--project 'my project'");
     }
 
     #[test]
@@ -470,7 +607,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["--min-tokens 50000", "--min-cost 0.5"],
         );
-        assert!(components.iter().all(|c| c.scoped_to.is_none()));
+        assert!(
+            components
+                .iter()
+                .all(|c| c.honored_by == HonoredBy::EVERY_LOADER)
+        );
 
         let tokens_only = ThresholdsFilter {
             min_tokens: Some(50_000),
@@ -496,7 +637,10 @@ mod tests {
 
         let all = SessionFilter {
             project_name: Some("alpha".to_string()),
-            since: Some(ts("2026-04-10T00:00:00Z")),
+            // Built through the parser: the instant that renders bare
+            // is the local day start, which is not midnight UTC in
+            // every zone this test runs in.
+            since: parse_filter_datetime("2026-04-10").ok(),
             until: Some(ts("2026-04-20T14:33:00Z")),
         };
         let components = all.describe_active();
@@ -507,12 +651,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "--project alpha",
-                // Midnight renders bare; a non-midnight instant does not.
+                // The local day start renders bare; any other instant
+                // renders as a full timestamp at the local offset.
                 "--since 2026-04-10",
-                "--until 2026-04-20T14:33:00+00:00",
+                &format!(
+                    "--until {}",
+                    ts("2026-04-20T14:33:00Z")
+                        .with_timezone(&Local)
+                        .to_rfc3339()
+                ),
             ],
         );
-        assert!(components.iter().all(|c| c.scoped_to.is_none()));
+        // `load_show` is handed one session id, so a scope filter
+        // cannot be what emptied it.
+        assert!(
+            components
+                .iter()
+                .all(|c| c.honored_by == HonoredBy::SESSION_SCOPED)
+        );
     }
 
     #[test]

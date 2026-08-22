@@ -157,13 +157,13 @@ pub(super) struct SessionFilterArgs {
     #[arg(long)]
     project: Option<String>,
     /// Include only sessions whose `started_at` is at or after this
-    /// time (inclusive). Accepts `YYYY-MM-DD`, which means midnight
-    /// UTC, or a full RFC 3339 timestamp.
+    /// time (inclusive). Accepts `YYYY-MM-DD`, which means the start
+    /// of that day in local time, or a full RFC 3339 timestamp.
     #[arg(long, value_parser = parse_filter_datetime)]
     since: Option<DateTime<Utc>>,
     /// Include only sessions whose `started_at` is at or before this
-    /// time (inclusive). Accepts `YYYY-MM-DD`, which means midnight
-    /// UTC, or a full RFC 3339 timestamp.
+    /// time (inclusive). Accepts `YYYY-MM-DD`, which means the start
+    /// of that day in local time, or a full RFC 3339 timestamp.
     #[arg(long, value_parser = parse_filter_datetime)]
     until: Option<DateTime<Utc>>,
 }

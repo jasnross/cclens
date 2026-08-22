@@ -40,7 +40,9 @@ use crate::discovery::{
     ProjectSessions, SessionPaths, SubagentPaths, discover, read_subagent_meta,
 };
 use crate::domain::{Session, Turn, TurnOrigin};
-use crate::filter::{FilterComponent, QueryScope, SessionFilter, ThresholdsFilter};
+use crate::filter::{
+    FilterComponent, HonoredBy, SessionFilter, ThresholdsFilter, quote_filter_value,
+};
 use crate::inventory::{InventoryConfig, discover_inventory};
 use crate::parsing::parse_jsonl;
 use crate::pricing::{self, ClaudePricing, PricingCatalog};
@@ -67,8 +69,8 @@ impl Query {
         let mut components = Vec::new();
         if let Some(id) = &self.inputs_session_id {
             components.push(FilterComponent {
-                text: format!("--session {id}"),
-                scoped_to: Some(QueryScope::Inputs),
+                text: format!("--session {}", quote_filter_value(id)),
+                honored_by: HonoredBy::INPUTS_ONLY,
             });
         }
         components.extend(self.sessions.describe_active());
@@ -823,11 +825,9 @@ mod tests {
         let query = Query {
             sessions: SessionFilter {
                 project_name: Some("alpha".to_string()),
-                since: Some(
-                    chrono::DateTime::parse_from_rfc3339("2026-04-10T00:00:00Z")
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
-                ),
+                // Through the parser: the instant that renders as a
+                // bare date is the local day start.
+                since: crate::filter::parse_filter_datetime("2026-04-10").ok(),
                 until: None,
             },
             thresholds: ThresholdsFilter {
@@ -849,11 +849,17 @@ mod tests {
                 "--min-tokens 50000",
             ],
         );
-        // Only `--session` is view-scoped; every other component
-        // constrains all three loaders.
+        // `--session` is read by the inputs loader alone, scope
+        // filters never reach `load_show`, and thresholds constrain
+        // all three loaders.
         assert_eq!(
-            components.iter().map(|c| c.scoped_to).collect::<Vec<_>>(),
-            vec![Some(QueryScope::Inputs), None, None, None],
+            components.iter().map(|c| c.honored_by).collect::<Vec<_>>(),
+            vec![
+                HonoredBy::INPUTS_ONLY,
+                HonoredBy::SESSION_SCOPED,
+                HonoredBy::SESSION_SCOPED,
+                HonoredBy::EVERY_LOADER,
+            ],
         );
     }
 
