@@ -136,6 +136,7 @@ The cache lives at `dirs::cache_dir()/cclens/litellm-pricing.json` (macOS: `~/Li
 ## Development
 
 ```sh
-just check    # fmt + lint + build + test
+just check    # fmt-check + lint + build + test (verifies; never writes)
+just fmt      # format the tree in place
 just install  # cargo install --path .
 ```

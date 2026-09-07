@@ -26,8 +26,9 @@ This bias toward refactoring does not override scope discipline. Improve what yo
 ## Commands
 
 ```sh
-just check                      # fmt + lint + build + test (the full suite)
+just check                      # fmt-check + lint + build + test (the full suite)
 just fmt                        # just --fmt + cargo +nightly fmt + cargo fix + prettier
+just fmt-check                  # verify formatting without writing
 just lint                       # clippy on all targets, warnings-as-errors
 just test                       # run tests
 just build                      # build only
@@ -36,7 +37,7 @@ just install                    # cargo install --path .
 # Or without just:
 cargo build
 cargo test
-cargo fmt --check               # verify formatting without writing
+cargo +nightly fmt --check      # verify formatting without writing
 cargo clippy --all-targets -- -D warnings
 
 # Run a single unit test (in src/aggregation.rs):
@@ -45,6 +46,10 @@ cargo test extract_title_from_slash_command_with_args
 # Run a single integration test (tests/listing.rs):
 cargo test --test listing list_renders_sessions_oldest_first_with_correct_totals
 ```
+
+`just check` verifies rather than writes: it depends on `fmt-check`, not `fmt`. Writing is `just fmt`, which additionally runs `cargo fix --allow-dirty` and so edits source as a side effect — never reach for it as a gate.
+
+Nightly rustfmt is the formatter of record, because `rustfmt.toml` sets `imports_granularity` and `group_imports`, which stable ignores. Always spell it `cargo +nightly fmt`: the two channels disagree on some constructs (nightly has collapsed a multi-line `cfg_attr` that stable expanded), so a bare `cargo fmt` reformats against a second, unenforced standard.
 
 ## Git Commits
 

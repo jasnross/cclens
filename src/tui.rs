@@ -2955,14 +2955,13 @@ mod tests {
     use std::time::SystemTime;
 
     use chrono::{DateTime, Utc};
-
-    use crate::filter::{HonoredBy, SessionFilter, ThresholdsFilter};
     use ratatui::backend::TestBackend;
 
     use super::*;
     use crate::aggregation::{PreparedExchange, PreparedRowRole};
     use crate::attribution::TierCoverage;
     use crate::domain::{CostBreakdown, TurnOrigin};
+    use crate::filter::{HonoredBy, SessionFilter, ThresholdsFilter};
     use crate::inventory::{ContextFile, ContextFileKind, Scope};
     use crate::pricing::{ClaudePricing, TieredRate};
 
