@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-04-16T10:00:00Z","cwd":"/work/beta","message":{"content":"hi"}}
+{"type":"assistant","timestamp":"2026-04-16T10:00:05Z","cwd":"/work/beta","message":{"id":"msg_p2","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":100},"cache_read_input_tokens":0}},"requestId":"req_p2"}

@@ -14,18 +14,21 @@
 //!   `--until` scope flags shared by `cclens list` and `cclens inputs`;
 //!   `.session_filter()` produces a library `SessionFilter`.
 //! - `InputsArgs` — flattened `inputs`-only `--session` flag.
-//! - `emit_empty_result_hint(&SessionFilterArgs, &ThresholdsFilterArgs)`
-//!   — stderr hint used by `run_list` and `run_show` when the filters
-//!   dropped every row.
-//! - `emit_inputs_empty_hint(&SessionFilterArgs, &InputsArgs,
-//!   &ThresholdsFilterArgs)` — sibling hint that describes the inputs-
-//!   side, scope, and threshold filters when `cclens inputs` produces
-//!   no rows.
+//! - `PinningFilterArgs` — flattened `agents`-only `--pinning` flag;
+//!   `.pinning_filter()` produces a library `PinningFilter`.
+//! - `AgentsArgs` — flattened `agents`-only `--compare-model` flag.
+//! - Four empty-result hint wrappers, one per view, each naming its
+//!   own `QueryScope`: `emit_list_empty_hint`, `emit_show_empty_hint`,
+//!   `emit_inputs_empty_hint`, `emit_agents_empty_hint`. One helper
+//!   cannot serve two views — the hint asserts causation, so a
+//!   component the named loader never applies has no place in it.
 
 use std::path::PathBuf;
 
-use cclens::agents::PinningFilter;
-use cclens::filter::{SessionFilter, ThresholdsFilter, parse_filter_datetime, parse_min_cost};
+use cclens::agents::{PinningFilter, PinningKind};
+use cclens::filter::{
+    QueryScope, SessionFilter, ThresholdsFilter, parse_filter_datetime, parse_min_cost,
+};
 use cclens::loading::Query;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -107,6 +110,38 @@ pub(super) enum Command {
         // composition order.
         #[command(flatten)]
         inputs: InputsArgs,
+        #[command(flatten)]
+        scope: SessionFilterArgs,
+        #[command(flatten)]
+        thresholds: ThresholdsFilterArgs,
+    },
+    /// Rank subagent dispatches by observed spend.
+    ///
+    /// Reads every subagent transcript under `--projects-dir`,
+    /// deduplicates each one's assistant turns, and prices the
+    /// survivors at the model that dispatch actually ran on. Rows are
+    /// grouped by agent type, resolved model, observed effort, and how
+    /// the agent's file constrains the model — so one agent whose
+    /// dispatches disagree about any of those appears as several rows.
+    ///
+    /// Columns: `agent`, `model` and `effort` as observed in the
+    /// transcript, `declared_effort` as the agent file states it,
+    /// `pinning`, the dispatch count, deduplicated `tokens`, and
+    /// `cost`. `--compare-model` adds `repriced` and `delta`.
+    ///
+    /// The repriced figure is an **upper bound**: it prices the exact
+    /// token bundle these dispatches produced at another model's
+    /// rates, and the same work on a different model would produce a
+    /// different bundle. Fork rows are excluded from it entirely, a
+    /// fork having no model choice to make.
+    Agents {
+        // Field order shapes `--help` ordering (clap inlines flattened
+        // groups in field order), so the agents-specific flags precede
+        // the shared ones, as `Inputs` does.
+        #[command(flatten)]
+        agents: AgentsArgs,
+        #[command(flatten)]
+        pinning: PinningFilterArgs,
         #[command(flatten)]
         scope: SessionFilterArgs,
         #[command(flatten)]
@@ -201,52 +236,197 @@ impl InputsArgs {
     }
 }
 
-/// Emit `note: no rows matched <flags>` to stderr when the `list` /
-/// `show` filters dropped every row. No-op when no filter is active so
-/// the pre-existing "empty `projects_dir` produces no stderr" contract
-/// is preserved. Delegates the description to `Query::describe_active`,
-/// the one producer both this hint and the TUI header read from.
-pub(super) fn emit_empty_result_hint(scope: &SessionFilterArgs, thresholds: &ThresholdsFilterArgs) {
-    emit_hint(&Query {
-        sessions: scope.session_filter(),
-        thresholds: thresholds.thresholds_filter(),
-        inputs_session_id: None,
-        pinning: PinningFilter::default(),
-    });
+/// clap's spelling of `PinningKind`. A separate enum because the
+/// library type must not derive `ValueEnum` — that would put clap in
+/// the library crate and dissolve the seam this module exists to hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(super) enum PinningArg {
+    Pinned,
+    Inherit,
+    Unpinned,
+    NoAgentFile,
+    Fork,
 }
 
-/// Sibling of `emit_empty_result_hint` for `cclens inputs`: adds the
-/// inputs-only `--session` constraint to the same `Query`, which puts
-/// it first in the rendered order structurally rather than by
-/// hand-ordered concatenation.
+impl PinningArg {
+    fn kind(self) -> PinningKind {
+        match self {
+            Self::Pinned => PinningKind::Pinned,
+            Self::Inherit => PinningKind::Inherit,
+            Self::Unpinned => PinningKind::Unpinned,
+            Self::NoAgentFile => PinningKind::NoAgentFile,
+            Self::Fork => PinningKind::Fork,
+        }
+    }
+}
+
+/// `cclens agents`-only `--pinning` filter.
+///
+/// Its default narrows: it hides the rows whose agent file names a
+/// concrete model, and the fork rows, leaving the agents whose model
+/// nobody chose. That is the question the view was built to answer, so
+/// the footer names the active slice on every run rather than relying
+/// on a filter component that the default deliberately does not emit.
+#[derive(Args, Debug, Clone, Default)]
+pub(super) struct PinningFilterArgs {
+    /// Comma-separated pinning kinds to include. Defaults to
+    /// `inherit,unpinned,no-agent-file` — the rows for which no agent
+    /// file names a concrete model. Values are accepted in any order
+    /// and normalized to the canonical one every surface displays.
+    // `num_args = 1` with a comma delimiter keeps the flag
+    // non-greedy: `--pinning pinned fork` is a parse error rather
+    // than two values, so a positional added to `agents` later
+    // cannot be swallowed by it.
+    #[arg(long, value_enum, value_delimiter = ',', num_args = 1)]
+    pinning: Vec<PinningArg>,
+}
+
+impl PinningFilterArgs {
+    /// Project the clap-derived flag into the library-side
+    /// `PinningFilter`. Same library/CLI seam pattern as
+    /// `ThresholdsFilterArgs::thresholds_filter`.
+    ///
+    /// An unspecified flag yields the library default rather than an
+    /// empty filter: `Vec` has no way to distinguish "flag absent"
+    /// from "flag given no values", and clap's `num_args = 1..`
+    /// already rejects the latter.
+    pub(super) fn pinning_filter(&self) -> PinningFilter {
+        if self.pinning.is_empty() {
+            return PinningFilter::default();
+        }
+        let kinds: Vec<PinningKind> = self.pinning.iter().map(|p| p.kind()).collect();
+        PinningFilter::new(&kinds)
+    }
+}
+
+/// `cclens agents`-only flags. Kept separate from `PinningFilterArgs`
+/// for the reason `InputsArgs` is separate from `SessionFilterArgs`:
+/// `--pinning` narrows which rows are shown, `--compare-model` adds
+/// columns to the rows already there. Only the first belongs in a
+/// `Query`.
+#[derive(Args, Debug, Clone, Default)]
+pub(super) struct AgentsArgs {
+    /// Also report what the visible rows would cost at this model's
+    /// rates. Must be an exact pricing-catalog key — see
+    /// `cclens pricing list`. The figure is an upper bound.
+    #[arg(long)]
+    compare_model: Option<String>,
+}
+
+impl AgentsArgs {
+    pub(super) fn compare_model(&self) -> Option<&str> {
+        self.compare_model.as_deref()
+    }
+}
+
+/// Emit `note: no rows matched <flags>` to stderr when `cclens list`'s
+/// filters dropped every row. No-op when no filter is active so the
+/// pre-existing "empty `projects_dir` produces no stderr" contract is
+/// preserved.
+pub(super) fn emit_list_empty_hint(scope: &SessionFilterArgs, thresholds: &ThresholdsFilterArgs) {
+    emit_hint(
+        &Query {
+            sessions: scope.session_filter(),
+            thresholds: thresholds.thresholds_filter(),
+            ..Query::default()
+        },
+        QueryScope::Sessions,
+    );
+}
+
+/// Sibling of `emit_list_empty_hint` for `cclens show`.
+///
+/// Takes no scope argument because `run_show` has no scope flags to
+/// pass: `load_show` is handed one session id and applies thresholds
+/// only. One helper cannot serve both callers — a Show hint naming
+/// `--project` would blame a filter that provably excluded nothing.
+pub(super) fn emit_show_empty_hint(thresholds: &ThresholdsFilterArgs) {
+    emit_hint(
+        &Query {
+            thresholds: thresholds.thresholds_filter(),
+            ..Query::default()
+        },
+        QueryScope::Show,
+    );
+}
+
+/// Sibling for `cclens inputs`: adds the inputs-only `--session`
+/// constraint to the same `Query`, which puts it first in the rendered
+/// order structurally rather than by hand-ordered concatenation.
 pub(super) fn emit_inputs_empty_hint(
     scope: &SessionFilterArgs,
     inputs: &InputsArgs,
     thresholds: &ThresholdsFilterArgs,
 ) {
-    emit_hint(&Query {
-        sessions: scope.session_filter(),
-        thresholds: thresholds.thresholds_filter(),
-        inputs_session_id: inputs.session_id(),
-        pinning: PinningFilter::default(),
-    });
+    emit_hint(
+        &Query {
+            sessions: scope.session_filter(),
+            thresholds: thresholds.thresholds_filter(),
+            inputs_session_id: inputs.session_id(),
+            ..Query::default()
+        },
+        QueryScope::Inputs,
+    );
 }
 
-/// Shared tail of both empty-result hints: one producer of the
+/// Sibling for `cclens agents`.
+///
+/// `--pinning` at its default contributes no component, so an agents
+/// run emptied by the default slice alone prints no hint here. The
+/// rendered footer names the slice instead, on every run.
+pub(super) fn emit_agents_empty_hint(
+    scope: &SessionFilterArgs,
+    pinning: &PinningFilterArgs,
+    thresholds: &ThresholdsFilterArgs,
+) {
+    emit_hint(
+        &Query {
+            sessions: scope.session_filter(),
+            thresholds: thresholds.thresholds_filter(),
+            pinning: pinning.pinning_filter(),
+            ..Query::default()
+        },
+        QueryScope::Agents,
+    );
+}
+
+/// Shared tail of the four empty-result hints: one producer of the
 /// description text, joined with spaces. Suppressed when no filter is
 /// active, preserving the "empty `projects_dir` produces no stderr"
 /// contract.
-fn emit_hint(query: &Query) {
-    let components = query.describe_active();
-    if components.is_empty() {
-        return;
+///
+/// Components are filtered to those `scope`'s loader honors, the
+/// discipline `tui::empty_state_lines` already applies. The hint
+/// asserts causation — it says these flags are why there are no rows —
+/// so a component that could not have emptied this view has no place
+/// in it.
+fn emit_hint(query: &Query, scope: QueryScope) {
+    if let Some(text) = hint_text(query, scope) {
+        eprintln!("note: no rows matched {text}");
     }
-    let combined = components
+}
+
+/// The hint's flag list for `scope`, or `None` when nothing this
+/// loader honors is active.
+///
+/// Split from `emit_hint` so the scope filter is testable: today every
+/// wrapper happens to build a `Query` carrying only its own view's
+/// components, so the filter drops nothing in practice. It is the
+/// guard against a future wrapper — or a future `Query` field with a
+/// non-empty default, as `pinning` already is — putting a component in
+/// front of a view whose loader never applied it.
+fn hint_text(query: &Query, scope: QueryScope) -> Option<String> {
+    let combined = query
+        .describe_active()
         .iter()
+        .filter(|c| c.honored_by.honors(scope))
         .map(|c| c.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    eprintln!("note: no rows matched {combined}");
+    if combined.is_empty() {
+        return None;
+    }
+    Some(combined)
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -274,6 +454,110 @@ fn default_projects_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hint_text_drops_components_the_scope_does_not_honor() {
+        // A `Query` carrying every kind of component. Each view's hint
+        // must name only what its own loader applied — the hint
+        // asserts causation, so a flag that provably excluded nothing
+        // sends the reader to widen the wrong filter.
+        let query = Query {
+            sessions: SessionFilter {
+                project_name: Some("alpha".to_string()),
+                ..SessionFilter::default()
+            },
+            thresholds: ThresholdsFilter {
+                min_tokens: Some(10),
+                min_cost: None,
+            },
+            inputs_session_id: Some("abc".to_string()),
+            pinning: PinningFilter::new(&[PinningKind::Pinned]),
+        };
+
+        let sessions = hint_text(&query, QueryScope::Sessions).expect("some");
+        assert!(sessions.contains("--project alpha"), "{sessions}");
+        assert!(sessions.contains("--min-tokens 10"), "{sessions}");
+        assert!(!sessions.contains("--session "), "{sessions}");
+        assert!(!sessions.contains("--pinning"), "{sessions}");
+
+        // `load_show` is handed one session id and applies thresholds
+        // only, so its hint names nothing else.
+        let show = hint_text(&query, QueryScope::Show).expect("some");
+        assert_eq!(show, "--min-tokens 10");
+
+        let inputs = hint_text(&query, QueryScope::Inputs).expect("some");
+        assert!(inputs.contains("--session abc"), "{inputs}");
+        assert!(!inputs.contains("--pinning"), "{inputs}");
+
+        let agents = hint_text(&query, QueryScope::Agents).expect("some");
+        assert!(agents.contains("--pinning pinned"), "{agents}");
+        assert!(!agents.contains("--session "), "{agents}");
+    }
+
+    #[test]
+    fn hint_text_is_none_when_no_honored_component_is_active() {
+        // Preserves the "empty projects_dir produces no stderr"
+        // contract: with no filter set, every scope stays silent.
+        for scope in [
+            QueryScope::Sessions,
+            QueryScope::Show,
+            QueryScope::Inputs,
+            QueryScope::Agents,
+        ] {
+            assert!(hint_text(&Query::default(), scope).is_none());
+        }
+    }
+
+    #[test]
+    fn hint_text_is_none_when_only_an_unhonored_component_is_active() {
+        // A `--session`-only query empties nothing in the list view,
+        // so `cclens list` must stay silent rather than print a bare
+        // `note: no rows matched`.
+        let query = Query {
+            inputs_session_id: Some("abc".to_string()),
+            ..Query::default()
+        };
+        assert!(hint_text(&query, QueryScope::Sessions).is_none());
+        assert!(hint_text(&query, QueryScope::Inputs).is_some());
+    }
+
+    #[test]
+    fn pinning_filter_args_default_matches_library_default() {
+        // `cclens agents` with no `--pinning` must resolve to exactly
+        // the library default, or the flag's absence would mean
+        // something the library never agreed to.
+        let cli = Cli::try_parse_from(["cclens", "agents"]).unwrap();
+        let Some(Command::Agents { pinning, .. }) = cli.command else {
+            panic!("expected an Agents command");
+        };
+        assert_eq!(pinning.pinning_filter(), PinningFilter::default());
+    }
+
+    #[test]
+    fn pinning_filter_args_parses_a_comma_separated_list() {
+        let cli = Cli::try_parse_from(["cclens", "agents", "--pinning", "pinned,fork"]).unwrap();
+        let Some(Command::Agents { pinning, .. }) = cli.command else {
+            panic!("expected an Agents command");
+        };
+        assert_eq!(
+            pinning.pinning_filter(),
+            PinningFilter::new(&[PinningKind::Pinned, PinningKind::Fork]),
+        );
+    }
+
+    #[test]
+    fn pinning_flag_rejects_an_unknown_kind() {
+        assert!(Cli::try_parse_from(["cclens", "agents", "--pinning", "nonsense"]).is_err());
+    }
+
+    #[test]
+    fn compare_model_is_absent_by_default() {
+        let cli = Cli::try_parse_from(["cclens", "agents"]).unwrap();
+        let Some(Command::Agents { agents, .. }) = cli.command else {
+            panic!("expected an Agents command");
+        };
+        assert!(agents.compare_model().is_none());
+    }
 
     #[test]
     fn bare_invocation_leaves_command_as_none() {

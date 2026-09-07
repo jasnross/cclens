@@ -112,12 +112,28 @@ inventory     ← walks ~/.claude/{CLAUDE.md,rules,skills,agents},
                 context; tokenizes via tiktoken_rs cl100k_base;
                 returns Vec<ContextFile> with kind/scope; identifier()
                 returns the harness-name for skill/command/agent kinds,
-                None for always-loaded kinds (CLAUDE.md, rules)
+                None for always-loaded kinds (CLAUDE.md, rules);
+                a PluginAgent identifier carries the namespace from
+                its .claude-plugin/plugin.json; read_agent_frontmatter
+                returns one agent file's declared model / effort as a
+                separate entry point — the walk parses no frontmatter
 aggregation   ← turn list → Session; Exchange grouping;
                 title extraction; project short-name derivation;
                 zero-billable filter; cross-file dedup_assistant_turns;
                 aggregate accepts subagent_turn_lists slice that folds
                 into Session.total_* (Session.turns stays parent-only)
+agents        ← subagent transcript → Dispatch (deduplicated per
+                transcript on (message_id, request_id), priced at its
+                own recorded model) → AgentRow keyed by agent type ×
+                model × effort × Pinning; Pinning classifies how an
+                agent file constrains a dispatch (Pinned / Inherit /
+                Unpinned / NoAgentFile / Fork) from a caller-supplied
+                frontmatter map, so the classification reads no files;
+                PinningFilter (colocated here, not in filter, which
+                depends on nothing) whose default narrows and whose
+                describe_active is therefore empty at that default;
+                reprice / repriced_delta price a recorded bundle at
+                another model's rates as a labelled upper bound
 attribution   ← turn list → SessionMeta { kind: Parent | Subagent
                 { agent_type }, primary_tier, on_demand_loads:
                 Vec<OnDemandLoad>, observed_*_tokens, majority model };
@@ -126,31 +142,40 @@ attribution   ← turn list → SessionMeta { kind: Parent | Subagent
                 None cost propagation; per-tier CoverageStats summed
                 across parent + subagent metas
 loading       ← composes discovery/parsing/aggregation/attribution/
-                pricing into view-ready data behind DataContext {
-                projects_dir, catalog: Arc<PricingCatalog>, query };
-                load_sessions / load_show / load_inputs /
+                pricing into view-ready data behind DataContext;
+                load_sessions / load_show / load_inputs / load_agents;
+                DataContext carries projects_dir, catalog, inventory
+                (an Arc<InventoryConfig>, so a caller can point the
+                context-file walk somewhere without the process-global
+                CCLENS_CLAUDE_HOME), and query;
                 build_fingerprint / pricing_data / refresh_pricing;
                 Query::describe_active composes the filter components
-                in display order (--session, scope, thresholds) for
-                both the CLI hint and the TUI header;
+                in display order (--session, scope, thresholds,
+                --pinning) for both the CLI hint and the TUI header;
                 consumed by both the TUI (src/tui.rs) and the binary's
                 plain/JSON CLI paths — one loader definition per view,
                 not one per entry point
 pricing       ← LiteLLM-catalog fetch/cache/lookup, tiered cost math,
                 pricing-subcommand handlers; cost_for_cache_creation_{1h,5m}
-                helpers exposed for the inputs subcommand
+                helpers exposed for the inputs subcommand; lookup_exact
+                resolves a user-supplied model without lookup's
+                prefix / substring fallbacks
 rendering     ← comfy-table render_table (list view), render_session
                 (show view dispatches on Turn.origin: parent → two
                 rows, subagent → single `subagent` row inline by
-                timestamp), and render_inputs (inputs view) with
-                per-tier coverage line; per-row formatters
+                timestamp), render_inputs (inputs view) with per-tier
+                coverage line, and render_agents (agents view, whose
+                totals line names the active pinning slice
+                unconditionally because the narrowing default emits no
+                filter component to say so); per-row formatters
 filter        ← ThresholdsFilter / SessionFilter value types — the
                 cross-boundary primitives that let rendering accept
                 --min-tokens / --min-cost / --project / --since /
                 --until without depending on clap; plus the filter
                 vocabulary both surfaces render: FilterComponent,
-                QueryScope (one of the three loaders) + HonoredBy
-                (which loaders honor a component), describe_active on
+                QueryScope (one of the four loaders, Agents included)
+                + HonoredBy (which loaders honor a component;
+                AGENTS_ONLY carries --pinning), describe_active on
                 both filter types, and
                 parse_filter_datetime / render_filter_datetime (the
                 lenient YYYY-MM-DD-or-RFC-3339 parser and its
@@ -161,6 +186,7 @@ formatting    ← shared per-value display helpers: format_cost_opt,
                 coverage_half pair; consumed by both rendering and tui
 views         ← shared per-row cell builders — SessionCells (list),
                 ShowRowCells (show), InputsCells (inputs),
+                AgentsCells + repriced_cells (agents),
                 pricing_view_rows, SessionTotals — mapping domain
                 types to cell values; rendering applies truncate_title
                 and comfy-table alignment, tui wraps the same cells in
@@ -183,7 +209,7 @@ Binary entry point (`src/main.rs`):
 
 - Declares `mod cli;` (binary-only — `src/cli.rs` is **not** in `lib.rs`) so library code cannot reach into clap-derived types.
 - Imports library modules via `use cclens::...`.
-- Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs` — orchestration only. Each `run_*` builds a `loading::DataContext` from CLI args and either drives the TUI (`run_tui`) or calls `loading::load_sessions` / `loading::load_show` / `loading::load_inputs` directly for the plain/JSON paths. The loaders themselves, their `build_subagent_turns` / `build_subagent_meta` / `stem_matches` helpers, and fingerprint-building all live in `loading` — the binary has no data-loading code of its own.
+- Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs`, `run_agents` — orchestration only. Each `run_*` builds a `loading::DataContext` from CLI args and either drives the TUI (`run_tui`) or calls `loading::load_sessions` / `loading::load_show` / `loading::load_inputs` / `loading::load_agents` directly for the plain/JSON paths. The loaders themselves, their `build_subagent_turns` / `build_subagent_meta` / `stem_matches` helpers, and fingerprint-building all live in `loading` — the binary has no data-loading code of its own.
 
 Binary CLI submodule (`src/cli.rs`):
 
@@ -191,7 +217,9 @@ Binary CLI submodule (`src/cli.rs`):
 - `ThresholdsFilterArgs` — flattened `--min-tokens` / `--min-cost` flags with a `.thresholds_filter()` constructor that produces a library `ThresholdsFilter`.
 - `SessionFilterArgs` — flattened `--project` / `--since` / `--until` scope flags with a `.session_filter()` constructor that produces a library `SessionFilter`.
 - `InputsArgs` — the `inputs`-only `--session` flag, with a `.session_id()` accessor.
-- `emit_empty_result_hint` and `emit_inputs_empty_hint`.
+- `PinningFilterArgs` — the `agents`-only `--pinning` flag over a clap-side `PinningArg` mirror of `PinningKind` (the library type must not derive `ValueEnum`, which would put clap in the library crate); `.pinning_filter()` produces a library `PinningFilter`.
+- `AgentsArgs` — the `agents`-only `--compare-model` flag.
+- Four empty-result hint wrappers over a private `emit_hint(query, scope)` tail — `emit_list_empty_hint`, `emit_show_empty_hint`, `emit_inputs_empty_hint`, `emit_agents_empty_hint` — one per view, each naming its own `QueryScope`. The tail filters components to those the scope honors: the hint asserts causation, so a component the named loader never applies has no place in it.
 
 Each library module file opens with a `//!` doc comment listing its public API surface. The gityard repo is the reference for the split's overall shape (flat `src/<name>.rs` files, `lib.rs` of pure `pub mod` declarations, `main.rs` with binary-only `mod cli;`).
 

@@ -802,3 +802,31 @@ fn show_works_on_zero_billable_session() {
         "orphan row cumulative should be 0 (renders as 0.00k); got: {row}",
     );
 }
+
+#[test]
+fn list_empty_hint_omits_the_pinning_component() {
+    // `cclens list` emptied by its own filters must not name
+    // `--pinning`, which `load_sessions` does not honor. The hint
+    // asserts causation: naming a flag that provably excluded nothing
+    // sends the reader to widen the wrong filter. This is the
+    // regression the per-view `emit_hint` scope exists to prevent.
+    let cache = isolated_cache();
+    let out = cclens_command(cache.path(), &pricing_fixture_url("litellm-mini.json"))
+        .args(["--projects-dir"])
+        .arg(projects_fixture_dir())
+        .args(["list", "--min-tokens", "999999999"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8(out).unwrap();
+    assert!(
+        stderr.contains("no rows matched"),
+        "expected an empty-result hint:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("--pinning"),
+        "the list hint must not name an agents-only flag:\n{stderr}",
+    );
+}

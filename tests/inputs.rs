@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 
 use common::{
     agent_namespace_projects_fixture_dir, build_agent_namespace_claude_home,
-    build_inputs_claude_home, cclens_inputs_command, copy_dir_recursive,
+    build_inputs_claude_home, cclens_claude_home_command, copy_dir_recursive,
     inputs_projects_fixture_dir, pricing_fixture_url,
 };
 use regex::Regex;
@@ -42,7 +42,7 @@ fn run_inputs(extra_args: &[&str]) -> (String, String) {
     let cache = isolated_tempdir();
     let claude_home_owner = isolated_tempdir();
     let claude_home = build_inputs_claude_home(claude_home_owner.path());
-    let mut cmd = cclens_inputs_command(
+    let mut cmd = cclens_claude_home_command(
         cache.path(),
         &pricing_fixture_url(PRICING_FIXTURE),
         &claude_home,
@@ -103,7 +103,7 @@ fn inputs_renders_empty_when_no_sessions() {
     let claude_home_owner = isolated_tempdir();
     let claude_home = build_inputs_claude_home(claude_home_owner.path());
     let empty_projects = isolated_tempdir();
-    let stdout = cclens_inputs_command(
+    let stdout = cclens_claude_home_command(
         cache.path(),
         &pricing_fixture_url(PRICING_FIXTURE),
         &claude_home,
@@ -543,7 +543,8 @@ fn plugin_agent_file_is_credited_by_a_namespaced_dispatch() {
 }
 
 fn run_inputs_against(cache: &Path, claude_home: &Path, projects_dir: &Path) -> String {
-    let mut cmd = cclens_inputs_command(cache, &pricing_fixture_url(PRICING_FIXTURE), claude_home);
+    let mut cmd =
+        cclens_claude_home_command(cache, &pricing_fixture_url(PRICING_FIXTURE), claude_home);
     cmd.args(["--projects-dir"]).arg(projects_dir).arg("inputs");
     let raw = cmd.assert().success().get_output().stdout.clone();
     String::from_utf8(raw).unwrap()

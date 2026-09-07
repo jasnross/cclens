@@ -15,11 +15,16 @@
 //!   via `format_cost_breakdown`).
 //! - `InputsCells` / `inputs_cells(&AttributionRow)` — inputs-view
 //!   row cells.
+//! - `AgentsCells` / `agents_cells(&AgentRow)` — agents-view row
+//!   cells.
+//! - `repriced_cells(&AgentRow, &str, &PricingCatalog)` — the
+//!   repriced-cost and delta cells for one row under `--compare-model`.
 //! - `pricing_view_rows(&str, &ClaudePricing) -> Vec<Vec<String>>` —
 //!   pricing-view rows (cells identical between paths).
 //! - `SessionTotals` / `session_totals(&[Session])` — aggregate
 //!   token + cost totals for 2+ sessions.
 
+use crate::agents::{AgentRow, Pinning, reprice};
 use crate::aggregation::{PreparedRow, PreparedRowRole, fold_cum_cost};
 use crate::attribution::AttributionRow;
 use crate::domain::{CostBreakdown, Session};
@@ -27,7 +32,7 @@ use crate::formatting::{
     display_path, format_cost_opt, format_local, format_local_or_empty, format_rate_mtok,
     format_tokens, kind_label, tiers_differ,
 };
-use crate::pricing::ClaudePricing;
+use crate::pricing::{ClaudePricing, PricingCatalog};
 
 pub struct SessionCells {
     pub datetime: String,
@@ -54,6 +59,17 @@ pub struct InputsCells {
     pub tokens: String,
     pub loads: String,
     pub billed: String,
+    pub cost: String,
+}
+
+pub struct AgentsCells {
+    pub agent: String,
+    pub model: String,
+    pub effort: String,
+    pub declared_effort: String,
+    pub pinning: String,
+    pub dispatches: String,
+    pub tokens: String,
     pub cost: String,
 }
 
@@ -109,6 +125,74 @@ pub fn inputs_cells(row: &AttributionRow) -> InputsCells {
         billed: format_tokens(row.estimated_tokens_billed),
         cost: format_cost_opt(row.attributed_cost),
     }
+}
+
+/// An absent optional cell. Shared by the three agents columns that
+/// can be unknown, matching how `show_row_cells` renders an absent
+/// token count: a gap the reader can see, never a substituted value.
+const ABSENT: &str = "—";
+
+fn or_absent(value: Option<&String>) -> String {
+    value.map_or_else(|| ABSENT.to_string(), Clone::clone)
+}
+
+#[must_use]
+pub fn agents_cells(row: &AgentRow) -> AgentsCells {
+    AgentsCells {
+        agent: row.agent_type.clone(),
+        model: or_absent(row.model.as_ref()),
+        effort: or_absent(row.effort.as_ref()),
+        declared_effort: or_absent(row.declared_effort.as_ref()),
+        pinning: row.pinning.label().to_string(),
+        dispatches: row.dispatches.to_string(),
+        tokens: format_tokens(row.usage.billable()),
+        cost: format_cost_opt(row.cost.map(|c| c.total())),
+    }
+}
+
+/// The `(repriced, delta)` cells for one row under `--compare-model`.
+///
+/// Both render as an em dash unless *both* sides are known: a delta
+/// needs a recorded cost to subtract from, and a repriced figure the
+/// target model can price. Reporting one without the other would
+/// invite reading the repriced column as a saving.
+///
+/// A `Fork` row is likewise an em dash, matching what
+/// `agents::repriced_delta` excludes from the footer. The column has
+/// to agree with the total beneath it — a priced fork cell would make
+/// the visible column sum differ from the footer's figure, and a fork
+/// runs its parent's model, so its repriced number describes a change
+/// nobody can make.
+#[must_use]
+pub fn repriced_cells(
+    row: &AgentRow,
+    target_model: &str,
+    catalog: &PricingCatalog,
+) -> (String, String) {
+    if row.pinning == Pinning::Fork {
+        return (ABSENT.to_string(), ABSENT.to_string());
+    }
+    let (Some(current), Some(target)) = (row.cost, reprice(&row.usage, target_model, catalog))
+    else {
+        return (ABSENT.to_string(), ABSENT.to_string());
+    };
+    let delta = target.total() - current.total();
+    (format_cost_opt(Some(target.total())), format_delta(delta))
+}
+
+/// A signed cost delta, because the direction is the point: a negative
+/// delta is what the target model would save, a positive one what it
+/// would add.
+///
+/// A magnitude below the display threshold renders unsigned. Costs
+/// print to four decimals, so a signed `-$0.0000` would be claiming a
+/// direction the rendered number cannot support.
+fn format_delta(delta: f64) -> String {
+    let rendered = format_cost_opt(Some(delta.abs()));
+    if rendered == "$0.0000" {
+        return rendered;
+    }
+    format!("{}{rendered}", if delta > 0.0 { "+" } else { "-" })
 }
 
 #[must_use]

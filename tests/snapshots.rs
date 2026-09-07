@@ -12,8 +12,8 @@
 mod common;
 
 use common::{
-    build_inputs_claude_home, cclens_command, cclens_inputs_command, inputs_projects_fixture_dir,
-    pricing_fixture_url, snapshot_pricing_url, snapshot_projects_dir,
+    build_inputs_claude_home, cclens_claude_home_command, cclens_command,
+    inputs_projects_fixture_dir, pricing_fixture_url, snapshot_pricing_url, snapshot_projects_dir,
 };
 use insta::assert_snapshot;
 
@@ -93,7 +93,7 @@ fn inputs_snapshot() {
     let claude_home = build_inputs_claude_home(home.path());
     let pricing = pricing_fixture_url("litellm-mini.json");
 
-    let stdout_bytes = cclens_inputs_command(cache.path(), &pricing, &claude_home)
+    let stdout_bytes = cclens_claude_home_command(cache.path(), &pricing, &claude_home)
         .env("HOME", home.path())
         .env("TZ", "UTC")
         .args(["--projects-dir"])

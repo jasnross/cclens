@@ -62,11 +62,16 @@ pub fn cclens_command(cache_dir: &Path, pricing_url: &str) -> Command {
     cmd
 }
 
-/// Build a `cclens` command for the `inputs` subcommand with a
-/// hermetic `CCLENS_CLAUDE_HOME` override. Adds the third env var on
-/// top of `cclens_command`'s pricing/cache isolation so tests don't
-/// leak into the user's real `~/.claude/` directory.
-pub fn cclens_inputs_command(cache_dir: &Path, pricing_url: &str, claude_home: &Path) -> Command {
+/// Build a `cclens` command with a hermetic `CCLENS_CLAUDE_HOME`
+/// override. Adds the third env var on top of `cclens_command`'s
+/// pricing/cache isolation so tests don't leak into the user's real
+/// `~/.claude/` directory. Used by every subcommand that walks the
+/// context-file inventory — `inputs` and `agents` both do.
+pub fn cclens_claude_home_command(
+    cache_dir: &Path,
+    pricing_url: &str,
+    claude_home: &Path,
+) -> Command {
     let mut cmd = cclens_command(cache_dir, pricing_url);
     cmd.env("CCLENS_CLAUDE_HOME", claude_home);
     cmd
@@ -169,6 +174,65 @@ pub fn build_agent_namespace_claude_home(cache_dir: &Path) -> PathBuf {
         plugin_path.join("agents/sample-agent.md"),
         "---\nname: sample-agent\nmodel: claude-opus-5\n---\n\n\
          # Sample Agent\n\nDispatched by the namespacing integration test.\n",
+    )
+    .expect("write plugin agent");
+
+    let plugins_dir = claude_home.join("plugins");
+    let json = format!(
+        r#"{{"plugins":{{"tp-plugin@test-marketplace":[{{"installPath":{path:?},"version":"1.0.0"}}]}}}}"#,
+        path = plugin_path.to_string_lossy(),
+    );
+    fs::write(plugins_dir.join("installed_plugins.json"), json)
+        .expect("write installed_plugins.json");
+
+    claude_home
+}
+
+pub fn agents_projects_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agents-projects")
+}
+
+/// Build a synthetic `~/.claude/` holding the agent files the
+/// `agents-projects` fixture's dispatches resolve against:
+/// - `agents/pinned-agent.md` declaring `model: claude-opus-4-7` and
+///   `effort: high`
+/// - `agents/unpinned-agent.md` declaring neither
+/// - `agents/inherit-agent.md` declaring `model: inherit`
+/// - a plugin named `tp` shipping `agents/sample-agent.md`
+///
+/// No file defines `absent-agent`, so its dispatches classify as
+/// `no-agent-file`.
+pub fn build_agents_claude_home(cache_dir: &Path) -> PathBuf {
+    let claude_home = cache_dir.join("claude-home");
+    fs::create_dir_all(claude_home.join("agents")).expect("create agents/");
+
+    fs::write(
+        claude_home.join("agents/pinned-agent.md"),
+        "---\nname: pinned-agent\nmodel: claude-opus-4-7\neffort: high\n---\n\nA pinned agent.\n",
+    )
+    .expect("write pinned agent");
+    fs::write(
+        claude_home.join("agents/unpinned-agent.md"),
+        "---\nname: unpinned-agent\ndescription: names no model\n---\n\nAn unpinned agent.\n",
+    )
+    .expect("write unpinned agent");
+    fs::write(
+        claude_home.join("agents/inherit-agent.md"),
+        "---\nname: inherit-agent\nmodel: inherit\n---\n\nAn inheriting agent.\n",
+    )
+    .expect("write inherit agent");
+
+    let plugin_path = claude_home.join("plugins/cache/test-marketplace/tp-plugin/1.0.0");
+    fs::create_dir_all(plugin_path.join(".claude-plugin")).expect("create .claude-plugin");
+    fs::write(
+        plugin_path.join(".claude-plugin/plugin.json"),
+        r#"{"name":"tp"}"#,
+    )
+    .expect("write plugin.json");
+    fs::create_dir_all(plugin_path.join("agents")).expect("create plugin agents/");
+    fs::write(
+        plugin_path.join("agents/sample-agent.md"),
+        "---\nmodel: claude-haiku-4-5\n---\n\nA plugin agent.\n",
     )
     .expect("write plugin agent");
 

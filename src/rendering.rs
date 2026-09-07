@@ -12,19 +12,26 @@
 //!   `show` view.
 //! - `render_inputs(&[AttributionRow], &CoverageStats) -> String` —
 //!   the `inputs` view.
+//! - `render_agents(&[AgentRow], &PinningFilter, Option<(&str, &PricingCatalog)>) -> String`
+//!   — the `agents` view, with repricing columns and footer when a
+//!   comparison target is given.
 //! - `render_prices(&[(&str, &ClaudePricing)]) -> String` — the
 //!   `pricing list` view.
+
+use std::fmt::Write as _;
 
 use comfy_table::presets::NOTHING;
 use comfy_table::{Cell, CellAlignment, Table};
 
+use crate::agents::{AgentRow, PinningFilter, repriced_delta};
 use crate::aggregation::PreparedExchange;
 use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::{CostBreakdown, Session};
 use crate::formatting::{coverage_line, format_cost_opt, format_tokens};
-use crate::pricing::ClaudePricing;
+use crate::pricing::{ClaudePricing, PricingCatalog};
 use crate::views::{
-    inputs_cells, pricing_view_rows, session_cells, session_totals, show_row_cells,
+    agents_cells, inputs_cells, pricing_view_rows, repriced_cells, session_cells, session_totals,
+    show_row_cells,
 };
 
 const TITLE_MAX_CHARS: usize = 80;
@@ -63,6 +70,23 @@ const INPUTS_BILLED_COL_INDEX: usize = 5;
 const INPUTS_ATTRIBUTED_COST_COL_INDEX: usize = 6;
 
 const INPUTS_PATH_MAX_CHARS: usize = 60;
+
+// `agents` view column indices. Header order:
+//   agent | model | effort | declared_effort | pinning | dispatches
+//     | tokens | cost   [ | repriced | delta ]
+// Right-alignment is applied at these positions; reordering the header
+// requires updating these constants in lockstep.
+const AGENTS_DISPATCHES_COL_INDEX: usize = 5;
+const AGENTS_TOKENS_COL_INDEX: usize = 6;
+const AGENTS_COST_COL_INDEX: usize = 7;
+const AGENTS_REPRICED_COL_INDEX: usize = 8;
+const AGENTS_DELTA_COL_INDEX: usize = 9;
+
+/// Width cap for the `agent` cell. Long enough for
+/// `tw:codebase-pattern-finder` (26 characters) with headroom;
+/// `truncate_title` is scalar-aware, so a multi-byte agent name
+/// truncates by character rather than by byte.
+const AGENTS_AGENT_MAX_CHARS: usize = 32;
 
 // `pricing list` view column indices. Header order:
 //   model | tier | input | output | cache_rd | cache_5m | cache_1h
@@ -199,6 +223,149 @@ pub fn render_session(prepared: &[PreparedExchange]) -> (String, usize) {
     (format!("{table}"), rows_shown)
 }
 
+// ---- agents view ----
+
+/// Render the `agents` view.
+///
+/// Takes `pinning` because this is the one view whose default slice
+/// narrows silently: `PinningFilter::describe_active` emits nothing at
+/// the default, so the footer is where the active slice gets named.
+///
+/// `compare` adds the `repriced` and `delta` columns and a second
+/// footer line. That figure is an upper bound, and the footer says so
+/// — the same task on a cheaper model produces a smaller token bundle
+/// than the one being repriced, which the arithmetic cannot model.
+#[must_use]
+pub fn render_agents(
+    rows: &[AgentRow],
+    pinning: &PinningFilter,
+    compare: Option<(&str, &PricingCatalog)>,
+) -> String {
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+    let mut header = vec![
+        "agent",
+        "model",
+        "effort",
+        "declared_effort",
+        "pinning",
+        "dispatches",
+        "tokens",
+        "cost",
+    ];
+    if compare.is_some() {
+        header.push("repriced");
+        header.push("delta");
+    }
+    table.set_header(header);
+
+    for row in rows {
+        let cells = agents_cells(row);
+        let mut values = vec![
+            truncate_title(&cells.agent, AGENTS_AGENT_MAX_CHARS),
+            cells.model,
+            cells.effort,
+            cells.declared_effort,
+            cells.pinning,
+            cells.dispatches,
+            cells.tokens,
+            cells.cost,
+        ];
+        if let Some((target, catalog)) = compare {
+            let (repriced, delta) = repriced_cells(row, target, catalog);
+            values.push(repriced);
+            values.push(delta);
+        }
+        table.add_row(values);
+    }
+
+    let mut numeric = vec![
+        AGENTS_DISPATCHES_COL_INDEX,
+        AGENTS_TOKENS_COL_INDEX,
+        AGENTS_COST_COL_INDEX,
+    ];
+    if compare.is_some() {
+        numeric.push(AGENTS_REPRICED_COL_INDEX);
+        numeric.push(AGENTS_DELTA_COL_INDEX);
+    }
+    for idx in numeric {
+        if let Some(col) = table.column_mut(idx) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+    }
+
+    let mut out = format!("{table}\n{}", agents_totals_line(rows, pinning));
+    if let Some((target, catalog)) = compare {
+        out.push('\n');
+        out.push_str(&agents_compare_line(rows, target, catalog));
+    }
+    out
+}
+
+/// Totals over the visible rows, naming the pinning slice they cover.
+///
+/// The slice is named unconditionally, including at the default. At
+/// the default no filter component exists to say what was hidden, so
+/// without this line a reader would take the totals for the whole
+/// roster.
+fn agents_totals_line(rows: &[AgentRow], pinning: &PinningFilter) -> String {
+    let dispatches: u64 = rows.iter().map(|r| r.dispatches).sum();
+    let tokens: u64 = rows.iter().map(|r| r.usage.billable()).sum();
+    // Strict fold: one unpriced row collapses the total, matching how
+    // every other total in cclens propagates an unknown model.
+    let cost = rows
+        .iter()
+        .try_fold(0.0_f64, |acc, r| r.cost.map(|c| acc + c.total()).ok_or(()));
+    format!(
+        "total: {dispatches} dispatches, {} tokens, {} | pinning: {}",
+        format_tokens(tokens),
+        format_cost_opt(cost.ok()),
+        pinning.describe_slice(),
+    )
+}
+
+/// The repricing footer: what the visible rows would have cost at
+/// `target`, labelled and with its exclusions counted.
+///
+/// The labels belong in the rendered output rather than only in the
+/// design notes, because the number travels without them otherwise.
+fn agents_compare_line(rows: &[AgentRow], target: &str, catalog: &PricingCatalog) -> String {
+    let d = repriced_delta(rows, target, catalog);
+    let mut line = if d.rows_counted == 0 {
+        // Saying "$0.0000 more across 0 rows" would read as a real
+        // finding of parity rather than as nothing to compare.
+        format!("vs {target}: no comparable rows")
+    } else {
+        let direction = if d.delta >= 0.0 { "more" } else { "less" };
+        format!(
+            "vs {target}: {} {direction} across {} (upper bound — the same work \
+             on another model produces a smaller token bundle than the one \
+             repriced here)",
+            format_cost_opt(Some(d.delta.abs())),
+            plural(d.rows_counted, "row"),
+        )
+    };
+    if d.rows_forked > 0 || d.rows_unpriced > 0 {
+        let _ = write!(
+            line,
+            "; excluded {} and {}",
+            plural(d.rows_forked, "fork row"),
+            plural(d.rows_unpriced, "unpriced row"),
+        );
+    }
+    line
+}
+
+/// `"1 row"` / `"2 rows"`. The footer counts what it excluded, and a
+/// count that reads as broken English invites doubting the number.
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 // ---- pricing list view ----
 
 #[must_use]
@@ -284,6 +451,182 @@ mod tests {
     use crate::aggregation::{PreparedRow, PreparedRowRole};
     use crate::domain::TurnOrigin;
     use crate::formatting::{format_local, kind_label};
+
+    // --- render_agents ---
+
+    fn agent_row(agent_type: &str, pinning: crate::agents::Pinning, cost: Option<f64>) -> AgentRow {
+        AgentRow {
+            agent_type: agent_type.to_string(),
+            model: Some("claude-opus-5".to_string()),
+            effort: Some("high".to_string()),
+            declared_effort: None,
+            pinning,
+            dispatches: 3,
+            usage: crate::domain::Usage {
+                input: 1000,
+                output: 0,
+                cache_creation: crate::domain::CacheCreation::default(),
+                cache_read: 0,
+            },
+            cost: cost.map(|input| crate::domain::CostBreakdown {
+                input,
+                ..crate::domain::CostBreakdown::default()
+            }),
+        }
+    }
+
+    fn compare_catalog() -> PricingCatalog {
+        PricingCatalog::from_raw_json(
+            r#"{"claude-sonnet-5":{"input_cost_per_token":0.000002,
+                "output_cost_per_token":0.000002,
+                "cache_read_input_token_cost":0.000002,
+                "cache_creation_input_token_cost":0.000002}}"#,
+        )
+        .expect("catalog parses")
+    }
+
+    #[test]
+    fn render_agents_renders_header_and_one_row() {
+        let rows = vec![agent_row(
+            "tw:code-reviewer",
+            crate::agents::Pinning::Unpinned,
+            Some(1.5),
+        )];
+        let out = render_agents(&rows, &PinningFilter::default(), None);
+        for header in [
+            "agent",
+            "model",
+            "effort",
+            "declared_effort",
+            "pinning",
+            "dispatches",
+            "tokens",
+            "cost",
+        ] {
+            assert!(out.contains(header), "missing header {header} in:\n{out}");
+        }
+        assert!(out.contains("tw:code-reviewer"), "{out}");
+        assert!(out.contains("unpinned"), "{out}");
+        // An absent declared_effort renders as a gap, not a guess.
+        assert!(out.contains('\u{2014}'), "{out}");
+    }
+
+    #[test]
+    fn render_agents_omits_repricing_columns_without_a_target() {
+        let rows = vec![agent_row("a", crate::agents::Pinning::Unpinned, Some(1.5))];
+        let out = render_agents(&rows, &PinningFilter::default(), None);
+        assert!(!out.contains("repriced"), "{out}");
+        assert!(!out.contains("delta"), "{out}");
+        assert!(!out.contains("upper bound"), "{out}");
+    }
+
+    #[test]
+    fn render_agents_footer_names_the_target_and_labels_the_bound() {
+        let catalog = compare_catalog();
+        let rows = vec![agent_row("a", crate::agents::Pinning::Unpinned, Some(1.5))];
+        let out = render_agents(
+            &rows,
+            &PinningFilter::default(),
+            Some(("claude-sonnet-5", &catalog)),
+        );
+        // Assert on the substrings that carry the meaning: the target
+        // is named, and the figure is labelled a bound with its
+        // direction of bias stated.
+        assert!(out.contains("vs claude-sonnet-5"), "{out}");
+        assert!(out.contains("upper bound"), "{out}");
+        assert!(out.contains("smaller token bundle"), "{out}");
+        assert!(out.contains("repriced"), "{out}");
+        assert!(out.contains("delta"), "{out}");
+    }
+
+    #[test]
+    fn render_agents_footer_reports_excluded_fork_and_unpriced_rows() {
+        let catalog = compare_catalog();
+        let rows = vec![
+            agent_row("priced", crate::agents::Pinning::Unpinned, Some(1.5)),
+            agent_row("forked", crate::agents::Pinning::Fork, Some(1.5)),
+            agent_row("unpriced", crate::agents::Pinning::Unpinned, None),
+        ];
+        let out = render_agents(
+            &rows,
+            &PinningFilter::everything(),
+            Some(("claude-sonnet-5", &catalog)),
+        );
+        assert!(
+            out.contains("excluded 1 fork row and 1 unpriced row"),
+            "footer must count what it dropped, or a shrunken total \
+             passes as a complete one:\n{out}",
+        );
+    }
+
+    #[test]
+    fn render_agents_footer_names_the_pinning_slice_at_the_default() {
+        // The default slice is the case where no filter component
+        // exists to say what was hidden, so the footer must say it.
+        let rows = vec![agent_row("a", crate::agents::Pinning::Unpinned, Some(1.5))];
+        let default_filter = PinningFilter::default();
+        assert!(
+            default_filter.describe_active().is_empty(),
+            "precondition: the default emits no filter component",
+        );
+        let out = render_agents(&rows, &default_filter, None);
+        assert!(
+            out.contains("pinning: inherit,unpinned,no-agent-file"),
+            "{out}",
+        );
+    }
+
+    #[test]
+    fn render_agents_totals_collapse_when_one_row_is_unpriced() {
+        let rows = vec![
+            agent_row("priced", crate::agents::Pinning::Unpinned, Some(1.5)),
+            agent_row("unpriced", crate::agents::Pinning::Unpinned, None),
+        ];
+        let out = render_agents(&rows, &PinningFilter::default(), None);
+        assert!(
+            out.contains("6 dispatches"),
+            "the dispatch total still covers every row:\n{out}",
+        );
+        assert!(
+            out.contains("tokens, \u{2014} |"),
+            "one unpriced row collapses the cost total:\n{out}",
+        );
+    }
+
+    #[test]
+    fn render_agents_fork_row_renders_no_repriced_figure() {
+        // The column must agree with the footer beneath it: the
+        // footer excludes forks, so a priced fork cell would make the
+        // visible column sum differ from the reported total.
+        let catalog = compare_catalog();
+        let rows = vec![agent_row("forked", crate::agents::Pinning::Fork, Some(1.5))];
+        let out = render_agents(
+            &rows,
+            &PinningFilter::everything(),
+            Some(("claude-sonnet-5", &catalog)),
+        );
+        assert!(
+            out.contains("vs claude-sonnet-5: no comparable rows"),
+            "a comparison over zero rows must say so rather than \
+             report $0.0000 as a finding of parity:\n{out}",
+        );
+    }
+
+    #[test]
+    fn render_agents_truncates_a_long_agent_name() {
+        let long = "a".repeat(AGENTS_AGENT_MAX_CHARS + 10);
+        let rows = vec![agent_row(
+            &long,
+            crate::agents::Pinning::Unpinned,
+            Some(1.5),
+        )];
+        let out = render_agents(&rows, &PinningFilter::default(), None);
+        assert!(
+            !out.contains(&long),
+            "the full name must not appear:\n{out}"
+        );
+        assert!(out.contains('\u{2026}'), "expected an ellipsis:\n{out}");
+    }
 
     // --- test helpers ---
 

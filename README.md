@@ -120,6 +120,41 @@ The same scope flags described under [Filtering](#filtering) — `--project`, `-
 
 The empty-result behavior matches `list`: if every row is dropped, stdout still prints the header, stderr prints `note: no rows matched <flags>`, and the exit code is 0.
 
+### agents
+
+Rank subagent dispatches by observed spend. Reads every subagent transcript under `--projects-dir`, deduplicates each one's assistant turns, and prices the survivors at the model that dispatch actually ran on.
+
+```sh
+$ cclens agents
+$ cclens agents --pinning pinned
+$ cclens agents --compare-model claude-sonnet-5
+```
+
+Rows are grouped by agent type, resolved model, observed effort, and how the agent's file constrains the model. One agent whose dispatches disagree about any of those appears as several rows — that disagreement is information, not noise to be merged away.
+
+#### Columns
+
+- **agent** — the dispatch's `agentType`, truncated with `…` at 32 characters. A plugin-shipped agent carries its plugin's namespace (`tw:code-reviewer`).
+- **model** — the model the dispatches ran on, as a majority vote across each transcript's assistant turns. A run that switched mid-flight reports the model it mostly ran on.
+- **effort** — the reasoning effort the transcript recorded, likewise a majority vote. `—` when the transcript records none.
+- **declared_effort** — the effort the agent's file declares in its frontmatter, or `—` when it declares none. Never compared against **effort**; both are reported as found.
+- **pinning** — how the agent's file constrains the model: `pinned` (frontmatter names a concrete model), `inherit` (the `inherit` sentinel), `unpinned` (a file that names no model), `no-agent-file` (nothing on disk matched — either a built-in agent or a file not installed here, which are indistinguishable), or `fork` (a fork of the parent, which structurally has no model choice).
+- **dispatches** — how many dispatches this row covers.
+- **tokens** — deduplicated billable tokens summed across those dispatches.
+- **cost** — USD across those dispatches. Renders `—` if any contributing dispatch had an unpriceable model; the token figure still reflects all of them.
+
+#### Filtering
+
+The scope flags under [Filtering](#filtering) — `--project`, `--since`, `--until` — apply per dispatch; `--min-tokens` / `--min-cost` apply per accumulated row.
+
+`--pinning <kinds>` takes a comma-separated list of the five pinning values and **defaults to `inherit,unpinned,no-agent-file`** — the agents whose model nobody chose, which is the question the view was built to answer. That default narrows, so the totals line names the active slice on every run, including at the default. Pass all five to see the whole roster.
+
+`--compare-model <id>` adds `repriced` and `delta` columns and a footer reporting what the visible rows would have cost at that model's rates. The model must be an exact pricing-catalog key (see `cclens pricing list`); a near miss is an error rather than a fuzzy match, so a typo can never reprice against a model you did not name.
+
+**The repriced figure is an upper bound.** It prices the exact token bundle these dispatches produced at another model's rates, and the same work on a different model would produce a different — generally smaller — bundle. It is exact arithmetic over a counterfactual it does not model. Fork rows are excluded from it entirely and counted in the footer, a fork having no model choice to make; unpriced rows are excluded and counted too, so a total summed over a shrunken subset never passes as a complete one.
+
+The empty-result behavior matches `list`.
+
 ### pricing
 
 `cclens pricing refresh` re-fetches the LiteLLM catalog and overwrites the cache atomically. `cclens pricing info` prints the cache path, size, last-modified time, and Claude-entry count.

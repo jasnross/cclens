@@ -4,19 +4,22 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 
-use cclens::agents::PinningFilter;
+use cclens::agents::{AgentRow, PinningFilter, RepricedDelta, repriced_delta};
 use cclens::aggregation::SessionSummary;
 use cclens::attribution::{AttributionRow, CoverageStats};
 use cclens::inventory::InventoryConfig;
 use cclens::loading::{self, DataContext, Query};
 use cclens::pricing;
-use cclens::rendering::{render_inputs, render_prices, render_session, render_table};
+use cclens::rendering::{
+    render_agents, render_inputs, render_prices, render_session, render_table,
+};
 use cclens::tui::{Tab, run_tui};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::{
-    Cli, Command, InputsArgs, OutputFormat, PricingAction, SessionFilterArgs, ThresholdsFilterArgs,
-    emit_empty_result_hint, emit_inputs_empty_hint,
+    AgentsArgs, Cli, Command, InputsArgs, OutputFormat, PinningFilterArgs, PricingAction,
+    SessionFilterArgs, ThresholdsFilterArgs, emit_agents_empty_hint, emit_inputs_empty_hint,
+    emit_list_empty_hint, emit_show_empty_hint,
 };
 use serde::Serialize;
 
@@ -40,6 +43,15 @@ struct ShowOutput<'a> {
 struct InputsOutput<'a> {
     rows: &'a [AttributionRow],
     coverage: &'a CoverageStats,
+}
+
+#[derive(Serialize)]
+struct AgentsOutput<'a> {
+    rows: &'a [AgentRow],
+    /// Present only under `--compare-model`. Carries the skip counts
+    /// alongside the delta, so a consumer cannot read a total summed
+    /// over a shrunken subset as a complete one.
+    repriced: Option<RepricedDelta>,
 }
 
 #[derive(Serialize)]
@@ -76,6 +88,19 @@ fn main() -> anyhow::Result<()> {
             inputs,
             thresholds,
         } => run_inputs(mode, &cli.projects_dir, &scope, &inputs, thresholds),
+        Command::Agents {
+            agents,
+            pinning,
+            scope,
+            thresholds,
+        } => run_agents(
+            mode,
+            &cli.projects_dir,
+            &agents,
+            &pinning,
+            &scope,
+            thresholds,
+        ),
     }
 }
 
@@ -133,7 +158,7 @@ fn run_list(
         RenderMode::Tui | RenderMode::Plain => {
             println!("{}", render_table(&sessions));
             if sessions.is_empty() {
-                emit_empty_result_hint(scope, &thresholds);
+                emit_list_empty_hint(scope, &thresholds);
             }
         }
     }
@@ -207,6 +232,68 @@ fn run_inputs(
             println!("{}", render_inputs(&visible_rows, &coverage));
             if visible_rows.is_empty() {
                 emit_inputs_empty_hint(scope, inputs, &thresholds);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_agents(
+    mode: RenderMode,
+    projects_dir: &Path,
+    agents: &AgentsArgs,
+    pinning: &PinningFilterArgs,
+    scope: &SessionFilterArgs,
+    thresholds: ThresholdsFilterArgs,
+) -> anyhow::Result<()> {
+    let catalog = Arc::new(pricing::load_catalog());
+    let inventory = Arc::new(InventoryConfig::default());
+
+    // Resolved before the walk, so a typo fails immediately rather
+    // than after a full scan of every transcript. Exact-key only:
+    // `PricingCatalog::lookup`'s fallbacks would resolve a near miss
+    // to some unrelated entry and reprice against a model the user
+    // never named.
+    let compare_model = agents.compare_model();
+    if let Some(target) = compare_model
+        && catalog.lookup_exact(target).is_none()
+    {
+        anyhow::bail!(
+            "unknown model {target:?} — --compare-model takes an exact pricing-catalog key; \
+             run `cclens pricing list` to see them"
+        );
+    }
+
+    let pinning_filter = pinning.pinning_filter();
+    let ctx = DataContext {
+        projects_dir: projects_dir.to_path_buf(),
+        catalog: Arc::clone(&catalog),
+        inventory: Arc::clone(&inventory),
+        query: Query {
+            sessions: scope.session_filter(),
+            thresholds: thresholds.thresholds_filter(),
+            inputs_session_id: None,
+            pinning: pinning_filter.clone(),
+        },
+    };
+    let rows = loading::load_agents(&ctx)?;
+
+    match mode {
+        RenderMode::Json => {
+            let output = AgentsOutput {
+                rows: &rows,
+                repriced: compare_model.map(|t| repriced_delta(&rows, t, &catalog)),
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        // No Tui arm yet: `Tab::Agents` does not exist, so the
+        // interactive path cannot be built here. Both modes render the
+        // plain table, as `run_pricing` already does for `List`.
+        RenderMode::Tui | RenderMode::Plain => {
+            let compare = compare_model.map(|t| (t, catalog.as_ref()));
+            println!("{}", render_agents(&rows, &pinning_filter, compare));
+            if rows.is_empty() {
+                emit_agents_empty_hint(scope, pinning, &thresholds);
             }
         }
     }
@@ -314,7 +401,7 @@ fn run_show(
             let (rendered, _rows_shown) = render_session(&prepared);
             println!("{rendered}");
             if prepared.is_empty() {
-                emit_empty_result_hint(&SessionFilterArgs::default(), &thresholds);
+                emit_show_empty_hint(&thresholds);
             }
         }
     }

@@ -1,0 +1,1 @@
+{"type":"assistant","timestamp":"2026-04-16T10:03:00Z","cwd":"/work/beta","effort":"low","message":{"id":"msg_b3","model":"claude-haiku-4-5","usage":{"input_tokens":500,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"cache_read_input_tokens":0}},"requestId":"req_b3"}

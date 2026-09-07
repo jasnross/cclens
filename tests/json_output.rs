@@ -9,8 +9,8 @@
 mod common;
 
 use common::{
-    build_inputs_claude_home, cclens_command, cclens_inputs_command, inputs_projects_fixture_dir,
-    pricing_fixture_url, projects_fixture_dir,
+    build_inputs_claude_home, cclens_claude_home_command, cclens_command,
+    inputs_projects_fixture_dir, pricing_fixture_url, projects_fixture_dir,
 };
 
 fn isolated_cache() -> tempfile::TempDir {
@@ -102,7 +102,7 @@ fn show_format_json_produces_valid_json_object() {
 fn inputs_format_json_produces_valid_json_object() {
     let cache = isolated_cache();
     let claude_home = build_inputs_claude_home(cache.path());
-    let out = cclens_inputs_command(
+    let out = cclens_claude_home_command(
         cache.path(),
         &pricing_fixture_url("litellm-mini.json"),
         &claude_home,
