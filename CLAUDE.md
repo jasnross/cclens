@@ -79,7 +79,15 @@ Notable lints that affect everyday coding:
 - `uninlined_format_args` — write `format!("{x}")` not `format!("{}", x)`
 - `doc_markdown` — wrap identifiers like `RawLine`, `serde`, `comfy-table` in backticks in doc comments
 
-Run `cargo fmt && cargo clippy --all-targets -- -D warnings` before committing.
+`--all-targets` builds the non-test lib target alongside the test one, so an item constructed only under `#[cfg(test)]` is genuinely unreachable in that second build and trips `dead_code` even though `cargo build` and `cargo test` both pass. Scope the allowance to the build that needs it:
+
+```rust
+#[cfg_attr(not(test), expect(dead_code, reason = "constructed by X in the next phase"))]
+```
+
+A plain `#[expect(dead_code)]` is wrong — it goes unfulfilled in the test build, where the item _is_ constructed, and trips `unfulfilled_lint_expectation` instead. Prefer `expect` over `allow` so the attribute self-retires once a real writer appears; `StatusKind::Info` in `src/tui.rs` is the working example. Better still, give the item its first real writer in the same change — an item nothing constructs is a smell the lint is correctly reporting.
+
+Run `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings` before committing.
 
 ## Source Layout
 
@@ -161,8 +169,15 @@ tui           ← run_tui event loop and app state for the interactive
                 list + inputs tabs; Tab (Sessions | Inputs), session
                 drill-down, pricing and filter overlays, status
                 footer; consumes loading::DataContext and its load
-                functions directly, with no dependency-inversion layer
+                functions directly, with no dependency-inversion layer;
+                async loads go through the dispatch protocol below
 ```
+
+The TUI's async loads run under one protocol, and all three of its rules are load-bearing:
+
+- **A dispatch is redundant only when a running load can _answer_ for it.** `spawn_load` dedups against an in-flight ledger keyed by `LoadSlot`, and guardedness — not slot occupancy — decides. A guarded (timer-driven) load can resolve to `LoadResult::NoChange`, which no applier turns into data, so it answers nobody; an unguarded load always produces a result an applier consumes. Hence `try_reserve(slot, guarded)`: a guarded dispatch yields to any holder, an unguarded one only to another unguarded holder. Suppressing an unguarded dispatch behind a guarded one strands the waiting view on `ShowLoading` forever; never suppressing one lets key-repeat queue a full load per keypress. The ledger counts holders per kind and `StampedResult` carries a `guarded` flag so a release frees the holder it reserved. Keep the question at the dispatch chokepoint — a per-call-site "is a load running?" check is the read-side protocol this design rejects.
+- **A stale-generation result must release nothing.** `bump_ctx_generation` clears the whole ledger, so a result stamped below the current generation has already had its reservation dropped. The discard branch in `handle_load_result` therefore returns _before_ the release; releasing by key on arrival would free a fresh dispatch's slot and license a duplicate load alongside the one still running.
+- **Invalidation is write-side: clear at the mutation site, never compare at read time.** When displayed data can outlive the context it was computed under, `invalidate_data` empties every affected slot rather than versioning each slot for readers to compare — a missed comparison is silent and looks exactly like the staleness bug, while a missed clear is a compile error. Two details are easy to get wrong: branch on `app.tab` / `app.view`, not on `current_scope` (which derives the visible scope from slot _contents_ and so reports `None` for an Inputs tab sitting in `Loading` or `Error`, leaving a blank screen no navigation event recovers); and renew a pending `Show` view with `LoadRequest::ShowDetail`, not a forced `Refresh { scope: Show }` (the latter arrives with `is_refresh: true`, which the applier accepts only into a `View::Show`, so the just-renewed `ShowLoading` view hangs).
 
 Binary entry point (`src/main.rs`):
 
@@ -179,6 +194,8 @@ Binary CLI submodule (`src/cli.rs`):
 - `emit_empty_result_hint` and `emit_inputs_empty_hint`.
 
 Each library module file opens with a `//!` doc comment listing its public API surface. The gityard repo is the reference for the split's overall shape (flat `src/<name>.rs` files, `lib.rs` of pure `pub mod` declarations, `main.rs` with binary-only `mod cli;`).
+
+`docs/` holds supporting documentation that isn't worth always-on context — currently `docs/testing-pricing.md`, the recipe for exercising a doctored pricing catalog offline.
 
 Integration tests live in `tests/listing.rs` (and sibling files) and use `assert_cmd` against fixtures under `tests/fixtures/projects/`. Snapshot regression tests in `tests/snapshots.rs` use `insta` against a dedicated fixture tree at `tests/fixtures/snapshot-projects/` and lock byte-for-byte rendering of `list` and `show`.
 
@@ -219,6 +236,12 @@ Place helpers in the section that calls them, not in a generic `util` bucket. If
 When multiple valid approaches exist for the same concern (error handling, state management, data loading), prefer the approach already established in the codebase. Introducing a second pattern for the same concern creates two things to maintain and reason about. If the existing pattern is inadequate, refactor it everywhere — don't add a parallel approach.
 
 When in tension: correct code that's inconsistent beats consistent code that's wrong, but inconsistent-and-correct is a signal to unify the pattern, not to leave it.
+
+### When the expected outcome is "nothing happened", assert on state, not on silence
+
+A test that proves a dispatch was suppressed by asserting that nothing arrived on the result channel races the spawned task: it passes when the dispatch was correctly suppressed, and passes again when the dispatch happened but has not yet reached its `send`. It holds green when the behavior it names is broken.
+
+Assert on synchronously observable state instead — a reservation count, a registry entry — which is settled by the time the dispatch call returns. The `holders` helper in `src/tui.rs` exists for exactly this, and the dispatch-suppression tests use it rather than `try_recv`. The general form: make the observation distinguish "nothing happened" from "hasn't happened yet".
 
 ### Snapshot tests are reviewable assertions, not contracts
 
