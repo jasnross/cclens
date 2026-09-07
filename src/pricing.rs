@@ -11,6 +11,9 @@
 //! - `PricingCatalog::sorted_entries` — iterate all entries (optionally
 //!   filtered to bare `claude-*` keys) in alphabetical order; used by
 //!   `cclens pricing list`.
+//! - `PricingCatalog::lookup_exact` — resolve a model by exact
+//!   (lower-cased) catalog key only, with none of `lookup`'s
+//!   fallbacks. For model names the *user* supplied.
 //! - `PricingCatalog::cost_for_components` /
 //!   `PricingCatalog::cost_for_turn` — return `Option<CostBreakdown>`
 //!   preserving per-component costs through to rendering.
@@ -235,6 +238,22 @@ impl PricingCatalog {
         }
 
         self.longest_substring_match(&q)
+    }
+
+    /// Resolve `model` by exact catalog key, lower-cased, and nothing
+    /// else.
+    ///
+    /// Exists because `lookup`'s prefix and longest-substring
+    /// fallbacks would resolve a mistyped or abbreviated name to some
+    /// unrelated entry. That is the right behavior when pricing a
+    /// transcript's own recorded model — the catalog spells the same
+    /// model several ways and the transcript picked one. It is the
+    /// wrong behavior when the model is a user-supplied target, where
+    /// a near miss must be reported rather than quietly resolved to a
+    /// model nobody named.
+    #[must_use]
+    pub fn lookup_exact(&self, model: &str) -> Option<&ClaudePricing> {
+        self.entries.get(&model.to_lowercase())
     }
 
     fn longest_substring_match(&self, query_lower: &str) -> Option<&ClaudePricing> {

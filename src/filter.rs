@@ -8,7 +8,7 @@
 //!   `(project_name, since, until)`.
 //! - `SessionFilter::accepts` — predicate over
 //!   `(project_short_name, started_at)`.
-//! - `QueryScope` — one of the three loaders a filter component can
+//! - `QueryScope` — one of the four loaders a filter component can
 //!   constrain.
 //! - `HonoredBy` — which loaders honor a given component.
 //! - `FilterComponent` — one rendered, flag-shaped filter component
@@ -29,7 +29,7 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 
-/// One of the three loaders a filter component can constrain. Named
+/// One of the four loaders a filter component can constrain. Named
 /// per loader rather than per view because that is the granularity
 /// causation needs: `load_show` resolves its session by id and applies
 /// thresholds only, so a Show empty state naming `--project` would
@@ -39,17 +39,24 @@ pub enum QueryScope {
     Sessions,
     Show,
     Inputs,
+    Agents,
 }
 
-/// Which loaders honor a filter component. The three constants below
+/// Which loaders honor a filter component. The four constants below
 /// are the whole vocabulary — a component is built from one of them,
 /// never from arbitrary flags, so adding a loader-scoped filter means
 /// naming its shape here rather than leaving a call site to guess.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one bool per loader is the shape: a component names which loaders honor it, \
+              and a bitflag or a set would hide the exhaustiveness `honors` relies on"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HonoredBy {
     sessions: bool,
     show: bool,
     inputs: bool,
+    agents: bool,
 }
 
 impl HonoredBy {
@@ -58,6 +65,7 @@ impl HonoredBy {
         sessions: true,
         show: true,
         inputs: true,
+        agents: true,
     };
     /// `--project` / `--since` / `--until`: honored wherever sessions
     /// are *selected*. `load_show` is handed one session id, so these
@@ -66,12 +74,21 @@ impl HonoredBy {
         sessions: true,
         show: false,
         inputs: true,
+        agents: true,
     };
     /// `--session`: the inputs view is the only reader.
     pub const INPUTS_ONLY: Self = Self {
         sessions: false,
         show: false,
         inputs: true,
+        agents: false,
+    };
+    /// `--pinning`: the agents view is the only reader.
+    pub const AGENTS_ONLY: Self = Self {
+        sessions: false,
+        show: false,
+        inputs: false,
+        agents: true,
     };
 
     /// Whether the loader behind `scope` applies this component.
@@ -81,6 +98,7 @@ impl HonoredBy {
             QueryScope::Sessions => self.sessions,
             QueryScope::Show => self.show,
             QueryScope::Inputs => self.inputs,
+            QueryScope::Agents => self.agents,
         }
     }
 }

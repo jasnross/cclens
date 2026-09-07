@@ -12,6 +12,9 @@
 //!   — drop assistant turns whose `(message_id, request_id)` pair has
 //!   already been seen earlier in the project's file walk. Generic over
 //!   the `HashSet` hasher so callers retain control of the hash strategy.
+//! - `majority_assistant_value(&[Turn], Fn) -> Option<String>` —
+//!   most-frequent non-`None` value of a per-turn selector across
+//!   assistant turns, ties resolved to the first-seen value.
 //! - `Exchange<'a>` — a substantive user turn plus its assistant
 //!   cluster.
 //! - `group_into_exchanges(&[Turn]) -> Vec<Exchange<'_>>`.
@@ -122,7 +125,13 @@ fn total_session_cost(
     Some(sum)
 }
 
-fn derive_project_short_name(project_dir: &Path, turns: &[Turn]) -> String {
+/// The project's display name: the first turn's `cwd` basename, else
+/// the project directory's own basename.
+///
+/// Crate-internal rather than private so `loading::load_agents` reads
+/// the same definition the list view does — two spellings of this rule
+/// would let `--project` filter the two views differently.
+pub(crate) fn derive_project_short_name(project_dir: &Path, turns: &[Turn]) -> String {
     for turn in turns {
         if let Some(cwd) = &turn.cwd
             && let Some(name) = cwd.file_name()
@@ -166,6 +175,46 @@ pub fn dedup_assistant_turns<S: BuildHasher>(
             Role::User | Role::Attachment | Role::System | Role::Other(_) => true,
         })
         .collect()
+}
+
+// ---- majority vote across assistant turns ----
+
+/// Most-frequent non-`None` value of `select` across assistant turns,
+/// ties resolved to the first-seen value. Non-assistant turns are
+/// skipped: only an assistant turn records what the model actually
+/// ran as.
+///
+/// Accumulates into a `Vec` rather than a `HashMap` deliberately:
+/// `HashMap` iteration order is nondeterministic in Rust, so a tied
+/// vote could resolve differently across runs.
+#[must_use]
+pub fn majority_assistant_value<F>(turns: &[Turn], select: F) -> Option<String>
+where
+    F: Fn(&Turn) -> Option<&str>,
+{
+    let mut counts: Vec<(String, u64)> = Vec::new();
+    for turn in turns {
+        match &turn.role {
+            Role::Assistant => {}
+            Role::User | Role::Attachment | Role::System | Role::Other(_) => continue,
+        }
+        let Some(value) = select(turn) else {
+            continue;
+        };
+        if let Some(entry) = counts.iter_mut().find(|(v, _)| v == value) {
+            entry.1 += 1;
+        } else {
+            counts.push((value.to_string(), 1));
+        }
+    }
+    let mut best: Option<&(String, u64)> = None;
+    for entry in &counts {
+        // Strict `>` lets the first occurrence of a tied count win.
+        if best.is_none_or(|b| entry.1 > b.1) {
+            best = Some(entry);
+        }
+    }
+    best.map(|(v, _)| v.clone())
 }
 
 // ---- title extraction ----
@@ -771,6 +820,38 @@ mod tests {
     use crate::domain::{CacheCreation, TurnOrigin};
 
     // --- test helpers ---
+
+    // --- majority_assistant_value ---
+
+    #[test]
+    fn majority_assistant_value_breaks_ties_to_first_seen() {
+        let mut first = assistant_turn_with_usage(1, 1, 0);
+        first.model = Some("alpha".to_string());
+        let mut second = assistant_turn_with_usage(1, 1, 0);
+        second.model = Some("beta".to_string());
+        // One vote each — the first-seen value wins, so a tied vote
+        // resolves identically across runs.
+        let turns = vec![first, second];
+        assert_eq!(
+            majority_assistant_value(&turns, |t| t.model.as_deref()).as_deref(),
+            Some("alpha"),
+        );
+    }
+
+    #[test]
+    fn majority_assistant_value_ignores_non_assistant_turns() {
+        // Only an assistant turn records what the model ran as; a user
+        // turn carrying the field must not vote.
+        let mut user = user_string_turn("hello");
+        user.model = Some("from-a-user-turn".to_string());
+        let mut assistant = assistant_turn_with_usage(1, 1, 0);
+        assistant.model = Some("from-an-assistant-turn".to_string());
+        let turns = vec![user, assistant];
+        assert_eq!(
+            majority_assistant_value(&turns, |t| t.model.as_deref()).as_deref(),
+            Some("from-an-assistant-turn"),
+        );
+    }
 
     fn user_string_turn(content: &str) -> Turn {
         Turn {

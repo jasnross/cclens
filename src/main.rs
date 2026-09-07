@@ -4,8 +4,10 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 
+use cclens::agents::PinningFilter;
 use cclens::aggregation::SessionSummary;
 use cclens::attribution::{AttributionRow, CoverageStats};
+use cclens::inventory::InventoryConfig;
 use cclens::loading::{self, DataContext, Query};
 use cclens::pricing;
 use cclens::rendering::{render_inputs, render_prices, render_session, render_table};
@@ -92,14 +94,17 @@ fn run_list(
     thresholds: ThresholdsFilterArgs,
 ) -> anyhow::Result<()> {
     let catalog = Arc::new(pricing::load_catalog());
+    let inventory = Arc::new(InventoryConfig::default());
     let query = Query {
         sessions: scope.session_filter(),
         thresholds: thresholds.thresholds_filter(),
         inputs_session_id: None,
+        pinning: PinningFilter::default(),
     };
     let ctx = DataContext {
         projects_dir: projects_dir.to_path_buf(),
         catalog: Arc::clone(&catalog),
+        inventory: Arc::clone(&inventory),
         query,
     };
     let sessions = loading::load_sessions(&ctx)?;
@@ -149,15 +154,18 @@ fn run_inputs(
     thresholds: ThresholdsFilterArgs,
 ) -> anyhow::Result<()> {
     let catalog = Arc::new(pricing::load_catalog());
+    let inventory = Arc::new(InventoryConfig::default());
     let thresholds_filter = thresholds.thresholds_filter();
     let inputs_query = Query {
         sessions: scope.session_filter(),
         thresholds: thresholds_filter,
         inputs_session_id: inputs.session_id(),
+        pinning: PinningFilter::default(),
     };
     let inputs_ctx = DataContext {
         projects_dir: projects_dir.to_path_buf(),
         catalog: Arc::clone(&catalog),
+        inventory: Arc::clone(&inventory),
         query: inputs_query,
     };
     match mode {
@@ -287,6 +295,7 @@ fn run_show(
     let ctx = DataContext {
         projects_dir: projects_dir.to_path_buf(),
         catalog: Arc::new(pricing::load_catalog()),
+        inventory: Arc::new(InventoryConfig::default()),
         query: Query {
             thresholds: thresholds.thresholds_filter(),
             ..Query::default()

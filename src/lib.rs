@@ -6,7 +6,12 @@
 //! Pipeline order (alphabetical declaration below; pipeline order
 //! documented for orientation):
 //!   `domain → parsing → discovery → inventory → aggregation
-//!     → attribution → loading → pricing → rendering → filter`.
+//!     → attribution → agents → loading → pricing → rendering
+//!     → filter`.
+//! `agents` folds subagent transcripts into per-dispatch records and
+//! groups them into the rows the `agents` subcommand ranks; it sits
+//! beside `attribution` rather than under it, sharing input data and
+//! no output.
 //! `inventory` walks user-controlled context-file locations
 //! (`~/.claude/{CLAUDE.md,rules,skills,agents}` and the plugin cache);
 //! `attribution` folds inventory + per-session metadata + pricing into
@@ -18,6 +23,7 @@
 //! `views` provides shared per-row view builders consumed by both
 //! `rendering` and `tui`.
 
+pub mod agents;
 pub mod aggregation;
 pub mod attribution;
 pub mod discovery;

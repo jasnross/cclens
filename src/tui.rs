@@ -2176,11 +2176,16 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
     let tabs = format!(" {sessions_label}  {inputs_label}");
     let mut left_spans = vec![Span::raw(tabs.clone()).bold()];
 
-    // The indicator describes all of `Query`, without exception.
-    // Over-claiming is the safe direction: a component that does not
-    // constrain the visible tab is dimmed, never omitted, because a
-    // hidden filter is one actively narrowing what the user is
-    // reading with nothing on screen to say so.
+    // The indicator describes all of `Query` bar one documented
+    // exception. Over-claiming is the safe direction: a component that
+    // does not constrain the visible tab is dimmed, never omitted,
+    // because a hidden filter is one actively narrowing what the user
+    // is reading with nothing on screen to say so.
+    //
+    // The exception is `Query::pinning` at its default, which narrows
+    // but emits no component — `PinningFilter::describe_active`
+    // explains why it must, and the agents view names its own slice
+    // unconditionally in the places this header cannot.
     let components = app.ctx.query.describe_active();
     if !components.is_empty() {
         const MARKER: &str = "  filter: ";
@@ -2973,6 +2978,7 @@ mod tests {
         DataContext {
             projects_dir: PathBuf::from("/nonexistent"),
             catalog: Arc::new(PricingCatalog::default()),
+            inventory: Arc::new(InventoryConfig::default()),
             query: crate::loading::Query::default(),
         }
     }
@@ -6194,6 +6200,7 @@ mod tests {
                 min_cost: Some(0.5),
             },
             inputs_session_id: Some("aaaa1111-2222-3333-4444-555555555555".to_string()),
+            pinning: crate::agents::PinningFilter::default(),
         }
     }
 

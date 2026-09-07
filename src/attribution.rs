@@ -64,6 +64,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::aggregation::majority_assistant_value;
 use crate::domain::{CacheCreation, Role, Turn};
 use crate::filter::SessionFilter;
 use crate::inventory::{
@@ -429,37 +430,11 @@ fn extract_skill_identifier(text: &str) -> Option<String> {
         .map(|n| n.to_string_lossy().into_owned())
 }
 
-/// Pick the most-frequent assistant model. Iteration order is
-/// preserved (Vec insertion order = first-occurrence order); ties
-/// resolve to the first-seen model.
-///
-/// Avoids `HashMap` deliberately — `HashMap` iteration order is
-/// nondeterministic in Rust, so a tied vote could resolve differently
-/// across runs.
+/// Pick the most-frequent assistant model, ties resolved to the
+/// first-seen model. A named delegate rather than an inlined call so
+/// this module's call sites keep reading as a model lookup.
 fn most_frequent_assistant_model(turns: &[Turn]) -> Option<String> {
-    let mut counts: Vec<(String, u64)> = Vec::new();
-    for turn in turns {
-        match &turn.role {
-            Role::Assistant => {}
-            Role::User | Role::Attachment | Role::System | Role::Other(_) => continue,
-        }
-        let Some(model) = turn.model.as_deref() else {
-            continue;
-        };
-        if let Some(entry) = counts.iter_mut().find(|(m, _)| m == model) {
-            entry.1 += 1;
-        } else {
-            counts.push((model.to_string(), 1));
-        }
-    }
-    let mut best: Option<&(String, u64)> = None;
-    for entry in &counts {
-        // Strict `>` lets the first occurrence of a tied count win.
-        if best.is_none_or(|b| entry.1 > b.1) {
-            best = Some(entry);
-        }
-    }
-    best.map(|(m, _)| m.clone())
+    majority_assistant_value(turns, |turn| turn.model.as_deref())
 }
 
 // ---- per-session inventory extension ----

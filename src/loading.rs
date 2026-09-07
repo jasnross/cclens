@@ -5,11 +5,11 @@
 //! Public API:
 //! - `Query` — the mutable, user-facing slice of load configuration
 //!   (`sessions: SessionFilter`, `thresholds: ThresholdsFilter`,
-//!   `inputs_session_id: Option<String>`). The sole source of filter
-//!   semantics across all three loaders.
-//! - `DataContext` — everything a load needs (`projects_dir`, `catalog`,
-//!   `query`). Cloned into each dispatched load; cheap (a `PathBuf`, an
-//!   `Arc` bump, a small `Query`).
+//!   `inputs_session_id: Option<String>`, `pinning: PinningFilter`).
+//!   The sole source of filter semantics across all four loaders.
+//! - `DataContext` — everything a load needs (`projects_dir`,
+//!   `catalog`, `inventory`, `query`). Cloned into each dispatched
+//!   load; cheap (a `PathBuf`, two `Arc` bumps, a small `Query`).
 //! - `RefreshFingerprint` — file-size + mtime fingerprint for change
 //!   detection, keyed by watched path.
 //! - `PricingData` — owned pricing entries + cache staleness info,
@@ -17,6 +17,7 @@
 //! - `load_sessions(&DataContext) -> anyhow::Result<Vec<Session>>`
 //! - `load_show(&DataContext, &str) -> anyhow::Result<Vec<PreparedExchange>>`
 //! - `load_inputs(&DataContext) -> anyhow::Result<(Vec<AttributionRow>, CoverageStats)>`
+//! - `load_agents(&DataContext) -> anyhow::Result<Vec<AgentRow>>`
 //! - `Query::describe_active` — every active filter as a flag-shaped
 //!   `FilterComponent`, in display order (`--session`, scope,
 //!   thresholds). One producer for the CLI hint and the TUI header.
@@ -29,8 +30,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::agents::{
+    AgentRow, Dispatch, PinningFilter, dispatch_from_turns, group_dispatches, sort_rows,
+};
 use crate::aggregation::{
-    PreparedExchange, aggregate, dedup_assistant_turns, group_into_exchanges, prepare_exchanges,
+    PreparedExchange, aggregate, dedup_assistant_turns, derive_project_short_name,
+    group_into_exchanges, prepare_exchanges,
 };
 use crate::attribution::{
     AttributionRow, CoverageStats, InputsFilter, SessionKind, SessionMeta, compute_coverage,
@@ -43,7 +48,9 @@ use crate::domain::{Session, Turn, TurnOrigin};
 use crate::filter::{
     FilterComponent, HonoredBy, SessionFilter, ThresholdsFilter, quote_filter_value,
 };
-use crate::inventory::{InventoryConfig, discover_inventory};
+use crate::inventory::{
+    AgentFrontmatter, ContextFileKind, InventoryConfig, discover_inventory, read_agent_frontmatter,
+};
 use crate::parsing::parse_jsonl;
 use crate::pricing::{self, ClaudePricing, PricingCatalog};
 
@@ -56,14 +63,20 @@ pub struct Query {
     pub sessions: SessionFilter,
     pub thresholds: ThresholdsFilter,
     pub inputs_session_id: Option<String>,
+    /// Which pinning classifications the agents view admits. Unlike
+    /// the other three fields, its default narrows rather than
+    /// admitting everything — see `PinningFilter::describe_active` for
+    /// why that does not make every view look filtered.
+    pub pinning: PinningFilter,
 }
 
 impl Query {
     /// Every active filter as a flag-shaped component, in display
-    /// order: `--session`, then scope, then thresholds. An empty
-    /// vector means no filter is active — which is how both the CLI
-    /// hint and the TUI empty states distinguish "filtered to nothing"
-    /// from "nothing to show".
+    /// order: `--session`, then scope, then thresholds, then
+    /// `--pinning`. An empty vector means no filter is active — which
+    /// is how both the CLI hint and the TUI empty states distinguish
+    /// "filtered to nothing" from "nothing to show", and why the
+    /// pinning filter contributes nothing at its (narrowing) default.
     #[must_use]
     pub fn describe_active(&self) -> Vec<FilterComponent> {
         let mut components = Vec::new();
@@ -75,6 +88,7 @@ impl Query {
         }
         components.extend(self.sessions.describe_active());
         components.extend(self.thresholds.describe_active());
+        components.extend(self.pinning.describe_active());
         components
     }
 }
@@ -87,6 +101,12 @@ impl Query {
 pub struct DataContext {
     pub projects_dir: PathBuf,
     pub catalog: Arc<PricingCatalog>,
+    /// Filesystem roots the context-file walk reads. Held here rather
+    /// than defaulted inside each loader so a caller — a test above
+    /// all — can point the walk somewhere without reaching for the
+    /// process-global `CCLENS_CLAUDE_HOME`. `Arc` for the same reason
+    /// `catalog` is one: every dispatched load clones the context.
+    pub inventory: Arc<InventoryConfig>,
     pub query: Query,
 }
 
@@ -254,8 +274,8 @@ pub fn load_inputs(ctx: &DataContext) -> anyhow::Result<(Vec<AttributionRow>, Co
         scope: ctx.query.sessions.clone(),
     };
 
-    let inventory_config = InventoryConfig::default();
-    let mut inventory = discover_inventory(&inventory_config);
+    let inventory_config = ctx.inventory.as_ref();
+    let mut inventory = discover_inventory(inventory_config);
     let mut seen_inventory_paths: HashSet<PathBuf> = HashSet::new();
     for file in &inventory {
         seen_inventory_paths.insert(file.path.clone());
@@ -291,7 +311,7 @@ pub fn load_inputs(ctx: &DataContext) -> anyhow::Result<(Vec<AttributionRow>, Co
                     &mut inventory,
                     &mut seen_inventory_paths,
                     cwd,
-                    &inventory_config,
+                    inventory_config,
                 );
             }
             if subagents.is_empty() {
@@ -315,7 +335,7 @@ pub fn load_inputs(ctx: &DataContext) -> anyhow::Result<(Vec<AttributionRow>, Co
                         &mut inventory,
                         &mut seen_inventory_paths,
                         cwd,
-                        &inventory_config,
+                        inventory_config,
                     );
                 }
                 session_metas.push(sub_meta);
@@ -334,6 +354,139 @@ pub fn load_inputs(ctx: &DataContext) -> anyhow::Result<(Vec<AttributionRow>, Co
         })
         .collect();
     Ok((visible, coverage))
+}
+
+/// Agent rows for the `agents` view, honoring `ctx.query.sessions`
+/// (per dispatch), `ctx.query.pinning` and `ctx.query.thresholds`
+/// (per accumulated row).
+///
+/// # Errors
+/// Propagates a failure to read `ctx.projects_dir` itself; per-project
+/// and per-subagent read/parse failures are skipped rather than
+/// propagated (see `discovery`'s degrade-per-entry contract).
+pub fn load_agents(ctx: &DataContext) -> anyhow::Result<Vec<AgentRow>> {
+    let inventory_config = ctx.inventory.as_ref();
+    let mut inventory = discover_inventory(inventory_config);
+    let mut seen_inventory_paths: HashSet<PathBuf> = HashSet::new();
+    for file in &inventory {
+        seen_inventory_paths.insert(file.path.clone());
+    }
+
+    let project_entries = discover(&ctx.projects_dir)?;
+    let mut dispatches: Vec<Dispatch> = Vec::new();
+    for ProjectSessions {
+        project_dir,
+        sessions: session_paths,
+    } in project_entries
+    {
+        for SessionPaths { jsonl, subagents } in session_paths {
+            if subagents.is_empty() {
+                continue;
+            }
+            // The parent transcript is read for its cwd and short name
+            // only — the fallbacks a subagent that recorded neither
+            // needs in order to match a project-local agent file. Its
+            // own turns never enter a dispatch.
+            //
+            // An unreadable parent degrades to no fallbacks rather
+            // than skipping the session: most subagent transcripts
+            // record their own cwd, and dropping them here would
+            // delete readable, priced spend over a file this loader
+            // only consults for a default.
+            let parent_turns = parse_jsonl(&jsonl).unwrap_or_default();
+            let parent_cwd = parent_turns.iter().find_map(|t| t.cwd.clone());
+            let parent_short_name = derive_project_short_name(&project_dir, &parent_turns);
+            if let Some(cwd) = &parent_cwd {
+                extend_inventory_for_session(
+                    &mut inventory,
+                    &mut seen_inventory_paths,
+                    cwd,
+                    inventory_config,
+                );
+            }
+
+            for subagent in &subagents {
+                let Some(dispatch) = build_dispatch(
+                    subagent,
+                    parent_cwd.as_deref(),
+                    &parent_short_name,
+                    &ctx.catalog,
+                ) else {
+                    continue;
+                };
+                if let Some(cwd) = &dispatch.cwd {
+                    extend_inventory_for_session(
+                        &mut inventory,
+                        &mut seen_inventory_paths,
+                        cwd,
+                        inventory_config,
+                    );
+                }
+                if !ctx
+                    .query
+                    .sessions
+                    .accepts(&dispatch.project_short_name, dispatch.started_at)
+                {
+                    continue;
+                }
+                dispatches.push(dispatch);
+            }
+        }
+    }
+
+    // Built only once the inventory is final — project-local agent
+    // files enter it exclusively through the
+    // `extend_inventory_for_session` calls above, so reading
+    // frontmatter any earlier would miss them. Only agent kinds are
+    // read, so no CLAUDE.md, rule, skill, or command is parsed as YAML.
+    let frontmatter: HashMap<PathBuf, AgentFrontmatter> = inventory
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                ContextFileKind::UserAgent
+                    | ContextFileKind::PluginAgent { .. }
+                    | ContextFileKind::ProjectLocalAgent
+            )
+        })
+        .map(|f| (f.path.clone(), read_agent_frontmatter(&f.path)))
+        .collect();
+
+    let mut rows = group_dispatches(dispatches, &inventory, &frontmatter);
+    rows.retain(|row| {
+        ctx.query.pinning.accepts(&row.pinning)
+            && ctx
+                .query
+                .thresholds
+                .matches(row.usage.billable(), row.cost.map(|c| c.total()))
+    });
+    sort_rows(&mut rows);
+    Ok(rows)
+}
+
+/// Read one subagent's transcript and fold it into a priced
+/// `Dispatch`. `None` when the sidecar is absent or unreadable, when
+/// the transcript fails to parse, or when it carries no timestamp.
+///
+/// The `seen` set is scoped to this single transcript, not to the
+/// project. A dispatch is the unit being priced, so identity across
+/// transcripts carries no meaning for agent attribution, and a wider
+/// set would drop a second agent's genuinely distinct spend on a
+/// coincidental key collision. This differs from `load_sessions`,
+/// which scopes per project because it deduplicates one conversation
+/// spread across resumed files.
+fn build_dispatch(
+    subagent: &SubagentPaths,
+    parent_cwd: Option<&Path>,
+    parent_short_name: &str,
+    catalog: &PricingCatalog,
+) -> Option<Dispatch> {
+    let meta_path = subagent.meta.as_ref()?;
+    let meta = read_subagent_meta(meta_path)?;
+    let turns = parse_jsonl(&subagent.jsonl).ok()?;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let turns = dedup_assistant_turns(turns, &mut seen);
+    dispatch_from_turns(&meta, parent_cwd, parent_short_name, &turns, catalog)
 }
 
 /// Build a file-size + mtime fingerprint of every session transcript
@@ -551,10 +704,25 @@ mod tests {
         root
     }
 
-    fn ctx(projects_dir: PathBuf) -> DataContext {
+    /// A context whose context-file walk is rooted in an empty
+    /// tempdir rather than the developer's real `~/.claude`. Without
+    /// it a user-global agent file sharing a test's agent type would
+    /// reclassify its row and fail the test on that machine alone.
+    /// An empty `~/.claude` stand-in inside `tmp`.
+    fn empty_claude_home(tmp: &tempfile::TempDir) -> PathBuf {
+        let home = tmp.path().join("claude-home");
+        std::fs::create_dir_all(&home).expect("create claude-home");
+        home
+    }
+
+    fn ctx_with_claude_home(projects_dir: PathBuf, claude_home: &Path) -> DataContext {
         DataContext {
             projects_dir,
             catalog: Arc::new(PricingCatalog::default()),
+            inventory: Arc::new(InventoryConfig {
+                claude_home: claude_home.to_path_buf(),
+                installed_plugins_path: claude_home.join("plugins/installed_plugins.json"),
+            }),
             query: Query::default(),
         }
     }
@@ -579,7 +747,7 @@ mod tests {
             1000,
         );
 
-        let mut data_ctx = ctx(projects_dir);
+        let mut data_ctx = ctx_with_claude_home(projects_dir, &empty_claude_home(&tmp));
         data_ctx.query.sessions.project_name = Some("alpha".to_string());
 
         let sessions = load_sessions(&data_ctx).expect("load_sessions");
@@ -607,7 +775,7 @@ mod tests {
             100_000,
         );
 
-        let mut data_ctx = ctx(projects_dir);
+        let mut data_ctx = ctx_with_claude_home(projects_dir, &empty_claude_home(&tmp));
         data_ctx.query.thresholds.min_tokens = Some(1000);
 
         let sessions = load_sessions(&data_ctx).expect("load_sessions");
@@ -627,11 +795,12 @@ mod tests {
             10,
         );
 
-        let unfiltered = ctx(projects_dir.clone());
+        let claude_home = empty_claude_home(&tmp);
+        let unfiltered = ctx_with_claude_home(projects_dir.clone(), &claude_home);
         let unfiltered_exchanges = load_show(&unfiltered, "s1").expect("load_show unfiltered");
         assert!(!unfiltered_exchanges.is_empty());
 
-        let mut filtered = ctx(projects_dir);
+        let mut filtered = ctx_with_claude_home(projects_dir, &claude_home);
         filtered.query.thresholds.min_tokens = Some(1_000_000);
         let filtered_exchanges = load_show(&filtered, "s1").expect("load_show filtered");
         // `prepare_exchanges` omits a below-threshold exchange
@@ -655,7 +824,7 @@ mod tests {
             1000,
         );
 
-        let mut data_ctx = ctx(projects_dir);
+        let mut data_ctx = ctx_with_claude_home(projects_dir, &empty_claude_home(&tmp));
         data_ctx.query.thresholds.min_cost = Some(1_000_000.0);
 
         let (rows, _coverage) = load_inputs(&data_ctx).expect("load_inputs");
@@ -694,9 +863,17 @@ mod tests {
         // credit it in the unscoped case; scoping to a session id
         // that matches nothing empties `session_metas` entirely, and
         // every row's loads/billed-tokens/coverage must collapse to
-        // zero. This is deterministic and environment-independent —
-        // it holds regardless of which inventory files exist here.
-        let all_ctx = ctx(projects_dir.clone());
+        // zero. The synthetic `~/.claude` below is what makes that
+        // deterministic: the walk reads it rather than the developer's
+        // real one, so the assertion does not depend on which files
+        // happen to exist on this machine.
+        let claude_home = empty_claude_home(&tmp);
+        std::fs::write(
+            claude_home.join("CLAUDE.md"),
+            "# Global\n\nA global rule body.\n",
+        )
+        .expect("write CLAUDE.md");
+        let all_ctx = ctx_with_claude_home(projects_dir.clone(), &claude_home);
         let (all_rows, all_coverage) = load_inputs(&all_ctx).expect("load_inputs all");
         let all_loads: u64 = all_rows.iter().map(|r| r.loads_1h + r.loads_5m).sum();
         assert!(
@@ -705,7 +882,7 @@ mod tests {
              at least one always-loaded inventory row",
         );
 
-        let mut unmatched_ctx = ctx(projects_dir);
+        let mut unmatched_ctx = ctx_with_claude_home(projects_dir, &claude_home);
         unmatched_ctx.query.inputs_session_id = Some("does-not-exist".to_string());
         let (unmatched_rows, unmatched_coverage) =
             load_inputs(&unmatched_ctx).expect("load_inputs unmatched");
@@ -773,6 +950,7 @@ mod tests {
         let ctx_a = DataContext {
             projects_dir: PathBuf::from("/nonexistent"),
             catalog: Arc::new(PricingCatalog::default()),
+            inventory: Arc::new(InventoryConfig::default()),
             query: Query::default(),
         };
         let original_catalog_ptr = Arc::as_ptr(&ctx_a.catalog);
@@ -815,13 +993,306 @@ mod tests {
         std::fs::write(malformed_dir.join("s2.jsonl"), "not valid json\n")
             .expect("write malformed jsonl");
 
-        let sessions = load_sessions(&ctx(projects_dir)).expect("load_sessions");
+        let sessions = load_sessions(&ctx_with_claude_home(
+            projects_dir,
+            &empty_claude_home(&tmp),
+        ))
+        .expect("load_sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s1");
     }
 
+    // ---- load_agents ----
+
+    /// Write a subagent transcript plus its sidecar under
+    /// `<projects_dir>/<project>/<session_id>/subagents/`.
+    ///
+    /// `lines` are written verbatim so a test can repeat a
+    /// `(message_id, request_id)` pair, which is the shape the dedup
+    /// assertions turn on.
+    fn write_subagent(
+        projects_dir: &Path,
+        project: &str,
+        session_id: &str,
+        agent_file: &str,
+        agent_type: &str,
+        lines: &[String],
+    ) {
+        let dir = projects_dir
+            .join(project)
+            .join(session_id)
+            .join("subagents");
+        std::fs::create_dir_all(&dir).expect("create subagents dir");
+        let mut file =
+            std::fs::File::create(dir.join(format!("{agent_file}.jsonl"))).expect("create jsonl");
+        for line in lines {
+            writeln!(file, "{line}").expect("write line");
+        }
+        std::fs::write(
+            dir.join(format!("{agent_file}.meta.json")),
+            format!(r#"{{"agentType":"{agent_type}"}}"#),
+        )
+        .expect("write sidecar");
+    }
+
     #[test]
-    fn query_describe_active_orders_session_scope_then_thresholds() {
+    fn load_agents_deduplicates_within_one_transcript() {
+        // The figure every other number in the view rests on: one
+        // `(message_id, request_id)` pair repeated three times is
+        // billed once.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects_dir = write_session(
+            &tmp,
+            "alpha",
+            "s1",
+            "/home/user/alpha",
+            "2026-04-01T10:00:00Z",
+            1000,
+        );
+        let repeated = assistant_line("2026-04-01T10:05:00Z", "msg_x", "req_x", "m", 700, 0);
+        write_subagent(
+            &projects_dir,
+            "alpha",
+            "s1",
+            "agent-1",
+            "dedup-agent",
+            &[repeated.clone(), repeated.clone(), repeated],
+        );
+
+        let rows = load_agents(&ctx_with_claude_home(
+            projects_dir,
+            &empty_claude_home(&tmp),
+        ))
+        .expect("load_agents");
+        assert_eq!(rows.len(), 1, "expected one row, got {rows:#?}");
+        // 700 input + 5 ephemeral_5m, counted once rather than thrice.
+        assert_eq!(rows[0].usage.input, 700);
+        assert_eq!(rows[0].usage.cache_creation.ephemeral_5m, 5);
+        assert_eq!(rows[0].dispatches, 1);
+    }
+
+    #[test]
+    fn load_agents_does_not_deduplicate_across_transcripts() {
+        // Two transcripts sharing a key both count: the `seen` set is
+        // per transcript, because a dispatch is the unit being priced.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects_dir = write_session(
+            &tmp,
+            "alpha",
+            "s1",
+            "/home/user/alpha",
+            "2026-04-01T10:00:00Z",
+            1000,
+        );
+        let shared = assistant_line("2026-04-01T10:05:00Z", "msg_x", "req_x", "m", 700, 0);
+        write_subagent(
+            &projects_dir,
+            "alpha",
+            "s1",
+            "agent-1",
+            "shared-key-agent",
+            std::slice::from_ref(&shared),
+        );
+        write_subagent(
+            &projects_dir,
+            "alpha",
+            "s1",
+            "agent-2",
+            "shared-key-agent",
+            std::slice::from_ref(&shared),
+        );
+
+        let rows = load_agents(&ctx_with_claude_home(
+            projects_dir,
+            &empty_claude_home(&tmp),
+        ))
+        .expect("load_agents");
+        assert_eq!(rows.len(), 1, "same agent, model, effort, pinning");
+        assert_eq!(rows[0].dispatches, 2);
+        assert_eq!(rows[0].usage.input, 1400, "both transcripts counted");
+    }
+
+    #[test]
+    fn load_agents_skips_a_subagent_with_no_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects_dir = write_session(
+            &tmp,
+            "alpha",
+            "s1",
+            "/home/user/alpha",
+            "2026-04-01T10:00:00Z",
+            1000,
+        );
+        let dir = projects_dir.join("alpha").join("s1").join("subagents");
+        std::fs::create_dir_all(&dir).expect("create subagents dir");
+        std::fs::write(
+            dir.join("agent-1.jsonl"),
+            format!(
+                "{}\n",
+                assistant_line("2026-04-01T10:05:00Z", "m1", "r1", "m", 700, 0)
+            ),
+        )
+        .expect("write orphan transcript");
+
+        let rows = load_agents(&ctx_with_claude_home(
+            projects_dir,
+            &empty_claude_home(&tmp),
+        ))
+        .expect("load_agents");
+        assert!(
+            rows.is_empty(),
+            "a sidecar-less subagent is skipped: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn load_agents_respects_project_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects_dir = write_session(
+            &tmp,
+            "alpha",
+            "s1",
+            "/home/user/alpha",
+            "2026-04-01T10:00:00Z",
+            1000,
+        );
+        write_session(
+            &tmp,
+            "beta",
+            "s2",
+            "/home/user/beta",
+            "2026-04-02T10:00:00Z",
+            1000,
+        );
+        let line = assistant_line("2026-04-01T10:05:00Z", "m1", "r1", "m", 700, 0);
+        write_subagent(
+            &projects_dir,
+            "alpha",
+            "s1",
+            "agent-1",
+            "alpha-agent",
+            std::slice::from_ref(&line),
+        );
+        write_subagent(
+            &projects_dir,
+            "beta",
+            "s2",
+            "agent-1",
+            "beta-agent",
+            std::slice::from_ref(&line),
+        );
+
+        let mut data_ctx = ctx_with_claude_home(projects_dir, &empty_claude_home(&tmp));
+        data_ctx.query.sessions.project_name = Some("alpha".to_string());
+        let rows = load_agents(&data_ctx).expect("load_agents");
+        assert_eq!(rows.len(), 1, "got {rows:#?}");
+        assert_eq!(rows[0].agent_type, "alpha-agent");
+    }
+
+    #[test]
+    fn load_agents_respects_thresholds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects_dir = write_session(
+            &tmp,
+            "alpha",
+            "s1",
+            "/home/user/alpha",
+            "2026-04-01T10:00:00Z",
+            1000,
+        );
+        write_subagent(
+            &projects_dir,
+            "alpha",
+            "s1",
+            "agent-1",
+            "small-agent",
+            &[assistant_line(
+                "2026-04-01T10:05:00Z",
+                "m1",
+                "r1",
+                "m",
+                10,
+                0,
+            )],
+        );
+        write_subagent(
+            &projects_dir,
+            "alpha",
+            "s1",
+            "agent-2",
+            "big-agent",
+            &[assistant_line(
+                "2026-04-01T10:06:00Z",
+                "m2",
+                "r2",
+                "m",
+                5000,
+                0,
+            )],
+        );
+
+        let mut data_ctx = ctx_with_claude_home(projects_dir, &empty_claude_home(&tmp));
+        data_ctx.query.thresholds.min_tokens = Some(1000);
+        let rows = load_agents(&data_ctx).expect("load_agents");
+        assert_eq!(rows.len(), 1, "got {rows:#?}");
+        assert_eq!(rows[0].agent_type, "big-agent");
+    }
+
+    #[test]
+    fn load_agents_default_pinning_excludes_pinned_rows() {
+        // A project-local agent file naming a concrete model. It
+        // enters the inventory through `walk_for_session` on the
+        // dispatch's own cwd, so this stays hermetic without touching
+        // `CCLENS_CLAUDE_HOME`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(work.join(".claude/agents")).expect("create agent dir");
+        std::fs::write(
+            work.join(".claude/agents/pinned-agent.md"),
+            "---\nmodel: claude-opus-5\n---\n\nBody.\n",
+        )
+        .expect("write agent file");
+
+        let cwd = work.to_string_lossy().into_owned();
+        let projects_dir = write_session(&tmp, "alpha", "s1", &cwd, "2026-04-01T10:00:00Z", 1000);
+        write_subagent(
+            &projects_dir,
+            "alpha",
+            "s1",
+            "agent-1",
+            "pinned-agent",
+            &[assistant_line(
+                "2026-04-01T10:05:00Z",
+                "m1",
+                "r1",
+                "m",
+                700,
+                0,
+            )],
+        );
+
+        let mut data_ctx = ctx_with_claude_home(projects_dir, &empty_claude_home(&tmp));
+        let rows = load_agents(&data_ctx).expect("load_agents");
+        assert!(
+            rows.is_empty(),
+            "the default slice hides pinned rows, got {rows:#?}",
+        );
+
+        // Widening admits it, and it classifies as pinned — which is
+        // what proves the default excluded it for the right reason.
+        data_ctx.query.pinning = PinningFilter::everything();
+        let rows = load_agents(&data_ctx).expect("load_agents");
+        assert_eq!(rows.len(), 1, "got {rows:#?}");
+        assert_eq!(
+            rows[0].pinning,
+            crate::agents::Pinning::Pinned {
+                declared: "claude-opus-5".to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn query_describe_active_orders_session_scope_thresholds_then_pinning() {
         let query = Query {
             sessions: SessionFilter {
                 project_name: Some("alpha".to_string()),
@@ -835,6 +1306,9 @@ mod tests {
                 min_cost: None,
             },
             inputs_session_id: Some("abc".to_string()),
+            // Non-default, or the component would (correctly) not
+            // appear at all — see `PinningFilter::describe_active`.
+            pinning: PinningFilter::new(&[crate::agents::PinningKind::Pinned]),
         };
         let components = query.describe_active();
         assert_eq!(
@@ -847,11 +1321,12 @@ mod tests {
                 "--project alpha",
                 "--since 2026-04-10",
                 "--min-tokens 50000",
+                "--pinning pinned",
             ],
         );
         // `--session` is read by the inputs loader alone, scope
-        // filters never reach `load_show`, and thresholds constrain
-        // all three loaders.
+        // filters never reach `load_show`, thresholds constrain every
+        // loader, and `--pinning` reaches the agents loader alone.
         assert_eq!(
             components.iter().map(|c| c.honored_by).collect::<Vec<_>>(),
             vec![
@@ -859,10 +1334,13 @@ mod tests {
                 HonoredBy::SESSION_SCOPED,
                 HonoredBy::SESSION_SCOPED,
                 HonoredBy::EVERY_LOADER,
+                HonoredBy::AGENTS_ONLY,
             ],
         );
     }
 
+    /// The assertion that proves the pinning filter's *narrowing*
+    /// default did not silently make every view look filtered.
     #[test]
     fn query_describe_active_is_empty_when_no_filter_is_set() {
         assert!(Query::default().describe_active().is_empty());

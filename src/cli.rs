@@ -24,6 +24,7 @@
 
 use std::path::PathBuf;
 
+use cclens::agents::PinningFilter;
 use cclens::filter::{SessionFilter, ThresholdsFilter, parse_filter_datetime, parse_min_cost};
 use cclens::loading::Query;
 use chrono::{DateTime, Utc};
@@ -210,6 +211,7 @@ pub(super) fn emit_empty_result_hint(scope: &SessionFilterArgs, thresholds: &Thr
         sessions: scope.session_filter(),
         thresholds: thresholds.thresholds_filter(),
         inputs_session_id: None,
+        pinning: PinningFilter::default(),
     });
 }
 
@@ -226,6 +228,7 @@ pub(super) fn emit_inputs_empty_hint(
         sessions: scope.session_filter(),
         thresholds: thresholds.thresholds_filter(),
         inputs_session_id: inputs.session_id(),
+        pinning: PinningFilter::default(),
     });
 }
 
