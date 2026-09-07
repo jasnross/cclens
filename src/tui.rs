@@ -1,5 +1,6 @@
-//! Interactive TUI rendering for `cclens list` and `cclens inputs`
-//! with tabbed navigation, session drill-down, and pricing overlay.
+//! Interactive TUI rendering for `cclens list`, `cclens inputs`, and
+//! `cclens agents` with tabbed navigation, session drill-down, and
+//! pricing, filter, and comparison overlays.
 //!
 //! Cell data comes from `views` (shared with `rendering`); this
 //! module handles ratatui widget construction, styling, layout
@@ -8,14 +9,22 @@
 //! its load functions directly, with no dependency-inversion layer.
 //!
 //! Public API:
-//! - `Tab` — `Sessions` | `Inputs` — the active tab.
+//! - `Tab` — `Sessions` | `Inputs` | `Agents` — the active tab.
 //! - `run_tui(DataContext, Vec<Session>, RefreshFingerprint,
 //!   PricingData, Tab) -> anyhow::Result<()>` — fullscreen TUI with
-//!   tab switching (1/2 keys), scrollable tables, session drill-down
+//!   tab switching (1/2/3 keys), scrollable tables, session drill-down
 //!   (Enter/Esc within Sessions tab), attribution table with coverage
-//!   footer (Inputs tab), pricing overlay (`p` toggles, `r` refreshes,
+//!   footer (Inputs tab), agent rows with a pinning-slice line
+//!   (Agents tab), pricing overlay (`p` toggles, `r` refreshes,
 //!   Esc/q closes), and timer-driven auto-refresh (3s interval,
 //!   fingerprint-gated).
+//!
+//! Agents-tab bindings beyond navigation: `c` opens the comparison
+//! modal for the selected row's agent type, re-presenting that agent's
+//! rows over a repricing panel whose target model `↑`/`↓` switch; `a`
+//! widens `ctx.query.pinning` to every kind and back, committing
+//! through `invalidate_data` so the generation bump and the slot
+//! clearing happen at one site.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,6 +43,7 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 
+use crate::agents::{AgentRow, Pinning, PinningFilter, repriced_delta};
 use crate::aggregation::{PreparedExchange, PreparedRow};
 use crate::attribution::{AttributionRow, CoverageStats};
 use crate::domain::Session;
@@ -45,13 +55,15 @@ use crate::inventory::InventoryConfig;
 use crate::loading::{self, DataContext, PricingData, Query, RefreshFingerprint};
 use crate::pricing::{CacheInfo, PricingCatalog};
 use crate::views::{
-    inputs_cells, pricing_view_rows, session_cells, session_totals, show_row_cells,
+    agents_cells, inputs_cells, pricing_view_rows, repriced_cells, session_cells, session_totals,
+    show_row_cells,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Sessions,
     Inputs,
+    Agents,
 }
 
 struct InputsState {
@@ -78,6 +90,92 @@ enum InputsData {
     Loading,
     Loaded(InputsState),
     Error(String),
+}
+
+/// The Agents tab's rows and the selection that indexes them,
+/// constructed together so a selection cannot outlive its rows.
+/// Mirrors `InputsState`.
+struct AgentsState {
+    rows: Vec<AgentRow>,
+    table_state: TableState,
+}
+
+impl AgentsState {
+    fn new(rows: Vec<AgentRow>) -> Self {
+        let mut table_state = TableState::default();
+        if !rows.is_empty() {
+            table_state.select_first();
+        }
+        Self { rows, table_state }
+    }
+
+    /// The key `apply_agents_data` preserves a selection across a
+    /// refresh by. A path is not available here — a row is an
+    /// accumulation, not a file — so the row key stands in for one.
+    fn selected_key(&self) -> Option<(String, Option<String>, Option<String>, Pinning)> {
+        let row = self.rows.get(self.table_state.selected()?)?;
+        Some((
+            row.agent_type.clone(),
+            row.model.clone(),
+            row.effort.clone(),
+            row.pinning.clone(),
+        ))
+    }
+}
+
+enum AgentsData {
+    Loading,
+    Loaded(AgentsState),
+    Error(String),
+}
+
+/// The comparison modal's state: one agent type's visible rows, and
+/// an index into the catalog's bare `claude-*` keys naming the target
+/// being compared against.
+///
+/// One target at a time with a switcher, rather than several columns:
+/// the panel then carries the full label set for the figure on screen,
+/// where side-by-side columns would have to drop it for width at
+/// exactly the terminal sizes where a stripped number is most likely
+/// to be misread.
+struct CompareState {
+    agent_type: String,
+    rows: Vec<AgentRow>,
+    /// An index into `targets_from`'s output, not a snapshot of it.
+    /// A pricing refresh can land while this overlay is open, and a
+    /// snapshot would then name models the live catalog no longer
+    /// prices — a mixed-catalog delta with no sign it was one.
+    target_idx: usize,
+}
+
+/// The models a comparison can target: the catalog's bare `claude-*`
+/// keys, which are the ones that match transcript model strings.
+fn compare_targets(catalog: &PricingCatalog) -> Vec<String> {
+    catalog
+        .sorted_entries(false)
+        .into_iter()
+        .map(|(model, _)| model.to_string())
+        .collect()
+}
+
+impl CompareState {
+    fn target(&self, catalog: &PricingCatalog) -> Option<String> {
+        compare_targets(catalog).into_iter().nth(self.target_idx)
+    }
+
+    /// Move the target by `delta`, wrapping. Reads the catalog rather
+    /// than a stored length for the same reason `target` does.
+    fn move_target(&mut self, catalog: &PricingCatalog, forward: bool) {
+        let len = compare_targets(catalog).len();
+        if len == 0 {
+            return;
+        }
+        self.target_idx = if forward {
+            (self.target_idx + 1) % len
+        } else {
+            self.target_idx.checked_sub(1).unwrap_or(len - 1)
+        };
+    }
 }
 
 /// The Sessions tab's data and everything recomputed alongside it.
@@ -148,6 +246,9 @@ enum SessionsData {
 
 enum Overlay {
     Pricing,
+    /// Boxed for the same reason `Filter` is: the variant would
+    /// otherwise inflate every `Option<Overlay>` by a `Vec` of rows.
+    Compare(Box<CompareState>),
     /// Boxed so the variant does not inflate every `Option<Overlay>`
     /// by the editor's six fields — one allocation per `f` press
     /// against a value that is moved only on open and close.
@@ -318,8 +419,21 @@ impl FilterEditor {
     /// unreachable arms per field — a kind/value mismatch is
     /// impossible by construction, and dropping it is the safe
     /// direction if one ever appeared.
-    fn to_query(&self) -> Query {
-        let mut query = Query::default();
+    /// Project the parsed fields back onto `base`.
+    ///
+    /// The editor's six input fields write three of `Query`'s four
+    /// fields; `pinning` has no editor field and must survive a
+    /// commit. Basing the projection on the committed query makes the
+    /// round trip lossless by construction rather than for the fields
+    /// someone remembered to add — a field introduced later is
+    /// preserved without its author having to find this site.
+    fn to_query(&self, base: &Query) -> Query {
+        let mut query = base.clone();
+        // The editor owns these three: an emptied field must clear the
+        // committed value rather than inherit it from `base`.
+        query.inputs_session_id = None;
+        query.sessions = crate::filter::SessionFilter::default();
+        query.thresholds = crate::filter::ThresholdsFilter::default();
         for field in &self.fields {
             let Ok(Some(value)) = &field.parsed else {
                 continue;
@@ -429,6 +543,7 @@ enum RefreshScope {
     Sessions,
     Show { session_id: String },
     Inputs,
+    Agents,
 }
 
 /// The unit of in-flight accounting: at most one load per slot runs at
@@ -441,6 +556,7 @@ enum LoadSlot {
     Sessions,
     Show(String),
     Inputs,
+    Agents,
     Pricing,
 }
 
@@ -469,6 +585,7 @@ enum LoadRequest {
         header_label: String,
     },
     InputsRefresh,
+    AgentsRefresh,
     /// `guard: Some(fp)` is a timer-driven refresh — skipped if the
     /// filesystem is unchanged. `guard: None` is a forced reload
     /// (filter/catalog change) — always runs.
@@ -489,6 +606,10 @@ enum LoadResult {
     },
     InputsData {
         result: anyhow::Result<(Vec<AttributionRow>, CoverageStats)>,
+        refresh_fingerprint: Option<RefreshFingerprint>,
+    },
+    AgentsData {
+        result: anyhow::Result<Vec<AgentRow>>,
         refresh_fingerprint: Option<RefreshFingerprint>,
     },
     SessionsData {
@@ -577,6 +698,15 @@ struct App {
     sessions: SessionsData,
     view: View,
     inputs: Option<InputsData>,
+    agents: Option<AgentsData>,
+    /// The pinning slice the process started with, so the Agents
+    /// tab's `a` binding can restore it rather than the library
+    /// default. Immutable for the app's lifetime.
+    launch_pinning: PinningFilter,
+    /// `--compare-model`, when the run supplied one. Seeds the
+    /// comparison modal's target so the flag is not silently ignored
+    /// on the interactive surface.
+    compare_model: Option<String>,
     overlay: Option<Overlay>,
     pricing: PricingData,
     pending_loads: Vec<LoadRequest>,
@@ -612,12 +742,15 @@ impl App {
         default_tab: Tab,
     ) -> Self {
         Self {
+            launch_pinning: ctx.query.pinning.clone(),
+            compare_model: None,
             ctx,
             ctx_generation: 0,
             tab: default_tab,
             sessions: SessionsData::Loaded(SessionsState::new(sessions)),
             view: View::List,
             inputs: None,
+            agents: None,
             overlay: None,
             pricing,
             pending_loads: Vec::new(),
@@ -717,6 +850,10 @@ impl App {
 ///
 /// The two arms are deliberately asymmetric. `Inputs` is
 /// content-sensitive — it requires `InputsData::Loaded` — while
+/// The three tabs carry different content-sensitivity policies:
+/// Sessions ignores slot contents entirely, while Inputs and Agents
+/// each require `Loaded` before a guarded tick targets them.
+///
 /// `(Tab::Sessions, View::List, _)` ignores slot contents, so the
 /// timer keeps issuing guarded Sessions refreshes while that slot sits
 /// in `Loading` or `Error`. That is wanted: a guarded tick is the
@@ -730,6 +867,12 @@ fn current_scope(app: &App) -> Option<RefreshScope> {
             session_id: session_id.clone(),
         }),
         (Tab::Inputs, _, Some(InputsData::Loaded(_))) => Some(RefreshScope::Inputs),
+        // Requires `Loaded` for the same content-sensitivity reason
+        // the Inputs arm does: a guarded refresh into a slot that is
+        // still `Loading` has nothing to compare against.
+        (Tab::Agents, _, _) if matches!(app.agents, Some(AgentsData::Loaded(_))) => {
+            Some(RefreshScope::Agents)
+        }
         _ => None,
     }
 }
@@ -753,6 +896,33 @@ pub async fn run_tui(
     pricing: PricingData,
     default_tab: Tab,
 ) -> anyhow::Result<()> {
+    run_tui_with_compare_model(
+        ctx,
+        sessions,
+        initial_fingerprint,
+        pricing,
+        default_tab,
+        None,
+    )
+    .await
+}
+
+/// `run_tui` plus the `--compare-model` target the run supplied, which
+/// seeds the Agents tab's comparison modal so the flag is honored on
+/// the interactive surface rather than silently ignored.
+///
+/// # Errors
+///
+/// Propagates a terminal init/restore failure or an unrecoverable
+/// event-loop error.
+pub async fn run_tui_with_compare_model(
+    ctx: DataContext,
+    sessions: Vec<Session>,
+    initial_fingerprint: RefreshFingerprint,
+    pricing: PricingData,
+    default_tab: Tab,
+    compare_model: Option<String>,
+) -> anyhow::Result<()> {
     let mut terminal = ratatui::try_init()?;
     let result = run_event_loop(
         &mut terminal,
@@ -761,6 +931,7 @@ pub async fn run_tui(
         initial_fingerprint,
         pricing,
         default_tab,
+        compare_model,
     )
     .await;
     ratatui::restore();
@@ -774,8 +945,10 @@ async fn run_event_loop(
     initial_fingerprint: RefreshFingerprint,
     pricing: PricingData,
     default_tab: Tab,
+    compare_model: Option<String>,
 ) -> anyhow::Result<()> {
     let mut app = App::new(ctx, sessions, pricing, default_tab);
+    app.compare_model = compare_model;
     app.refresh_fingerprint = initial_fingerprint;
     let mut event_stream = EventStream::new();
 
@@ -785,9 +958,17 @@ async fn run_event_loop(
     refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     refresh_interval.tick().await;
 
+    // Only the Sessions tab arrives with data — `run_tui` is handed a
+    // session list, and nothing else. A tab launched into directly
+    // must dispatch its own first load or it renders an empty slot
+    // that no navigation event recovers.
     if default_tab == Tab::Inputs {
         app.inputs = Some(InputsData::Loading);
         app.pending_loads.push(LoadRequest::InputsRefresh);
+    }
+    if default_tab == Tab::Agents {
+        app.agents = Some(AgentsData::Loading);
+        app.pending_loads.push(LoadRequest::AgentsRefresh);
     }
 
     loop {
@@ -900,6 +1081,27 @@ fn spawn_load<T, L, M>(
     });
 }
 
+/// Dispatch an agents load. Extracted from `drain_pending_loads`
+/// because the guarded and unguarded arms differ only in the guard,
+/// and inlining both pushed that function past its line cap.
+fn spawn_agents_load(
+    app: &mut App,
+    guard: Option<RefreshFingerprint>,
+    tx: &mpsc::UnboundedSender<StampedResult>,
+) {
+    spawn_load(
+        app,
+        LoadSlot::Agents,
+        guard,
+        tx,
+        loading::load_agents,
+        |result, fp| LoadResult::AgentsData {
+            result,
+            refresh_fingerprint: fp,
+        },
+    );
+}
+
 fn drain_pending_loads(app: &mut App, tx: &mpsc::UnboundedSender<StampedResult>) {
     // `mem::take` rather than `drain(..)`: `spawn_load` needs `&mut
     // App`, which a live drain iterator would keep borrowed.
@@ -939,6 +1141,7 @@ fn drain_pending_loads(app: &mut App, tx: &mpsc::UnboundedSender<StampedResult>)
                     },
                 );
             }
+            LoadRequest::AgentsRefresh => spawn_agents_load(app, None, tx),
             LoadRequest::Refresh { scope, guard } => match scope {
                 RefreshScope::Sessions => {
                     spawn_load(
@@ -984,6 +1187,7 @@ fn drain_pending_loads(app: &mut App, tx: &mpsc::UnboundedSender<StampedResult>)
                         },
                     );
                 }
+                RefreshScope::Agents => spawn_agents_load(app, guard, tx),
             },
             LoadRequest::RefreshPricing => {
                 spawn_load(
@@ -1029,6 +1233,10 @@ fn handle_load_result(app: &mut App, stamped: StampedResult) {
             result,
             refresh_fingerprint,
         } => apply_inputs_data(app, result, refresh_fingerprint),
+        LoadResult::AgentsData {
+            result,
+            refresh_fingerprint,
+        } => apply_agents_data(app, result, refresh_fingerprint),
         LoadResult::SessionsData {
             result,
             fingerprint,
@@ -1307,6 +1515,75 @@ fn return_to_list(app: &mut App) {
 /// Off-screen slots are cleared but not reloaded: they refill through
 /// `ensure_sessions_data` and `try_switch_to_inputs` when the user
 /// navigates to them.
+/// Apply an agents load, mirroring `apply_inputs_data` including its
+/// selection-preservation logic. The selection is keyed on the row key
+/// — agent type, model, effort, pinning — rather than on a file path,
+/// because an agents row is an accumulation and no path identifies it.
+fn apply_agents_data(
+    app: &mut App,
+    result: anyhow::Result<Vec<AgentRow>>,
+    refresh_fingerprint: Option<RefreshFingerprint>,
+) {
+    let is_user_triggered =
+        refresh_fingerprint.is_none() && matches!(&app.agents, Some(AgentsData::Loading));
+    let is_refresh_triggered = matches!(&app.agents, Some(AgentsData::Loaded(_)));
+
+    if is_user_triggered {
+        match result {
+            Ok(rows) => {
+                app.agents = Some(AgentsData::Loaded(AgentsState::new(rows)));
+                app.clear_status();
+            }
+            Err(e) => {
+                let message = format!("{e}");
+                app.status = Some(StatusMessage {
+                    text: message.clone(),
+                    from_refresh_failure: false,
+                    kind: StatusKind::Error,
+                });
+                app.agents = Some(AgentsData::Error(message));
+            }
+        }
+    } else if is_refresh_triggered
+        && let Ok(new_rows) = result
+        && let Some(AgentsData::Loaded(state)) = &mut app.agents
+    {
+        let prev_key = state.selected_key();
+        let prev_idx = state.table_state.selected();
+
+        state.rows = new_rows;
+
+        if let Some(prev_key) = prev_key {
+            let found = state.rows.iter().position(|r| {
+                (
+                    r.agent_type.clone(),
+                    r.model.clone(),
+                    r.effort.clone(),
+                    r.pinning.clone(),
+                ) == prev_key
+            });
+            if let Some(new_idx) = found {
+                state.table_state.select(Some(new_idx));
+            } else if state.rows.is_empty() {
+                state.table_state.select(None);
+            } else {
+                let fallback = prev_idx.unwrap_or(0).min(state.rows.len() - 1);
+                state.table_state.select(Some(fallback));
+            }
+        } else if !state.rows.is_empty() {
+            state.table_state.select_first();
+        }
+        app.clear_status();
+    }
+    // Stored exactly as the three sibling appliers do. Without it the
+    // guarded tick keeps comparing against a stale fingerprint, so
+    // after any single filesystem change every 3s tick reruns a full
+    // `load_agents` instead of resolving to `NoChange`.
+    if let Some(fp) = refresh_fingerprint {
+        app.refresh_fingerprint = fp;
+    }
+}
+
 fn invalidate_data(app: &mut App) {
     app.bump_ctx_generation();
     app.sessions = SessionsData::Loading;
@@ -1345,6 +1622,17 @@ fn invalidate_data(app: &mut App) {
         app.pending_loads.push(LoadRequest::InputsRefresh);
     } else {
         app.inputs = None;
+    }
+
+    // Branch on `app.tab`, not on `current_scope`: that derives the
+    // visible scope from slot *contents* and so reports `None` for an
+    // Agents tab sitting in `Loading` or `Error`, leaving a blank
+    // screen no navigation event recovers.
+    if app.tab == Tab::Agents {
+        app.agents = Some(AgentsData::Loading);
+        app.pending_loads.push(LoadRequest::AgentsRefresh);
+    } else {
+        app.agents = None;
     }
 
     if app.tab == Tab::Sessions {
@@ -1412,6 +1700,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     // `app.overlay` ends at the arm and the handler can take `&mut App`.
     match &app.overlay {
         Some(Overlay::Pricing) => return handle_pricing_overlay_key(app, key),
+        Some(Overlay::Compare(_)) => return handle_compare_overlay_key(app, key),
         Some(Overlay::Filter(_)) => return handle_filter_overlay_key(app, key),
         None => {}
     }
@@ -1423,6 +1712,10 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('2') => {
             try_switch_to_inputs(app);
+            return false;
+        }
+        KeyCode::Char('3') => {
+            try_switch_to_agents(app);
             return false;
         }
         KeyCode::Char('p') => {
@@ -1471,6 +1764,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             View::List => handle_list_key(app, key),
         },
         Tab::Inputs => handle_inputs_key(app, key),
+        Tab::Agents => handle_agents_key(app, key),
     }
 }
 
@@ -1582,7 +1876,7 @@ fn handle_filter_overlay_key(app: &mut App, key: KeyEvent) -> bool {
 fn commit_filter_edit(app: &mut App) {
     let committable = match &app.overlay {
         Some(Overlay::Filter(editor)) => editor.is_committable(),
-        Some(Overlay::Pricing) | None => false,
+        Some(Overlay::Pricing | Overlay::Compare(_)) | None => false,
     };
     if !committable {
         return;
@@ -1599,7 +1893,7 @@ fn commit_filter_edit(app: &mut App) {
     let Some(Overlay::Filter(editor)) = app.overlay.take() else {
         return;
     };
-    app.ctx.query = editor.to_query();
+    app.ctx.query = editor.to_query(&app.ctx.query);
     invalidate_data(app);
     // As `apply_pricing` does: a user-initiated commit is a fresh
     // action, and a standing error would outrank the empty-state and
@@ -1915,6 +2209,259 @@ fn try_switch_to_inputs(app: &mut App) {
     app.tab = Tab::Inputs;
 }
 
+fn try_switch_to_agents(app: &mut App) {
+    if matches!(app.agents, None | Some(AgentsData::Error(_))) {
+        app.agents = Some(AgentsData::Loading);
+        app.pending_loads.push(LoadRequest::AgentsRefresh);
+    }
+    app.tab = Tab::Agents;
+}
+
+/// Widen `ctx.query.pinning` to every kind, or back to the slice the
+/// process launched with.
+///
+/// Back means `launch_pinning`, not `PinningFilter::default()`: a user
+/// who ran `cclens agents --pinning pinned` and pressed `a` twice
+/// would otherwise be moved silently to a slice they never asked for,
+/// with no pinning field in the filter overlay to get back from.
+///
+/// Commits through `invalidate_data`, the same path
+/// `commit_filter_edit` uses, so the generation bump and the slot
+/// clearing happen at one site rather than two.
+fn toggle_agents_pinning(app: &mut App) {
+    app.ctx.query.pinning = if app.ctx.query.pinning == PinningFilter::everything() {
+        app.launch_pinning.clone()
+    } else {
+        PinningFilter::everything()
+    };
+    invalidate_data(app);
+    app.clear_status();
+}
+
+/// Open the comparison modal for the selected row's agent type.
+///
+/// Carries the visible rows for that agent type only. The targets are
+/// the catalog's bare `claude-*` keys — the same set `pricing list`
+/// shows without `--all`, which are the keys that match transcript
+/// model strings.
+fn open_compare_overlay(app: &mut App) {
+    let Some(AgentsData::Loaded(state)) = &app.agents else {
+        return;
+    };
+    let Some(selected) = state.table_state.selected() else {
+        return;
+    };
+    let Some(agent_type) = state.rows.get(selected).map(|r| r.agent_type.clone()) else {
+        return;
+    };
+    let rows: Vec<AgentRow> = state
+        .rows
+        .iter()
+        .filter(|r| r.agent_type == agent_type)
+        .cloned()
+        .collect();
+    // `target_idx` seeds from `--compare-model` when the run supplied
+    // one, so the modal opens on the model the user already named
+    // rather than on whatever sorts first.
+    let target_idx = app
+        .compare_model
+        .as_deref()
+        .and_then(|wanted| {
+            compare_targets(&app.ctx.catalog)
+                .iter()
+                .position(|t| t == wanted)
+        })
+        .unwrap_or(0);
+    app.overlay = Some(Overlay::Compare(Box::new(CompareState {
+        agent_type,
+        rows,
+        target_idx,
+    })));
+}
+
+/// Keys while the comparison overlay is open. Swallows everything the
+/// overlay does not bind, so no global binding fires behind it —
+/// matching `handle_pricing_overlay_key`'s contract.
+fn handle_compare_overlay_key(app: &mut App, key: KeyEvent) -> bool {
+    // Cloned before the overlay borrow: `move_target` reads the live
+    // catalog, and `state` borrows `app` mutably. An `Arc` bump.
+    let catalog = Arc::clone(&app.ctx.catalog);
+    let Some(Overlay::Compare(state)) = &mut app.overlay else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Char('c' | 'q') | KeyCode::Esc => {
+            app.overlay = None;
+        }
+        KeyCode::Down | KeyCode::Char('j') => state.move_target(&catalog, true),
+        KeyCode::Up | KeyCode::Char('k') => state.move_target(&catalog, false),
+        KeyCode::Enter
+        | KeyCode::Backspace
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => {}
+    }
+    false
+}
+
+fn handle_agents_loading_key(key: KeyEvent) -> bool {
+    handle_inputs_loading_key(key)
+}
+
+/// Keys on an `AgentsData::Error` slot: retry, quit, or nothing.
+fn handle_agents_error_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Enter | KeyCode::Char('r') => {
+            try_switch_to_agents(app);
+            false
+        }
+        KeyCode::Backspace
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => false,
+    }
+}
+
+/// Navigation on a loaded Agents table. Split from
+/// `handle_agents_key` because `c` and `a` need `&mut App` while these
+/// arms hold a `&mut AgentsState` borrowed out of it.
+fn handle_agents_loaded_key(agents: &mut AgentsState, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Down | KeyCode::Char('j') => {
+            agents.table_state.select_next();
+            false
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            agents.table_state.select_previous();
+            false
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            agents.table_state.select_first();
+            false
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            agents.table_state.select_last();
+            false
+        }
+        KeyCode::Enter
+        | KeyCode::Backspace
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => false,
+    }
+}
+
+fn handle_agents_key(app: &mut App, key: KeyEvent) -> bool {
+    if matches!(&app.agents, Some(AgentsData::Loading)) {
+        return handle_agents_loading_key(key);
+    }
+    if matches!(&app.agents, Some(AgentsData::Error(_))) {
+        return handle_agents_error_key(app, key);
+    }
+    // `c` and `a` need `&mut App`, so they are dispatched before the
+    // `&mut AgentsState` borrow below begins.
+    match key.code {
+        KeyCode::Char('c') => {
+            open_compare_overlay(app);
+            return false;
+        }
+        KeyCode::Char('a') => {
+            toggle_agents_pinning(app);
+            return false;
+        }
+        KeyCode::Backspace
+        | KeyCode::Enter
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::Esc
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => {}
+    }
+    let Some(AgentsData::Loaded(agents)) = &mut app.agents else {
+        return false;
+    };
+    handle_agents_loaded_key(agents, key)
+}
+
 fn handle_inputs_loading_key(key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => true,
@@ -2047,7 +2594,7 @@ fn render(app: &mut App, frame: &mut Frame) {
                     frame,
                     content_area,
                     vec![Line::raw(""), Line::from(" Loading session...")],
-                    " 1/2 tabs  Esc back  q quit",
+                    " 1/2/3 tabs  Esc back  q quit",
                 );
             }
             View::ShowError { message, .. } => {
@@ -2061,7 +2608,7 @@ fn render(app: &mut App, frame: &mut Frame) {
                         Line::raw(""),
                         Line::from(" Press Enter or r to retry.").dim(),
                     ],
-                    " 1/2 tabs  Enter retry  Esc back  q quit",
+                    " 1/2/3 tabs  Enter retry  Esc back  q quit",
                 );
             }
             View::Show { .. } => {
@@ -2072,11 +2619,13 @@ fn render(app: &mut App, frame: &mut Frame) {
             }
         },
         Tab::Inputs => render_inputs_content(app, frame, content_area),
+        Tab::Agents => render_agents_content(app, frame, content_area),
     }
 
     match &app.overlay {
         Some(Overlay::Pricing) => render_pricing_overlay(app, frame),
         Some(Overlay::Filter(editor)) => render_filter_overlay(editor, frame),
+        Some(Overlay::Compare(state)) => render_compare_overlay(state, &app.ctx.catalog, frame),
         None => {}
     }
 }
@@ -2119,16 +2668,21 @@ fn fit_filter_components(
 }
 
 fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) {
-    let sessions_label = if app.tab == Tab::Sessions {
-        "[Sessions]"
-    } else {
-        " Sessions "
+    // Bracketed when active, bare when not — rather than the padded
+    // `" Sessions "` a two-tab strip could afford. A third tab costs
+    // the left area about ten columns, which at 80 (the common
+    // terminal width) is the difference between the filter indicator
+    // rendering and vanishing entirely.
+    let label = |tab: Tab, name: &str| {
+        if app.tab == tab {
+            format!("[{name}]")
+        } else {
+            name.to_string()
+        }
     };
-    let inputs_label = if app.tab == Tab::Inputs {
-        "[Inputs]"
-    } else {
-        " Inputs "
-    };
+    let sessions_label = label(Tab::Sessions, "Sessions");
+    let inputs_label = label(Tab::Inputs, "Inputs");
+    let agents_label = label(Tab::Agents, "Agents");
 
     let context = match app.tab {
         Tab::Sessions => match &app.view {
@@ -2155,6 +2709,16 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
             Some(InputsData::Error(_)) => "!".to_string(),
             None => "0 files".to_string(),
         },
+        Tab::Agents => match &app.agents {
+            Some(AgentsData::Loaded(agents)) => {
+                let count = agents.rows.len();
+                let label = if count == 1 { "agent" } else { "agents" };
+                format!("{count} {label}")
+            }
+            Some(AgentsData::Loading) => "...".to_string(),
+            Some(AgentsData::Error(_)) => "!".to_string(),
+            None => "0 agents".to_string(),
+        },
     };
 
     // The right label claims what it needs rather than half the row.
@@ -2173,7 +2737,7 @@ fn render_tab_header(app: &App, frame: &mut Frame, area: ratatui::layout::Rect) 
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
 
-    let tabs = format!(" {sessions_label}  {inputs_label}");
+    let tabs = format!(" {sessions_label} {inputs_label} {agents_label} ");
     let mut left_spans = vec![Span::raw(tabs.clone()).bold()];
 
     // The indicator describes all of `Query` bar one documented
@@ -2243,6 +2807,7 @@ fn tab_scope(tab: Tab) -> QueryScope {
     match tab {
         Tab::Sessions => QueryScope::Sessions,
         Tab::Inputs => QueryScope::Inputs,
+        Tab::Agents => QueryScope::Agents,
     }
 }
 
@@ -2311,7 +2876,7 @@ fn render_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
         }
         SessionsData::Loading => (
             vec![Line::raw(""), Line::from(" Loading sessions...")],
-            " 1/2 tabs  q quit",
+            " 1/2/3 tabs  q quit",
         ),
         SessionsData::Error(msg) => (
             vec![
@@ -2320,7 +2885,7 @@ fn render_list_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
                 Line::raw(""),
                 Line::from(" Press Enter or r to retry.").dim(),
             ],
-            " 1/2 tabs  Enter retry  q quit",
+            " 1/2/3 tabs  Enter retry  q quit",
         ),
     };
     render_feedback_content(app, frame, area, message_lines, footer);
@@ -2348,7 +2913,7 @@ fn render_loaded_list_content(app: &mut App, frame: &mut Frame, area: ratatui::l
             frame,
             area,
             lines,
-            " 1/2 tabs  f filter  p pricing  q quit",
+            " 1/2/3 tabs  f filter  p pricing  q quit",
         );
         return;
     }
@@ -2378,7 +2943,7 @@ fn render_loaded_list_content(app: &mut App, frame: &mut Frame, area: ratatui::l
         app,
         frame,
         footer_area,
-        " 1/2 tabs  ↑↓ navigate  Enter open  f filter  p pricing  q quit",
+        " 1/2/3 tabs  ↑↓ navigate  Enter open  f filter  p pricing  q quit",
         derived,
     );
 }
@@ -2537,7 +3102,7 @@ fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
             frame,
             area,
             lines,
-            " 1/2 tabs  Esc back  f filter  p pricing  q quit",
+            " 1/2/3 tabs  Esc back  f filter  p pricing  q quit",
         );
         return;
     }
@@ -2561,7 +3126,7 @@ fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
         app,
         frame,
         footer_area,
-        " 1/2 tabs  ↑↓ navigate  Esc back  f filter  p pricing  q quit",
+        " 1/2/3 tabs  ↑↓ navigate  Esc back  f filter  p pricing  q quit",
         None,
     );
 }
@@ -2671,7 +3236,7 @@ fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout
             frame,
             area,
             lines,
-            " 1/2 tabs  f filter  p pricing  q quit",
+            " 1/2/3 tabs  f filter  p pricing  q quit",
         );
         return;
     }
@@ -2700,7 +3265,7 @@ fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout
                 app,
                 frame,
                 footer_area,
-                " 1/2 tabs  ↑↓ navigate  f filter  p pricing  q quit",
+                " 1/2/3 tabs  ↑↓ navigate  f filter  p pricing  q quit",
                 derived,
             );
         }
@@ -2710,7 +3275,7 @@ fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout
                 frame,
                 area,
                 vec![Line::raw(""), Line::from(" Loading inputs...")],
-                " 1/2 tabs  q quit",
+                " 1/2/3 tabs  q quit",
             );
         }
         Some(InputsData::Error(msg)) => {
@@ -2726,7 +3291,7 @@ fn render_inputs_content(app: &mut App, frame: &mut Frame, area: ratatui::layout
                 Line::raw(""),
                 Line::from(" Press Enter or r to retry.").dim(),
             ];
-            render_feedback_content(app, frame, area, lines, " 1/2 tabs  Enter retry  q quit");
+            render_feedback_content(app, frame, area, lines, " 1/2/3 tabs  Enter retry  q quit");
         }
         None => {}
     }
@@ -2775,6 +3340,268 @@ fn render_inputs_table(inputs: &mut InputsState, frame: &mut Frame, area: ratatu
 fn render_inputs_coverage(inputs: &InputsState, frame: &mut Frame, area: ratatui::layout::Rect) {
     let text = Line::from(format!(" {}", coverage_line(&inputs.coverage)));
     frame.render_widget(Paragraph::new(text), area);
+}
+
+// ---- agents tab ----
+
+/// The active pinning slice, spelled for the footer and empty state.
+///
+/// Appended on both paths regardless of whether `describe_active`
+/// emitted a component: at the default it emits none, so without this
+/// the empty state would report "No agents found in …" for a view
+/// whose `Pinned` and `Fork` rows the filter is holding back.
+fn agents_slice_note(app: &App) -> String {
+    format!("pinning: {}", app.ctx.query.pinning.describe_slice())
+}
+
+fn render_agents_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let is_empty = match &app.agents {
+        Some(AgentsData::Loaded(agents)) => agents.rows.is_empty(),
+        Some(AgentsData::Loading | AgentsData::Error(_)) | None => false,
+    };
+    if is_empty {
+        // `ProjectsDir`, not `Inventory`: the agents view reads
+        // transcripts, so `projects_dir` is what can empty it.
+        let projects_dir = app.ctx.projects_dir.clone();
+        let mut lines = empty_state_lines(
+            &app.ctx.query,
+            "agents",
+            EmptySource::ProjectsDir(&projects_dir),
+            QueryScope::Agents,
+        );
+        lines.push(Line::raw(""));
+        lines.push(Line::from(format!(" Covering {}.", agents_slice_note(app))).dim());
+        lines.push(Line::from(" Press a to widen to every kind.").dim());
+        render_feedback_content(
+            app,
+            frame,
+            area,
+            lines,
+            " 1/2/3 tabs  a widen  f filter  p pricing  q quit",
+        );
+        return;
+    }
+
+    let slice = agents_slice_note(app);
+    match &mut app.agents {
+        Some(AgentsData::Loaded(agents)) => {
+            let [table_area, slice_area, footer_area] = Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+
+            render_agents_table(agents, frame, table_area);
+            frame.render_widget(Paragraph::new(Line::from(format!(" {slice}"))), slice_area);
+            let derived = agents
+                .rows
+                .iter()
+                .any(|r| r.cost.is_none())
+                .then_some(MISSING_MODEL_HINT);
+            render_status_footer(
+                app,
+                frame,
+                footer_area,
+                " 1/2/3 tabs  ↑↓ navigate  c compare  a widen  f filter  p pricing  q quit",
+                derived,
+            );
+        }
+        Some(AgentsData::Loading) => {
+            render_feedback_content(
+                app,
+                frame,
+                area,
+                vec![Line::raw(""), Line::from(" Loading agents...")],
+                " 1/2/3 tabs  q quit",
+            );
+        }
+        Some(AgentsData::Error(msg)) => {
+            let lines = vec![
+                Line::raw(""),
+                Line::from(format!(" Error: {msg}")),
+                Line::raw(""),
+                Line::from(" Press Enter or r to retry.").dim(),
+            ];
+            render_feedback_content(app, frame, area, lines, " 1/2/3 tabs  Enter retry  q quit");
+        }
+        None => {}
+    }
+}
+
+/// Column widths, weighted so the two identifying columns win the
+/// flexible space. At 80 columns — the common terminal width — the
+/// fixed columns leave little to share, and a row whose `agent` cell
+/// is truncated past recognition cannot be acted on at all, whereas a
+/// clipped `dispatches` header still reads from its numbers.
+fn agents_table_widths() -> [Constraint; 8] {
+    [
+        Constraint::Fill(3),    // agent
+        Constraint::Fill(2),    // model
+        Constraint::Length(6),  // effort
+        Constraint::Length(8),  // declared
+        Constraint::Length(13), // pinning
+        Constraint::Length(6),  // disp
+        Constraint::Length(8),  // tokens
+        Constraint::Length(9),  // cost
+    ]
+}
+
+fn render_agents_table(agents: &mut AgentsState, frame: &mut Frame, area: ratatui::layout::Rect) {
+    let rows: Vec<Row> = agents
+        .rows
+        .iter()
+        .map(|row| {
+            let cells = agents_cells(row);
+            Row::new(vec![
+                Line::raw(cells.agent),
+                Line::raw(cells.model),
+                Line::raw(cells.effort),
+                Line::raw(cells.declared_effort),
+                Line::raw(cells.pinning),
+                Line::raw(cells.dispatches).right_aligned(),
+                Line::raw(cells.tokens).right_aligned(),
+                Line::raw(cells.cost).right_aligned(),
+            ])
+        })
+        .collect();
+
+    // `declared` / `disp` rather than the plain renderer's
+    // `declared_effort` / `dispatches`: the TUI is width-constrained
+    // in a way the plain table is not, and a header wider than its
+    // column buys nothing.
+    let header = Row::new([
+        "agent", "model", "effort", "declared", "pinning", "disp", "tokens", "cost",
+    ])
+    .style(Style::new().bold());
+
+    let table = Table::new(rows, agents_table_widths())
+        .header(header)
+        .row_highlight_style(Style::new().reversed());
+
+    frame.render_stateful_widget(table, area, &mut agents.table_state);
+}
+
+// ---- comparison overlay ----
+
+/// One agent's rows as a model × effort grid, over a repricing panel.
+///
+/// A cell holding more than one row is an agent whose dispatches
+/// disagree about pinning; the cell says so rather than merging them,
+/// because the disagreement is the finding.
+fn render_compare_overlay(state: &CompareState, catalog: &PricingCatalog, frame: &mut Frame) {
+    let area = frame.area();
+    // Wide enough for the row format below (73 columns) plus the
+    // border. Narrower clipped the delta column and the upper-bound
+    // label — and a repriced figure whose label is cut off is exactly
+    // the number this modal exists to keep qualified.
+    let popup_width = 78.min(area.width);
+    let popup_height = u16::try_from(state.rows.len() + 13)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let popup_area = centered_rect(popup_width, popup_height, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::bordered().title(format!(" Compare — {} ", state.agent_type));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let target = state.target(catalog);
+    let target = target.as_deref();
+
+    lines.push(
+        Line::from(format!(
+            " {:<20} {:<7} {:<13} {:>9} {:>9} {:>9}",
+            "model", "effort", "pinning", "cost", "repriced", "delta",
+        ))
+        .bold(),
+    );
+    // Truncated, not just padded: a real catalog key such as
+    // `claude-sonnet-4-5-20250929` is 26 characters and would shift
+    // every column right, pushing `delta` past the panel's inner
+    // width — the exact clipping the popup width exists to prevent.
+    // Scalar-aware, per the crate's count-scalars-not-bytes rule.
+    let fit_model = |model: &str| -> String {
+        const MAX: usize = 20;
+        if model.chars().count() <= MAX {
+            return model.to_string();
+        }
+        let mut out: String = model.chars().take(MAX - 1).collect();
+        out.push('\u{2026}');
+        out
+    };
+    for row in &state.rows {
+        let cells = agents_cells(row);
+        let (repriced, delta) = target.map_or_else(
+            || ("—".to_string(), "—".to_string()),
+            |t| repriced_cells(row, t, catalog),
+        );
+        lines.push(Line::from(format!(
+            " {:<20} {:<7} {:<13} {:>9} {:>9} {:>9}",
+            fit_model(&cells.model),
+            cells.effort,
+            cells.pinning,
+            cells.cost,
+            repriced,
+            delta,
+        )));
+    }
+
+    // A model × effort pair carrying more than one row is a pinning
+    // disagreement; label it rather than merging the rows away.
+    let mut seen: Vec<(Option<String>, Option<String>)> = Vec::new();
+    let mut duplicated = false;
+    for row in &state.rows {
+        let key = (row.model.clone(), row.effort.clone());
+        if seen.contains(&key) {
+            duplicated = true;
+        } else {
+            seen.push(key);
+        }
+    }
+    if duplicated {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(" Rows sharing a model and effort disagree about pinning.").dim());
+    }
+
+    lines.push(Line::raw(""));
+    match target {
+        None => lines.push(Line::from(" No catalog models to compare against.")),
+        Some(t) => {
+            let d = repriced_delta(&state.rows, t, catalog);
+            lines.push(Line::from(format!(" vs {t}")).bold());
+            if d.rows_counted == 0 {
+                lines.push(Line::from(" No comparable rows."));
+            } else {
+                let direction = if d.delta >= 0.0 { "more" } else { "less" };
+                let noun = if d.rows_counted == 1 { "row" } else { "rows" };
+                lines.push(Line::from(format!(
+                    " {} {direction} across {} {noun}",
+                    format_cost_opt(Some(d.delta.abs())),
+                    d.rows_counted,
+                )));
+            }
+            // Split across two lines rather than one long one: at
+            // this width a single line clips, and a repriced figure
+            // whose qualifier is cut off reads as a promise.
+            lines.push(Line::from(" Upper bound — the same work on another model").dim());
+            lines.push(Line::from(" produces a smaller token bundle than this one.").dim());
+            let fork_noun = if d.rows_forked == 1 { "row" } else { "rows" };
+            let unpriced_noun = if d.rows_unpriced == 1 { "row" } else { "rows" };
+            lines.push(
+                Line::from(format!(
+                    " Excluded {} fork {fork_noun} and {} unpriced {unpriced_noun}.",
+                    d.rows_forked, d.rows_unpriced,
+                ))
+                .dim(),
+            );
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(" ↑↓ target   c/Esc close").dim());
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ---- pricing overlay ----
@@ -2977,7 +3804,24 @@ mod tests {
     fn fixture_ctx() -> DataContext {
         DataContext {
             projects_dir: PathBuf::from("/nonexistent"),
-            catalog: Arc::new(PricingCatalog::default()),
+            // Holds the same two models `fixture_pricing_data` lists.
+            // In production `ctx.catalog` and `pricing.entries` are
+            // derived from one catalog and swapped together, so a
+            // fixture where they disagree would test a state the app
+            // never reaches.
+            catalog: Arc::new(
+                PricingCatalog::from_raw_json(
+                    r#"{"claude-haiku-4-5":{"input_cost_per_token":0.0000008,
+                        "output_cost_per_token":0.0000008,
+                        "cache_read_input_token_cost":0.0000008,
+                        "cache_creation_input_token_cost":0.0000008},
+                        "claude-sonnet-4-5":{"input_cost_per_token":0.000003,
+                        "output_cost_per_token":0.000015,
+                        "cache_read_input_token_cost":0.0000003,
+                        "cache_creation_input_token_cost":0.00000375}}"#,
+                )
+                .expect("fixture catalog parses"),
+            ),
             inventory: Arc::new(InventoryConfig::default()),
             query: crate::loading::Query::default(),
         }
@@ -3047,6 +3891,7 @@ mod tests {
         let slot = match &result {
             LoadResult::ShowDetail { session_id, .. } => LoadSlot::Show(session_id.clone()),
             LoadResult::InputsData { .. } => LoadSlot::Inputs,
+            LoadResult::AgentsData { .. } => LoadSlot::Agents,
             LoadResult::Pricing { .. } => LoadSlot::Pricing,
             LoadResult::SessionsData { .. }
             | LoadResult::RefreshFailed { .. }
@@ -3982,9 +4827,513 @@ mod tests {
         let output = render_app(&mut app, 120, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
-            last_line.contains("1/2 tabs") && last_line.contains("q quit"),
+            last_line.contains("1/2/3 tabs") && last_line.contains("q quit"),
             "footer should contain tab hint and quit; got: {last_line}",
         );
+    }
+
+    // --- Agents tab ---
+
+    use crate::agents::PinningKind;
+    use crate::domain::{CacheCreation, Usage};
+
+    fn fixture_agent_rows() -> Vec<AgentRow> {
+        vec![
+            AgentRow {
+                agent_type: "tw:code-reviewer".to_string(),
+                model: Some("claude-opus-5".to_string()),
+                effort: Some("high".to_string()),
+                declared_effort: None,
+                pinning: Pinning::Unpinned,
+                dispatches: 3,
+                usage: Usage {
+                    input: 1000,
+                    output: 0,
+                    cache_creation: CacheCreation::default(),
+                    cache_read: 0,
+                },
+                cost: Some(CostBreakdown {
+                    input: 1.5,
+                    ..CostBreakdown::default()
+                }),
+            },
+            AgentRow {
+                agent_type: "general-purpose".to_string(),
+                model: None,
+                effort: None,
+                declared_effort: None,
+                pinning: Pinning::NoAgentFile,
+                dispatches: 1,
+                usage: Usage {
+                    input: 10,
+                    output: 0,
+                    cache_creation: CacheCreation::default(),
+                    cache_read: 0,
+                },
+                cost: None,
+            },
+        ]
+    }
+
+    fn agents_app(rows: Vec<AgentRow>) -> App {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Agents);
+        app.agents = Some(AgentsData::Loaded(AgentsState::new(rows)));
+        app.tab = Tab::Agents;
+        app
+    }
+
+    #[test]
+    fn key_3_switches_to_agents_loading() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('3')));
+        assert_eq!(app.tab, Tab::Agents);
+        assert!(matches!(app.agents, Some(AgentsData::Loading)));
+        assert_eq!(app.pending_loads.len(), 1);
+        assert!(matches!(app.pending_loads[0], LoadRequest::AgentsRefresh));
+    }
+
+    #[test]
+    fn key_3_reuses_cached_agents() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        handle_key_event(&mut app, key_event(KeyCode::Char('3')));
+        hlr(
+            &mut app,
+            LoadResult::AgentsData {
+                result: Ok(fixture_agent_rows()),
+                refresh_fingerprint: None,
+            },
+        );
+        assert!(matches!(app.agents, Some(AgentsData::Loaded(_))));
+        app.pending_loads.clear();
+        handle_key_event(&mut app, key_event(KeyCode::Char('1')));
+        handle_key_event(&mut app, key_event(KeyCode::Char('3')));
+        assert!(matches!(app.agents, Some(AgentsData::Loaded(_))));
+        assert!(
+            app.pending_loads.is_empty(),
+            "a loaded slot must not re-dispatch",
+        );
+    }
+
+    #[test]
+    fn app_starts_on_agents_tab_when_requested() {
+        let app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Agents);
+        assert_eq!(app.tab, Tab::Agents);
+    }
+
+    #[test]
+    fn agents_tab_renders_table_columns() {
+        let mut app = agents_app(fixture_agent_rows());
+        let output = render_app(&mut app, 140, 12);
+        // `declared` / `disp`, not the plain renderer's
+        // `declared_effort` / `dispatches`: the TUI abbreviates both
+        // to fit a width-constrained column.
+        for column in [
+            "agent", "model", "effort", "declared", "pinning", "disp", "tokens", "cost",
+        ] {
+            assert!(output.contains(column), "missing {column}; got:\n{output}");
+        }
+        assert!(output.contains("tw:code-reviewer"), "{output}");
+    }
+
+    #[test]
+    fn agents_tab_renders_pinning_labels() {
+        let mut app = agents_app(fixture_agent_rows());
+        let output = render_app(&mut app, 140, 12);
+        assert!(output.contains("unpinned"), "{output}");
+        assert!(output.contains("no-agent-file"), "{output}");
+    }
+
+    #[test]
+    fn agents_tab_renders_dash_for_unknown_cost() {
+        let mut app = agents_app(fixture_agent_rows());
+        let output = render_app(&mut app, 140, 12);
+        assert!(
+            output.contains('\u{2014}'),
+            "an unpriced row renders an em dash; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn agents_tab_renders_footer_with_tab_hint() {
+        let mut app = agents_app(fixture_agent_rows());
+        let output = render_app(&mut app, 140, 12);
+        let last_line = output.lines().last().unwrap();
+        assert!(
+            last_line.contains("1/2/3 tabs") && last_line.contains("q quit"),
+            "footer should contain tab hint and quit; got: {last_line}",
+        );
+    }
+
+    #[test]
+    fn agents_tab_names_the_pinning_slice_above_the_footer() {
+        // The narrowing default emits no filter component, so this
+        // line is the only place a reader learns which kinds the
+        // visible rows cover.
+        let mut app = agents_app(fixture_agent_rows());
+        let output = render_app(&mut app, 140, 12);
+        assert!(
+            output.contains("pinning: inherit,unpinned,no-agent-file"),
+            "{output}",
+        );
+    }
+
+    #[test]
+    fn agents_empty_state_names_the_pinning_slice_at_the_default() {
+        // A filtered-to-nothing Agents tab at the default slice must
+        // still say which pinning kinds it covered.
+        let mut app = agents_app(Vec::new());
+        let output = render_app(&mut app, 140, 12);
+        assert!(
+            output.contains("pinning: inherit,unpinned,no-agent-file"),
+            "{output}",
+        );
+        assert!(output.contains("Press a to widen"), "{output}");
+    }
+
+    #[test]
+    fn tab_header_shows_agents_active() {
+        let mut app = agents_app(fixture_agent_rows());
+        let output = render_app(&mut app, 140, 12);
+        let header = output.lines().next().unwrap();
+        assert!(header.contains("[Agents]"), "got: {header}");
+        assert!(!header.contains("[Sessions]"), "got: {header}");
+    }
+
+    #[test]
+    fn tab_header_shows_agent_count() {
+        let mut app = agents_app(fixture_agent_rows());
+        let output = render_app(&mut app, 140, 12);
+        let header = output.lines().next().unwrap();
+        assert!(header.contains("2 agents"), "got: {header}");
+
+        let mut one = agents_app(vec![fixture_agent_rows().remove(0)]);
+        let output = render_app(&mut one, 140, 12);
+        let header = output.lines().next().unwrap();
+        assert!(header.contains("1 agent"), "singular; got: {header}");
+    }
+
+    #[test]
+    fn agents_key_navigation_moves_selection() {
+        let mut app = agents_app(fixture_agent_rows());
+        handle_key_event(&mut app, key_event(KeyCode::Down));
+        let Some(AgentsData::Loaded(state)) = &app.agents else {
+            panic!("agents loaded");
+        };
+        assert_eq!(state.table_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn agents_key_unknown_is_noop() {
+        let mut app = agents_app(fixture_agent_rows());
+        let quit = handle_key_event(&mut app, key_event(KeyCode::Char('z')));
+        assert!(!quit);
+        let Some(AgentsData::Loaded(state)) = &app.agents else {
+            panic!("agents loaded");
+        };
+        assert_eq!(state.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn agents_refresh_stores_the_fingerprint() {
+        // Every sibling applier stores it. Without this, the guarded
+        // tick keeps comparing against a stale fingerprint and reruns
+        // a full `load_agents` every 3s forever.
+        let mut app = agents_app(fixture_agent_rows());
+        let mut fp = RefreshFingerprint::default();
+        fp.entries
+            .insert(PathBuf::from("/x.jsonl"), (1, std::time::UNIX_EPOCH));
+        hlr(
+            &mut app,
+            LoadResult::AgentsData {
+                result: Ok(fixture_agent_rows()),
+                refresh_fingerprint: Some(fp.clone()),
+            },
+        );
+        assert_eq!(app.refresh_fingerprint, fp);
+    }
+
+    #[test]
+    fn agents_refresh_preserves_selection_by_row_key() {
+        let mut app = agents_app(fixture_agent_rows());
+        handle_key_event(&mut app, key_event(KeyCode::Down));
+        // The selected row is `general-purpose`; a refresh that
+        // reorders the rows must follow it rather than the index.
+        let mut reordered = fixture_agent_rows();
+        reordered.reverse();
+        hlr(
+            &mut app,
+            LoadResult::AgentsData {
+                result: Ok(reordered),
+                refresh_fingerprint: Some(RefreshFingerprint::default()),
+            },
+        );
+        let Some(AgentsData::Loaded(state)) = &app.agents else {
+            panic!("agents loaded");
+        };
+        assert_eq!(state.table_state.selected(), Some(0));
+        assert_eq!(state.rows[0].agent_type, "general-purpose");
+    }
+
+    #[test]
+    fn agents_refresh_falls_back_when_the_selected_row_is_gone() {
+        let mut app = agents_app(fixture_agent_rows());
+        handle_key_event(&mut app, key_event(KeyCode::Down));
+        hlr(
+            &mut app,
+            LoadResult::AgentsData {
+                result: Ok(vec![fixture_agent_rows().remove(0)]),
+                refresh_fingerprint: Some(RefreshFingerprint::default()),
+            },
+        );
+        let Some(AgentsData::Loaded(state)) = &app.agents else {
+            panic!("agents loaded");
+        };
+        assert_eq!(
+            state.table_state.selected(),
+            Some(0),
+            "the index is clamped to the shorter list",
+        );
+    }
+
+    #[test]
+    fn agents_refresh_to_empty_clears_the_selection() {
+        // A dangling index into an empty table is the one state a
+        // renderer cannot draw.
+        let mut app = agents_app(fixture_agent_rows());
+        hlr(
+            &mut app,
+            LoadResult::AgentsData {
+                result: Ok(Vec::new()),
+                refresh_fingerprint: Some(RefreshFingerprint::default()),
+            },
+        );
+        let Some(AgentsData::Loaded(state)) = &app.agents else {
+            panic!("agents loaded");
+        };
+        assert_eq!(state.table_state.selected(), None);
+    }
+
+    #[test]
+    fn agents_table_stays_legible_at_eighty_columns() {
+        // Eight columns cannot all be full width at 80, so the
+        // question is which one wins. `agent` outweighs `model`
+        // because a row whose agent name is unrecognizable cannot be
+        // acted on, while a truncated model still reads as which
+        // family it is.
+        let mut app = agents_app(fixture_agent_rows());
+        let output = render_app(&mut app, 80, 12);
+        assert!(
+            output.contains("tw:code-review"),
+            "the agent cell must stay recognizable; got:\n{output}",
+        );
+        assert!(
+            output.contains("general-purpos"),
+            "and must distinguish the rows; got:\n{output}",
+        );
+        // The model cell yields first: it is truncated here while the
+        // agent cell is not yet exhausted.
+        assert!(
+            !output.contains("claude-opus-5 "),
+            "the model cell is the one that yields; got:\n{output}",
+        );
+        assert!(output.contains("no-agent-file"), "{output}");
+    }
+
+    #[test]
+    fn a_restores_the_launch_slice_not_the_library_default() {
+        // A run started with `--pinning pinned` must come back to
+        // `pinned`, not to the default — the filter overlay has no
+        // pinning field to recover it from.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Agents);
+        let launch = PinningFilter::new(&[PinningKind::Pinned]);
+        app.ctx.query.pinning = launch.clone();
+        app.launch_pinning = launch.clone();
+        app.agents = Some(AgentsData::Loaded(AgentsState::new(fixture_agent_rows())));
+
+        handle_key_event(&mut app, key_event(KeyCode::Char('a')));
+        assert_eq!(app.ctx.query.pinning, PinningFilter::everything());
+        hlr(
+            &mut app,
+            LoadResult::AgentsData {
+                result: Ok(fixture_agent_rows()),
+                refresh_fingerprint: None,
+            },
+        );
+        handle_key_event(&mut app, key_event(KeyCode::Char('a')));
+        assert_eq!(app.ctx.query.pinning, launch);
+    }
+
+    #[test]
+    fn compare_overlay_seeds_its_target_from_compare_model() {
+        let mut app = agents_app(fixture_agent_rows());
+        let wanted = compare_targets(&app.ctx.catalog)
+            .into_iter()
+            .nth(1)
+            .expect("the fixture catalog has two or more models");
+        app.compare_model = Some(wanted.clone());
+        handle_key_event(&mut app, key_event(KeyCode::Char('c')));
+        let Some(Overlay::Compare(state)) = &app.overlay else {
+            panic!("compare overlay not open");
+        };
+        assert_eq!(
+            state.target(&app.ctx.catalog).as_deref(),
+            Some(wanted.as_str())
+        );
+    }
+
+    #[test]
+    fn invalidate_data_reloads_a_visible_agents_tab() {
+        let mut app = agents_app(fixture_agent_rows());
+        invalidate_data(&mut app);
+        assert!(matches!(app.agents, Some(AgentsData::Loading)));
+        assert!(
+            app.pending_loads
+                .iter()
+                .any(|r| matches!(r, LoadRequest::AgentsRefresh)),
+            "a visible tab must re-dispatch",
+        );
+    }
+
+    #[test]
+    fn invalidate_data_clears_an_offscreen_agents_tab() {
+        let mut app = agents_app(fixture_agent_rows());
+        app.tab = Tab::Sessions;
+        invalidate_data(&mut app);
+        assert!(app.agents.is_none(), "an offscreen slot is cleared");
+        assert!(
+            !app.pending_loads
+                .iter()
+                .any(|r| matches!(r, LoadRequest::AgentsRefresh)),
+            "and must not re-dispatch",
+        );
+    }
+
+    #[test]
+    fn a_widens_pinning_to_every_kind() {
+        let mut app = agents_app(fixture_agent_rows());
+        let before = app.ctx_generation;
+        handle_key_event(&mut app, key_event(KeyCode::Char('a')));
+        assert_eq!(app.ctx.query.pinning, PinningFilter::everything());
+        assert!(
+            app.ctx_generation > before,
+            "widening must bump the generation, or an in-flight load \
+             computed against the old slice could overwrite the new one",
+        );
+        // Widening invalidates the slot, so the tab sits in
+        // `Loading` until the reload lands — `a` is a loaded-state
+        // binding and must wait for it, as `handle_agents_key`'s
+        // dispatch order says.
+        assert!(matches!(app.agents, Some(AgentsData::Loading)));
+        hlr(
+            &mut app,
+            LoadResult::AgentsData {
+                result: Ok(fixture_agent_rows()),
+                refresh_fingerprint: None,
+            },
+        );
+        handle_key_event(&mut app, key_event(KeyCode::Char('a')));
+        assert_eq!(
+            app.ctx.query.pinning,
+            PinningFilter::default(),
+            "a second press narrows back",
+        );
+    }
+
+    #[test]
+    fn c_opens_compare_overlay_from_agents_tab() {
+        let mut app = agents_app(fixture_agent_rows());
+        handle_key_event(&mut app, key_event(KeyCode::Char('c')));
+        let Some(Overlay::Compare(state)) = &app.overlay else {
+            panic!("compare overlay not open");
+        };
+        assert_eq!(state.agent_type, "tw:code-reviewer");
+        assert_eq!(state.rows.len(), 1, "only the selected agent's rows");
+    }
+
+    #[test]
+    fn esc_closes_compare_overlay() {
+        let mut app = agents_app(fixture_agent_rows());
+        handle_key_event(&mut app, key_event(KeyCode::Char('c')));
+        assert!(app.overlay.is_some());
+        handle_key_event(&mut app, key_event(KeyCode::Esc));
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn compare_overlay_swallows_unhandled_keys() {
+        // No global binding may fire behind the overlay — matching
+        // `handle_pricing_overlay_key`'s contract.
+        let mut app = agents_app(fixture_agent_rows());
+        handle_key_event(&mut app, key_event(KeyCode::Char('c')));
+        handle_key_event(&mut app, key_event(KeyCode::Char('1')));
+        assert_eq!(app.tab, Tab::Agents, "the tab binding must not fire");
+        assert!(app.overlay.is_some(), "and the overlay stays open");
+        handle_key_event(&mut app, key_event(KeyCode::Char('f')));
+        assert!(
+            matches!(app.overlay, Some(Overlay::Compare(_))),
+            "the filter overlay must not replace it",
+        );
+    }
+
+    #[test]
+    fn compare_overlay_switches_target_model() {
+        let mut app = agents_app(fixture_agent_rows());
+        handle_key_event(&mut app, key_event(KeyCode::Char('c')));
+        let catalog = Arc::clone(&app.ctx.catalog);
+        let first = match &app.overlay {
+            Some(Overlay::Compare(s)) => s.target(&catalog),
+            _ => panic!("compare overlay not open"),
+        };
+        handle_key_event(&mut app, key_event(KeyCode::Down));
+        let second = match &app.overlay {
+            Some(Overlay::Compare(s)) => s.target(&catalog),
+            _ => panic!("compare overlay not open"),
+        };
+        assert_ne!(first, second, "the target must move");
+    }
+
+    #[test]
+    fn filter_commit_preserves_a_non_default_pinning_slice() {
+        // The regression the `to_query` base change exists to
+        // prevent: the editor writes three of `Query`'s four fields,
+        // and a commit must not reset the fourth.
+        let mut app = agents_app(fixture_agent_rows());
+        handle_key_event(&mut app, key_event(KeyCode::Char('a')));
+        assert_eq!(app.ctx.query.pinning, PinningFilter::everything());
+
+        app.overlay = Some(Overlay::Filter(Box::new(FilterEditor::from_query(
+            &app.ctx.query,
+        ))));
+        commit_filter_edit(&mut app);
+        assert_eq!(
+            app.ctx.query.pinning,
+            PinningFilter::everything(),
+            "the committed slice must survive a filter commit",
+        );
+    }
+
+    #[test]
+    fn filter_commit_still_clears_an_emptied_editor_field() {
+        // The other half of the base change: the three fields the
+        // editor *does* own must not inherit `base`'s values, or
+        // clearing a filter in the overlay would silently do nothing.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        app.ctx.query = populated_query();
+        app.overlay = Some(Overlay::Filter(Box::new(FilterEditor::from_query(
+            &app.ctx.query,
+        ))));
+        // Clear every field through the editor's own key handling, so
+        // the test exercises the path a user takes.
+        for _ in 0..6 {
+            for _ in 0..64 {
+                handle_key_event(&mut app, key_event(KeyCode::Backspace));
+            }
+            handle_key_event(&mut app, key_event(KeyCode::Tab));
+        }
+        commit_filter_edit(&mut app);
+        assert_eq!(app.ctx.query.sessions, SessionFilter::default());
+        assert_eq!(app.ctx.query.thresholds, ThresholdsFilter::default());
+        assert!(app.ctx.query.inputs_session_id.is_none());
     }
 
     #[test]
@@ -4028,8 +5377,8 @@ mod tests {
         let output = render_app(&mut app, 80, 10);
         let last_line = output.lines().last().unwrap();
         assert!(
-            last_line.contains("1/2 tabs"),
-            "list footer should contain '1/2 tabs'; got: {last_line}",
+            last_line.contains("1/2/3 tabs"),
+            "list footer should contain '1/2/3 tabs'; got: {last_line}",
         );
     }
 
@@ -5778,6 +7127,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_agents_dispatch_yields_to_a_running_load() {
+        // Asserted on the reservation count, which is settled by the
+        // time `drain_pending_loads` returns — an empty result channel
+        // would pass both when the dispatch was suppressed and when it
+        // merely has not reached its `send`.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Agents);
+        let (tx, _rx) = load_channel();
+        assert!(app.try_reserve(LoadSlot::Agents, false));
+        app.pending_loads.push(LoadRequest::Refresh {
+            scope: RefreshScope::Agents,
+            guard: Some(RefreshFingerprint::default()),
+        });
+        drain_pending_loads(&mut app, &tx);
+        assert_eq!(
+            holders(&app, &LoadSlot::Agents),
+            1,
+            "a guarded dispatch must not add a second equivalent load",
+        );
+    }
+
+    #[tokio::test]
+    async fn unguarded_agents_dispatch_is_not_suppressed_by_a_guarded_one() {
+        // A guarded load can answer `NoChange`, which no applier turns
+        // into data — so it answers nobody, and suppressing the
+        // unguarded dispatch behind it would strand the tab in
+        // `Loading` forever.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Agents);
+        let (tx, _rx) = load_channel();
+        assert!(app.try_reserve(LoadSlot::Agents, true));
+        app.pending_loads.push(LoadRequest::AgentsRefresh);
+        drain_pending_loads(&mut app, &tx);
+        assert_eq!(
+            holders(&app, &LoadSlot::Agents),
+            2,
+            "the forced load runs alongside the guarded one",
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_generation_agents_result_releases_nothing() {
+        // `bump_ctx_generation` already dropped this result's
+        // reservation; releasing by key on arrival would free a
+        // *fresh* dispatch's slot and license a duplicate load.
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Agents);
+        app.bump_ctx_generation();
+        assert!(app.try_reserve(LoadSlot::Agents, false));
+        assert_eq!(holders(&app, &LoadSlot::Agents), 1);
+        handle_load_result(
+            &mut app,
+            StampedResult {
+                generation: 0,
+                slot: LoadSlot::Agents,
+                guarded: false,
+                result: LoadResult::AgentsData {
+                    result: Ok(fixture_agent_rows()),
+                    refresh_fingerprint: None,
+                },
+            },
+        );
+        assert_eq!(
+            holders(&app, &LoadSlot::Agents),
+            1,
+            "the fresh reservation must survive a stale result",
+        );
+    }
+
+    #[tokio::test]
     async fn unguarded_dispatch_yields_to_another_unguarded_load() {
         // That one *will* produce a result an applier consumes, so a
         // second is pure duplicated work.
@@ -6182,7 +7598,9 @@ mod tests {
     fn filter_editor(app: &App) -> &FilterEditor {
         match &app.overlay {
             Some(Overlay::Filter(editor)) => editor,
-            Some(Overlay::Pricing) | None => panic!("filter overlay not open"),
+            Some(Overlay::Pricing | Overlay::Compare(_)) | None => {
+                panic!("filter overlay not open")
+            }
         }
     }
 
@@ -6200,7 +7618,7 @@ mod tests {
                 min_cost: Some(0.5),
             },
             inputs_session_id: Some("aaaa1111-2222-3333-4444-555555555555".to_string()),
-            pinning: crate::agents::PinningFilter::default(),
+            pinning: PinningFilter::default(),
         }
     }
 
@@ -6244,7 +7662,7 @@ mod tests {
             "a seeded editor must start entirely Ok",
         );
         assert!(editor.is_committable());
-        assert_eq!(editor.to_query(), query);
+        assert_eq!(editor.to_query(&query), query);
     }
 
     #[test]

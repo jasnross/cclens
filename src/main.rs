@@ -13,7 +13,7 @@ use cclens::pricing;
 use cclens::rendering::{
     render_agents, render_inputs, render_prices, render_session, render_table,
 };
-use cclens::tui::{Tab, run_tui};
+use cclens::tui::{Tab, run_tui, run_tui_with_compare_model};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::{
@@ -276,20 +276,44 @@ fn run_agents(
             pinning: pinning_filter.clone(),
         },
     };
-    let rows = loading::load_agents(&ctx)?;
-
     match mode {
         RenderMode::Json => {
+            let rows = loading::load_agents(&ctx)?;
             let output = AgentsOutput {
                 rows: &rows,
                 repriced: compare_model.map(|t| repriced_delta(&rows, t, &catalog)),
             };
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
-        // No Tui arm yet: `Tab::Agents` does not exist, so the
-        // interactive path cannot be built here. Both modes render the
-        // plain table, as `run_pricing` already does for `List`.
-        RenderMode::Tui | RenderMode::Plain => {
+        RenderMode::Tui => {
+            // The Sessions tab is reachable from this entry point (key
+            // `1`), and the TUI applies `ctx.query` uniformly to every
+            // view — so the initial Sessions-tab render must be seeded
+            // from the same context every subsequent refresh runs
+            // against, exactly as `run_inputs` does.
+            // No `load_agents` here: the TUI dispatches its own
+            // `AgentsRefresh` at startup, so a scan run now would be
+            // discarded — and its failure would abort startup rather
+            // than surface as `AgentsData::Error`.
+            let sessions = loading::load_sessions(&ctx)?;
+            let pricing_data = loading::pricing_data(&catalog);
+            let initial_fingerprint = loading::build_fingerprint(projects_dir).unwrap_or_default();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let result = rt.block_on(run_tui_with_compare_model(
+                ctx,
+                sessions,
+                initial_fingerprint,
+                pricing_data,
+                Tab::Agents,
+                compare_model.map(str::to_string),
+            ));
+            rt.shutdown_timeout(std::time::Duration::from_millis(100));
+            result?;
+        }
+        RenderMode::Plain => {
+            let rows = loading::load_agents(&ctx)?;
             let compare = compare_model.map(|t| (t, catalog.as_ref()));
             println!("{}", render_agents(&rows, &pinning_filter, compare));
             if rows.is_empty() {

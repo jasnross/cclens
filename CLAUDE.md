@@ -192,9 +192,20 @@ views         ← shared per-row cell builders — SessionCells (list),
                 and comfy-table alignment, tui wraps the same cells in
                 ratatui Row/Line widgets with styling and constraints
 tui           ← run_tui event loop and app state for the interactive
-                list + inputs tabs; Tab (Sessions | Inputs), session
-                drill-down, pricing and filter overlays, status
-                footer; consumes loading::DataContext and its load
+                list + inputs + agents tabs; Tab (Sessions | Inputs |
+                Agents) switched by 1/2/3, session drill-down, pricing
+                / filter / compare overlays, status footer; the Agents
+                tab binds `c` (comparison modal: one agent's rows over
+                a repricing panel whose target ↑/↓ switch) and `a`
+                (widen the pinning slice to every kind and back,
+                committing through invalidate_data so the generation
+                bump happens at one site), and names the active
+                pinning slice above its footer because the narrowing
+                default emits no filter component;
+                FilterEditor::to_query takes the committed Query as a
+                base — the editor writes three of Query's four fields
+                and must preserve the rest;
+                consumes loading::DataContext and its load
                 functions directly, with no dependency-inversion layer;
                 async loads go through the dispatch protocol below
 ```

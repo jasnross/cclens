@@ -98,7 +98,7 @@ pub enum TurnOrigin {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct Usage {
     pub input: u64,
     pub output: u64,

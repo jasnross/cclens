@@ -162,7 +162,7 @@ impl PinningKind {
 /// `cost` is `None` when any contributing dispatch priced to `None` —
 /// strict propagation, never a partial sum presented as a total. The
 /// token figures still reflect every dispatch.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentRow {
     pub agent_type: String,
     pub model: Option<String>,
