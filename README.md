@@ -1,6 +1,6 @@
 # cclens
 
-A tiny Rust CLI that lists your Claude Code conversations: when they happened, what project they were in, what they were about, and how many tokens they consumed. It reads `~/.claude/projects/` and prints a plain aligned table to stdout.
+A tiny Rust CLI that lists your Claude Code conversations: when they happened, what project they were in, what they were about, and how many tokens they consumed. It reads `~/.claude/projects/` and renders either an interactive TUI or a plain aligned table on stdout, depending on `--format` (see [Commands](#commands)).
 
 ## Install
 
@@ -10,9 +10,16 @@ cargo install --path .
 
 ## Commands
 
+All subcommands accept a global `--format` flag:
+
+- `--format plain` — plain aligned tables on stdout
+- `--format json` — machine-readable JSON
+
+When `--format` is omitted, cclens launches an interactive TUI if stdout is a terminal, and falls back to `plain` otherwise (piped or redirected output).
+
 ### list
 
-Bare invocation lists all sessions sorted oldest-first:
+Bare invocation covers all sessions, sorted oldest-first. With `--format plain` (or piped output) that renders as a table:
 
 ```sh
 $ cclens
@@ -101,11 +108,23 @@ The same scope flags described under [Filtering](#filtering) — `--project`, `-
 
 `--min-tokens` / `--min-cost` apply as row-level filters on the rendered table (the per-tier coverage line below the table reflects every session in scope, not just the rows kept).
 
+#### Columns
+
+- **file** — path to the context file, with the home directory shown as `~`, truncated with `…`.
+- **kind** — what the file is: `global` (`~/.claude/CLAUDE.md`), `rule`, `skill`, `agent`, plugin-shipped, or project-local.
+- **tier** — the cache-creation tier the file was observed loading at: `1h`, `5m`, `1h+5m` when both (parent and subagent on different tiers), or `—` when the file is in scope but no session loaded it.
+- **tokens** — the file's own size in `cl100k_base` tokens.
+- **loads** — how many times the file was loaded, summed across both tiers.
+- **billed** — estimated tokens actually billed across those loads.
+- **attributed_cost** — per-file USD estimate (`$X.XXXX`). Named apart from the `cost` column in `list` and `show` because those are billed totals and this is an estimate. Renders `—` when the cost is unknown.
+
 The empty-result behavior matches `list`: if every row is dropped, stdout still prints the header, stderr prints `note: no rows matched <flags>`, and the exit code is 0.
 
 ### pricing
 
 `cclens pricing refresh` re-fetches the LiteLLM catalog and overwrites the cache atomically. `cclens pricing info` prints the cache path, size, last-modified time, and Claude-entry count.
+
+`cclens pricing list` shows per-model rates for every Claude entry in the catalog — columns `model`, `tier`, `input`, `output`, `cache_rd`, `cache_5m`, `cache_1h`, in $/MTok. Models whose ≤200k and >200k rates differ render as two rows (`≤200k`, `>200k`); uniform models render as one. `--all` additionally includes provider/region-prefixed keys (`bedrock`, `vertex_ai`, …) alongside the bare `claude-*` ones.
 
 The catalog is fetched on first run (one synchronous HTTPS GET to `raw.githubusercontent.com`). It does not auto-expire; refresh is explicit. If the fetch fails, every cost cell renders `—` and a single stderr warning is printed — `list` and `show` still work.
 
