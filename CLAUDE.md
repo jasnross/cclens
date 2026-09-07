@@ -27,7 +27,7 @@ This bias toward refactoring does not override scope discipline. Improve what yo
 
 ```sh
 just check                      # fmt + lint + build + test (the full suite)
-just fmt                        # cargo fmt
+just fmt                        # just --fmt + cargo +nightly fmt + cargo fix + prettier
 just lint                       # clippy on all targets, warnings-as-errors
 just test                       # run tests
 just build                      # build only
@@ -36,10 +36,10 @@ just install                    # cargo install --path .
 # Or without just:
 cargo build
 cargo test
-cargo fmt --check               # verify formatting without writing (what CI runs)
+cargo fmt --check               # verify formatting without writing
 cargo clippy --all-targets -- -D warnings
 
-# Run a single unit test (inline module in src/main.rs):
+# Run a single unit test (in src/aggregation.rs):
 cargo test extract_title_from_slash_command_with_args
 
 # Run a single integration test (tests/listing.rs):
@@ -143,6 +143,20 @@ filter        ← ThresholdsFilter / SessionFilter value types — the
                 lenient YYYY-MM-DD-or-RFC-3339 parser and its
                 shortest-spelling inverse) and parse_min_cost (rejects
                 negative / non-finite thresholds on both surfaces)
+formatting    ← shared per-value display helpers: format_cost_opt,
+                format_local, display_path, and the coverage_line /
+                coverage_half pair; consumed by both rendering and tui
+views         ← shared per-row cell builders — SessionCells (list),
+                ShowRowCells (show), InputsCells (inputs),
+                pricing_view_rows, SessionTotals — mapping domain
+                types to cell values; rendering applies truncate_title
+                and comfy-table alignment, tui wraps the same cells in
+                ratatui Row/Line widgets with styling and constraints
+tui           ← run_tui event loop and app state for the interactive
+                list + inputs tabs; Tab (Sessions | Inputs), session
+                drill-down, pricing and filter overlays, status
+                footer; consumes loading::DataContext and its load
+                functions directly, with no dependency-inversion layer
 ```
 
 Binary entry point (`src/main.rs`):
@@ -154,8 +168,10 @@ Binary entry point (`src/main.rs`):
 Binary CLI submodule (`src/cli.rs`):
 
 - `Cli` / `Command` / `PricingAction` clap parser types.
-- `FilterArgs` — flattened `--min-tokens` / `--min-cost` flags with a `.thresholds()` constructor that produces a library `Thresholds`.
-- `emit_empty_result_hint`.
+- `ThresholdsFilterArgs` — flattened `--min-tokens` / `--min-cost` flags with a `.thresholds_filter()` constructor that produces a library `ThresholdsFilter`.
+- `SessionFilterArgs` — flattened `--project` / `--since` / `--until` scope flags with a `.session_filter()` constructor that produces a library `SessionFilter`.
+- `InputsArgs` — the `inputs`-only `--session` flag, with a `.session_id()` accessor.
+- `emit_empty_result_hint` and `emit_inputs_empty_hint`.
 
 Each library module file opens with a `//!` doc comment listing its public API surface. The gityard repo is the reference for the split's overall shape (flat `src/<name>.rs` files, `lib.rs` of pure `pub mod` declarations, `main.rs` with binary-only `mod cli;`).
 
@@ -187,7 +203,7 @@ This is enforced by `let Ok(...) = ... else { continue }` at each layer and by i
 
 ### Colocate code with its consumer
 
-Place helpers in the section that calls them, not in a generic `util` bucket. If a function has one caller, it belongs next to that caller. The banner sections in `main.rs` encode this: `extract_title`, `extract_slash_command_title`, and the `SYNTHETIC_USER_CONTENT_PREFIXES` constant all live in `aggregation` because that's the only place they run.
+Place helpers in the section that calls them, not in a generic `util` bucket. If a function has one caller, it belongs next to that caller. The `aggregation` module encodes this: `extract_title`, `extract_slash_command_title`, and the `SYNTHETIC_USER_CONTENT_PREFIXES` constant all live there because that's the only place they run.
 
 ### Count scalars, not bytes
 
