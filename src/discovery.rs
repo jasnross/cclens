@@ -57,15 +57,22 @@ pub struct SubagentPaths {
 /// Parsed contents of a subagent `.meta.json` sidecar.
 ///
 /// The on-disk schema observed in real Claude Code data is
-/// `{"agentType": "<name>", "description": "<text>"}`. cclens exposes
-/// both fields: `agent_type` is consumed by the inputs pipeline for
-/// agent-row crediting, and `description` is consumed by the show
-/// renderer for per-invocation labels. Older sidecars without a
-/// `description` field deserialize cleanly (the field is `Option`).
+/// `{"agentType": "<name>", "description": "<text>", "isFork": <bool>}`.
+/// cclens exposes all three: `agent_type` is consumed by the inputs
+/// pipeline for agent-row crediting, `description` by the show
+/// renderer for per-invocation labels, and `is_fork` distinguishes a
+/// fork of the parent from a fresh agent. Sidecars omitting
+/// `description` or `isFork` deserialize cleanly.
 #[derive(Debug)]
 pub struct SubagentMeta {
     pub agent_type: String,
     pub description: Option<String>,
+    /// Whether the dispatch was a fork of its parent rather than a
+    /// fresh agent. `isFork` is undocumented in the official sidecar
+    /// schema and a sidecar may omit it, so `serde(default)` reads an
+    /// absent key as `false` — the required degradation for a field
+    /// cclens cannot require to be present.
+    pub is_fork: bool,
 }
 
 /// On-disk shape of a subagent `.meta.json` sidecar. Unknown fields
@@ -78,6 +85,8 @@ struct RawSubagentMeta {
     agent_type: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(rename = "isFork", default)]
+    is_fork: bool,
 }
 
 /// # Errors
@@ -227,6 +236,7 @@ pub fn read_subagent_meta(path: &Path) -> Option<SubagentMeta> {
     Some(SubagentMeta {
         agent_type: raw.agent_type,
         description: raw.description,
+        is_fork: raw.is_fork,
     })
 }
 
@@ -426,6 +436,22 @@ mod tests {
         let path = tmp.path().join("bad.meta.json");
         stdfs::write(&path, "{not valid json").unwrap();
         assert!(read_subagent_meta(&path).is_none());
+    }
+
+    #[test]
+    fn read_subagent_meta_reads_is_fork() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fork.meta.json");
+        stdfs::write(&path, r#"{"agentType":"fork","isFork":true}"#).unwrap();
+        assert!(read_subagent_meta(&path).expect("should parse").is_fork);
+    }
+
+    #[test]
+    fn read_subagent_meta_defaults_is_fork_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("plain.meta.json");
+        stdfs::write(&path, r#"{"agentType":"tw-code-reviewer"}"#).unwrap();
+        assert!(!read_subagent_meta(&path).expect("should parse").is_fork);
     }
 
     #[test]

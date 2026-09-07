@@ -13,6 +13,11 @@
 //!   typed records the walker emits.
 //! - `InventoryConfig` — overridable filesystem roots; production
 //!   callers use `Default::default()`, tests construct directly.
+//! - `AgentFrontmatter` / `read_agent_frontmatter(&Path)` — one agent
+//!   file's declared `model` / `effort`, read from its leading `---`
+//!   block. A separate entry point, called per file by whoever needs
+//!   a declaration: the walk itself parses no frontmatter, so a
+//!   `ContextFile` carries only path, kind, tokens, and scope.
 //!
 //! Per-entry graceful degradation: an unreadable rule file, an
 //! unparseable `installed_plugins.json`, or a tokenizer failure on one
@@ -60,6 +65,10 @@ pub enum ContextFileKind {
     PluginAgent {
         plugin: String,
         marketplace: String,
+        /// The plugin's `.claude-plugin/plugin.json` `name`, which is
+        /// what the harness prefixes a dispatch's `agentType` with.
+        /// `None` when the plugin ships no readable manifest.
+        namespace: Option<String>,
     },
     /// Any `CLAUDE.md` found by the cwd-ancestor walk in
     /// `walk_for_session`.
@@ -151,7 +160,14 @@ impl ContextFile {
     /// Mapping:
     /// - Agent kinds (`UserAgent`, `PluginAgent`, `ProjectLocalAgent`):
     ///   the file stem (`tw-code-reviewer.md` → `tw-code-reviewer`),
-    ///   matched against `SessionKind::Subagent { agent_type }`.
+    ///   matched against `SessionKind::Subagent { agent_type }`. A
+    ///   plugin agent's identifier additionally carries its plugin's
+    ///   namespace (`tw:code-reviewer`), read from the plugin's
+    ///   `.claude-plugin/plugin.json` `name` field, because that is
+    ///   what the harness names the dispatch. Neither the install path
+    ///   nor the `installed_plugins.json` key carries that name, so
+    ///   the manifest is the only source for it; a plugin shipping no
+    ///   readable manifest falls back to the bare stem.
     /// - Skill kinds (`UserSkill`, `PluginSkill`,
     ///   `ProjectLocalSkill`): the parent directory's name (skills are
     ///   subdir-keyed at `<root>/skills/<name>/SKILL.md`), matched
@@ -166,14 +182,22 @@ impl ContextFile {
     ///   inherits scope) regardless of any harness identifier.
     #[must_use]
     pub fn identifier(&self) -> Option<String> {
-        match &self.kind {
-            ContextFileKind::UserAgent
-            | ContextFileKind::PluginAgent { .. }
-            | ContextFileKind::ProjectLocalAgent
-            | ContextFileKind::ProjectLocalCommand => self
-                .path
+        let stem = || {
+            self.path
                 .file_stem()
-                .map(|s| s.to_string_lossy().into_owned()),
+                .map(|s| s.to_string_lossy().into_owned())
+        };
+        match &self.kind {
+            ContextFileKind::PluginAgent {
+                namespace: Some(ns),
+                ..
+            } => stem().map(|s| format!("{ns}:{s}")),
+            ContextFileKind::UserAgent
+            | ContextFileKind::PluginAgent {
+                namespace: None, ..
+            }
+            | ContextFileKind::ProjectLocalAgent
+            | ContextFileKind::ProjectLocalCommand => stem(),
             ContextFileKind::UserSkill
             | ContextFileKind::PluginSkill { .. }
             | ContextFileKind::ProjectLocalSkill => self
@@ -249,6 +273,95 @@ struct RawInstalledPlugins {
 struct RawPluginInstance {
     #[serde(rename = "installPath")]
     install_path: String,
+}
+
+/// Shape of `<installPath>/.claude-plugin/plugin.json`. Only `name`
+/// is read — it is the namespace the harness prefixes a plugin
+/// agent's `agentType` with.
+#[derive(Deserialize)]
+struct RawPluginManifest {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Read a plugin's declared namespace from its manifest. A missing,
+/// unreadable, or unparseable manifest yields `None` with no warning —
+/// a plugin shipping no manifest is not an error condition for cclens,
+/// it just means its agent files keep their bare stems.
+fn read_plugin_namespace(install_path: &Path) -> Option<String> {
+    let body = fs::read_to_string(install_path.join(".claude-plugin/plugin.json")).ok()?;
+    let manifest: RawPluginManifest = serde_json::from_str(&body).ok()?;
+    manifest.name
+}
+
+// ---- agent frontmatter ----
+
+/// Leading `---` block of a context file. Only `model` and `effort`
+/// are named — the two keys that describe what an agent file asks its
+/// dispatches to run as; serde ignores the rest.
+#[derive(Debug, Default, Deserialize)]
+struct RawAgentFrontmatter {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+/// One agent file's declared intent, read verbatim from its
+/// frontmatter. No site compares these to an observed value.
+#[derive(Debug, Default)]
+pub struct AgentFrontmatter {
+    /// A concrete model name, the `inherit` sentinel, or `None` for
+    /// an absent key. The three are distinct classifications.
+    pub declared_model: Option<String>,
+    pub declared_effort: Option<String>,
+}
+
+/// Return the slice between a leading `---` line and the next line
+/// that is exactly `---` or `...`. Returns `None` when the text does
+/// not open with `---`, or when no closing line follows.
+fn extract_frontmatter_block(text: &str) -> Option<&str> {
+    let rest = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))?;
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        // `trim_end`, not `trim`: YAML permits trailing whitespace
+        // after a document delimiter (a `--- ` that failed to close
+        // would silently discard the whole block), but a delimiter
+        // must start at column 0 — an indented `---` is ordinary
+        // block content.
+        let trimmed = line.trim_end();
+        if trimmed == "---" || trimmed == "..." {
+            return Some(&rest[..offset]);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Parse `path`'s leading `---` block. An unreadable file, an absent
+/// block, or unparseable YAML all yield the default — one bad agent
+/// file costs one classification, never the walk.
+///
+/// Degradation is per file, not per key: an ill-typed `effort` fails
+/// the whole block and discards a valid `model` alongside it. Both
+/// keys describe the same declaration, so a half-read block would
+/// report a file as declaring less than it does — less honest than
+/// reporting it as declaring nothing.
+#[must_use]
+pub fn read_agent_frontmatter(path: &Path) -> AgentFrontmatter {
+    let Ok(text) = fs::read_to_string(path) else {
+        return AgentFrontmatter::default();
+    };
+    let Some(block) = extract_frontmatter_block(&text) else {
+        return AgentFrontmatter::default();
+    };
+    let raw: RawAgentFrontmatter = serde_yaml_bw::from_str(block).unwrap_or_default();
+    AgentFrontmatter {
+        declared_model: raw.model,
+        declared_effort: raw.effort,
+    }
 }
 
 // ---- tokenizer ----
@@ -451,12 +564,14 @@ fn walk_plugins(config: &InventoryConfig) -> Vec<ContextFile> {
         // Agents: <installPath>/agents/*.md
         let plugin_for_agents = plugin_owned;
         let market_for_agents = market_owned;
+        let namespace = read_plugin_namespace(&install_path);
         collect_md_files_in_dir(
             &install_path.join("agents"),
             &mut out,
             move || ContextFileKind::PluginAgent {
                 plugin: plugin_for_agents.clone(),
                 marketplace: market_for_agents.clone(),
+                namespace: namespace.clone(),
             },
             &Scope::Global,
         );
@@ -890,6 +1005,165 @@ mod tests {
         }
     }
 
+    // --- read_agent_frontmatter ---
+
+    fn write_agent(tmp: &Path, name: &str, body: &str) -> PathBuf {
+        let path = tmp.join(name);
+        stdfs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_agent_frontmatter_reads_model_and_effort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_agent(
+            tmp.path(),
+            "a.md",
+            "---\nname: a\nmodel: claude-opus-5\neffort: high\n---\n\nBody.\n",
+        );
+        let fm = read_agent_frontmatter(&path);
+        assert_eq!(fm.declared_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(fm.declared_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn read_agent_frontmatter_reads_inherit_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_agent(tmp.path(), "a.md", "---\nmodel: inherit\n---\nBody\n");
+        assert_eq!(
+            read_agent_frontmatter(&path).declared_model.as_deref(),
+            Some("inherit"),
+        );
+    }
+
+    #[test]
+    fn read_agent_frontmatter_without_a_block_yields_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_agent(tmp.path(), "a.md", "# Just a heading\n\nmodel: nope\n");
+        let fm = read_agent_frontmatter(&path);
+        assert!(fm.declared_model.is_none());
+        assert!(fm.declared_effort.is_none());
+    }
+
+    #[test]
+    fn read_agent_frontmatter_malformed_yields_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `[unclosed` is not valid YAML — one bad file degrades to a
+        // missing classification rather than an error.
+        let path = write_agent(tmp.path(), "a.md", "---\nmodel: [unclosed\n---\nBody\n");
+        let fm = read_agent_frontmatter(&path);
+        assert!(fm.declared_model.is_none());
+        assert!(fm.declared_effort.is_none());
+    }
+
+    #[test]
+    fn read_agent_frontmatter_missing_file_yields_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fm = read_agent_frontmatter(&tmp.path().join("absent.md"));
+        assert!(fm.declared_model.is_none());
+        assert!(fm.declared_effort.is_none());
+    }
+
+    #[test]
+    fn read_agent_frontmatter_terminated_by_dots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_agent(
+            tmp.path(),
+            "a.md",
+            "---\nmodel: claude-sonnet-5\n...\nBody\n",
+        );
+        assert_eq!(
+            read_agent_frontmatter(&path).declared_model.as_deref(),
+            Some("claude-sonnet-5"),
+        );
+    }
+
+    #[test]
+    fn walk_does_not_parse_frontmatter() {
+        // The walk records path, kind, tokens, and scope only — the
+        // agents view's vocabulary stays off the inputs view's record.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = build_global_tree(tmp.path());
+        stdfs::create_dir_all(config.claude_home.join("agents")).unwrap();
+        stdfs::write(
+            config.claude_home.join("agents/pinned.md"),
+            "---\nmodel: claude-opus-5\n---\n\nAgent body.\n",
+        )
+        .unwrap();
+
+        let files = discover_inventory(&config);
+        assert_eq!(files.len(), 1);
+        let f = &files[0];
+        assert!(matches!(f.kind, ContextFileKind::UserAgent));
+        assert!(f.tokens > 0);
+        // The declared model is reachable only through the separate
+        // reader, never off the walked record.
+        assert_eq!(
+            read_agent_frontmatter(&f.path).declared_model.as_deref(),
+            Some("claude-opus-5"),
+        );
+    }
+
+    // --- plugin agent namespacing ---
+
+    /// Write a plugin at `<tmp>/plug` shipping one agent file, with a
+    /// `.claude-plugin/plugin.json` naming `namespace` when given, and
+    /// return the walked inventory.
+    fn walk_plugin_with_namespace(tmp: &Path, namespace: Option<&str>) -> Vec<ContextFile> {
+        let config = build_global_tree(tmp);
+        let install_path = tmp.join("plug");
+        stdfs::create_dir_all(install_path.join("agents")).unwrap();
+        stdfs::write(install_path.join("agents/sample-agent.md"), "agent\n").unwrap();
+        if let Some(ns) = namespace {
+            stdfs::create_dir_all(install_path.join(".claude-plugin")).unwrap();
+            stdfs::write(
+                install_path.join(".claude-plugin/plugin.json"),
+                format!(r#"{{"name":"{ns}"}}"#),
+            )
+            .unwrap();
+        }
+        stdfs::create_dir_all(config.claude_home.join("plugins")).unwrap();
+        stdfs::write(
+            &config.installed_plugins_path,
+            format!(
+                r#"{{"plugins":{{"p@m":[{{"installPath":{path:?}}}]}}}}"#,
+                path = install_path.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        walk_plugins(&config)
+    }
+
+    #[test]
+    fn plugin_agent_identifier_carries_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = walk_plugin_with_namespace(tmp.path(), Some("tp"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].identifier().as_deref(), Some("tp:sample-agent"));
+    }
+
+    #[test]
+    fn plugin_agent_without_manifest_keeps_bare_stem() {
+        // No manifest means no namespace to prefix — the bare stem
+        // matches no namespaced dispatch, so the file classifies as
+        // absent rather than being credited to the wrong dispatch.
+        let tmp = tempfile::tempdir().unwrap();
+        let files = walk_plugin_with_namespace(tmp.path(), None);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].identifier().as_deref(), Some("sample-agent"));
+    }
+
+    #[test]
+    fn user_agent_identifier_is_unchanged_by_namespacing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = build_global_tree(tmp.path());
+        stdfs::create_dir_all(config.claude_home.join("agents")).unwrap();
+        stdfs::write(config.claude_home.join("agents/plain.md"), "agent\n").unwrap();
+        let files = walk_global(&config);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].identifier().as_deref(), Some("plain"));
+    }
+
     #[test]
     fn identifier_returns_file_stem_for_agent_kinds() {
         assert_eq!(
@@ -912,7 +1186,8 @@ mod tests {
                 "/cache/plug/agents/some-agent.md",
                 ContextFileKind::PluginAgent {
                     plugin: "p".into(),
-                    marketplace: "m".into()
+                    marketplace: "m".into(),
+                    namespace: None,
                 }
             )
             .identifier()

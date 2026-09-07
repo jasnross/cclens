@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use common::{
+    agent_namespace_projects_fixture_dir, build_agent_namespace_claude_home,
     build_inputs_claude_home, cclens_inputs_command, copy_dir_recursive,
     inputs_projects_fixture_dir, pricing_fixture_url,
 };
@@ -500,6 +501,44 @@ fn inputs_subagent_without_cwd_inherits_parent_cwd_for_attribution() {
     assert_eq!(
         with_agent_loads, 1,
         "cwd-less subagent should still credit the matching agent file via the parent-cwd fallback\n\n{with_subagents}",
+    );
+}
+
+#[test]
+fn plugin_agent_file_is_credited_by_a_namespaced_dispatch() {
+    // A dispatch's `agentType` reads `tp:sample-agent`; the plugin
+    // agent file's identifier carries the same namespace, so the row
+    // reports a load and non-zero billed tokens. Isolated in both its
+    // fixture tree and its claude-home so no existing inputs
+    // assertion moves.
+    let cache = isolated_tempdir();
+    let claude_home_owner = isolated_tempdir();
+    let claude_home = build_agent_namespace_claude_home(claude_home_owner.path());
+    let stdout = run_inputs_against(
+        cache.path(),
+        &claude_home,
+        &agent_namespace_projects_fixture_dir(),
+    );
+
+    // The `file` cell renders a truncated tempdir path, so the row is
+    // identified by its kind label instead.
+    let row = stdout
+        .lines()
+        .find(|l| l.contains("plugin:tp-plugin:agent"))
+        .unwrap_or_else(|| panic!("no plugin agent row in:\n{stdout}"));
+    // Columns after split_whitespace (fixture rows carry no cell with
+    // an internal space):
+    //   0: file  1: kind  2: tier  3: tokens  4: loads  5: billed  6: cost
+    let cols: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(
+        cols.get(4),
+        Some(&"1"),
+        "loads column (idx 4) should be 1; row: {row}\n(cols: {cols:?})",
+    );
+    assert_ne!(
+        cols.get(5),
+        Some(&"0.00k"),
+        "billed column (idx 5) should be non-zero; row: {row}\n(cols: {cols:?})",
     );
 }
 

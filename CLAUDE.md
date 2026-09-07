@@ -105,8 +105,8 @@ discovery     ← projects_dir walk → ProjectSessions { project_dir,
                 [SubagentPaths { jsonl, meta }] }] }; per-session
                 three-level walk into <stem>/subagents/ for
                 agent-*.jsonl + .meta.json sidecars; read_subagent_meta
-                helper for the sidecar (returns SubagentMeta with both
-                agent_type and optional description)
+                helper for the sidecar (returns SubagentMeta with
+                agent_type, optional description, and is_fork)
 inventory     ← walks ~/.claude/{CLAUDE.md,rules,skills,agents},
                 plugin cache, and per-session ancestor + project-local
                 context; tokenizes via tiktoken_rs cl100k_base;

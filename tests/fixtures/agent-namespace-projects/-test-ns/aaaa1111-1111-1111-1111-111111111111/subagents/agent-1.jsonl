@@ -1,0 +1,1 @@
+{"type":"assistant","timestamp":"2026-04-15T10:00:30Z","cwd":"/proj-ns","message":{"id":"msg_s1","model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":500,"ephemeral_1h_input_tokens":0},"cache_read_input_tokens":0},"content":[{"type":"text","text":"agent reply"}]},"requestId":"req_s1"}

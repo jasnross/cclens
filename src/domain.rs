@@ -2,8 +2,8 @@
 //!
 //! Public API:
 //! - `Session` — aggregated per-session record (id, project, totals).
-//! - `Turn` — single-line record (role, model, usage, content, cwd,
-//!   origin).
+//! - `Turn` — single-line record (role, model, effort, usage, content,
+//!   cwd, origin).
 //! - `Role` — typed enum over Claude Code's `.type` field.
 //! - `TurnOrigin` — discriminates a parent-session turn (`Parent`) from
 //!   a subagent-transcript turn (`Subagent { agent_type, description }`).
@@ -50,6 +50,11 @@ pub struct Turn {
     pub timestamp: Option<DateTime<Utc>>,
     pub role: Role,
     pub model: Option<String>,
+    /// The line's top-level `effort` key — the reasoning effort the
+    /// run executed at. `None` where the line carries no such key,
+    /// which is the honest reading: the transcript records no effort
+    /// for that turn, rather than recording a default level.
+    pub effort: Option<String>,
     pub message_id: Option<String>,
     pub request_id: Option<String>,
     pub usage: Option<Usage>,

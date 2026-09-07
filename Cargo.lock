@@ -83,6 +83,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "assert_cmd"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -231,6 +237,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml_bw",
  "tempfile",
  "thiserror 2.0.18",
  "tiktoken-rs",
@@ -778,6 +785,16 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
+]
+
+[[package]]
+name = "granit-parser"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65ec0d45986cd51c847c75c5b69a00852c4fc84d0e5e79f041173f73437d0cdf"
+dependencies = [
+ "arraydeque",
+ "smallvec",
 ]
 
 [[package]]
@@ -1812,6 +1829,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_bw"
+version = "2.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "659d74d982f3ee009c27f34a1fc84d84828095d58ea210ce31705833188c8e27"
+dependencies = [
+ "base64",
+ "granit-parser",
+ "indexmap",
+ "itoa",
+ "num-traits",
+ "regex",
+ "serde",
+ "unsafe-libyaml-norway",
+ "zmij",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2196,6 +2230,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unsafe-libyaml-norway"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b39abd59bf32521c7f2301b52d05a6a2c975b6003521cbd0c6dc1582f0a22104"
 
 [[package]]
 name = "untrusted"

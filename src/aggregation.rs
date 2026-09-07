@@ -782,6 +782,7 @@ mod tests {
             usage: None,
             content: Some(Value::String(content.to_string())),
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -796,6 +797,7 @@ mod tests {
             usage: None,
             content: Some(content),
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -818,6 +820,7 @@ mod tests {
             }),
             content: None,
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -845,6 +848,7 @@ mod tests {
             }),
             content: Some(content),
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -859,6 +863,7 @@ mod tests {
             usage: None,
             content: Some(Value::String("whatever".to_string())),
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -873,6 +878,7 @@ mod tests {
             usage: None,
             content: Some(Value::String(content.to_string())),
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -901,6 +907,7 @@ mod tests {
             }),
             content: Some(content),
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -1068,6 +1075,7 @@ mod tests {
                 }),
                 content: None,
                 cwd: None,
+                effort: None,
                 origin: TurnOrigin::default(),
             },
         ];
@@ -1101,6 +1109,7 @@ mod tests {
             }),
             content: None,
             cwd: Some(PathBuf::from("/Users/jasonr/Projects/redis-tui")),
+            effort: None,
             origin: TurnOrigin::default(),
         };
         let session = aggregate(
@@ -1130,6 +1139,7 @@ mod tests {
             }),
             content: None,
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         };
         let session = aggregate(
@@ -1217,6 +1227,7 @@ mod tests {
             }),
             content: None,
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         };
         let subagent = vec![user_string_turn("hi"), unpriced_assistant];
@@ -1657,6 +1668,7 @@ mod tests {
             }),
             content: Some(serde_json::json!([{ "type": "text", "text": "?" }])),
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         };
         let exchange = Exchange {
@@ -1764,6 +1776,7 @@ mod tests {
             usage: None,
             content: Some(Value::Null),
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         };
         assert_eq!(user_content_preview(&turn), "");
@@ -1942,6 +1955,7 @@ mod tests {
             usage: None,
             content: None,
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         };
         let cluster: Vec<&Turn> = vec![&with_usage, &no_usage];

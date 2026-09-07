@@ -31,6 +31,10 @@ struct RawLine {
     message: Option<RawMessage>,
     #[serde(rename = "requestId", default)]
     request_id: Option<String>,
+    /// Top-level line key, not a field of `message` — the harness
+    /// records the reasoning effort alongside `type` and `timestamp`.
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +159,7 @@ fn raw_to_turn(raw: RawLine) -> Option<Turn> {
         timestamp: raw.timestamp,
         role,
         model,
+        effort: raw.effort,
         message_id,
         request_id: raw.request_id,
         usage,
@@ -301,6 +306,38 @@ mod tests {
         let turn = raw_to_turn(raw).expect("turn");
         assert!(turn.message_id.is_none());
         assert!(turn.request_id.is_none());
+    }
+
+    #[test]
+    fn parse_jsonl_reads_top_level_effort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let mut f = stdfs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "{{\"type\":\"assistant\",\"timestamp\":\"2026-04-01T10:00:00Z\",\"effort\":\"high\",\"message\":{{\"model\":\"claude-opus-5\"}}}}",
+        )
+        .unwrap();
+        drop(f);
+
+        let turns = parse_jsonl(&path).unwrap();
+        assert_eq!(turns[0].effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_jsonl_tolerates_absent_effort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let mut f = stdfs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "{{\"type\":\"assistant\",\"timestamp\":\"2026-04-01T10:00:00Z\",\"message\":{{\"model\":\"claude-opus-5\"}}}}",
+        )
+        .unwrap();
+        drop(f);
+
+        let turns = parse_jsonl(&path).unwrap();
+        assert!(turns[0].effort.is_none());
     }
 
     #[test]

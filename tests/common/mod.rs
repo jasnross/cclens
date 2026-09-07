@@ -138,6 +138,51 @@ pub fn build_inputs_claude_home(cache_dir: &Path) -> PathBuf {
     claude_home
 }
 
+/// Project directory for the plugin-agent namespacing test. Isolated
+/// from `inputs-projects/` so the extra dispatch and the extra agent
+/// file it needs don't perturb any pre-existing inputs assertion.
+pub fn agent_namespace_projects_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent-namespace-projects")
+}
+
+/// Build a synthetic `~/.claude/` tree holding exactly one plugin,
+/// whose `.claude-plugin/plugin.json` names `tp` and which ships
+/// `agents/sample-agent.md`. Deliberately a sibling of
+/// `build_inputs_claude_home` rather than an extension of it:
+/// `attribution::compute_rows` maps the entire inventory to rows with
+/// no zero-load filtering, so a file added to the shared helper would
+/// appear as a new row in every existing `tests/inputs.rs` case.
+pub fn build_agent_namespace_claude_home(cache_dir: &Path) -> PathBuf {
+    let claude_home = cache_dir.join("claude-home");
+    fs::create_dir_all(&claude_home).expect("create claude-home");
+
+    let plugin_path = claude_home.join("plugins/cache/test-marketplace/tp-plugin/1.0.0");
+    fs::create_dir_all(plugin_path.join(".claude-plugin")).expect("create .claude-plugin");
+    fs::write(
+        plugin_path.join(".claude-plugin/plugin.json"),
+        r#"{"name":"tp"}"#,
+    )
+    .expect("write plugin.json");
+
+    fs::create_dir_all(plugin_path.join("agents")).expect("create plugin agents/");
+    fs::write(
+        plugin_path.join("agents/sample-agent.md"),
+        "---\nname: sample-agent\nmodel: claude-opus-5\n---\n\n\
+         # Sample Agent\n\nDispatched by the namespacing integration test.\n",
+    )
+    .expect("write plugin agent");
+
+    let plugins_dir = claude_home.join("plugins");
+    let json = format!(
+        r#"{{"plugins":{{"tp-plugin@test-marketplace":[{{"installPath":{path:?},"version":"1.0.0"}}]}}}}"#,
+        path = plugin_path.to_string_lossy(),
+    );
+    fs::write(plugins_dir.join("installed_plugins.json"), json)
+        .expect("write installed_plugins.json");
+
+    claude_home
+}
+
 /// Recursively copy `src` into a fresh tempdir and apply the given
 /// mtime overrides (keyed by file name). Used by the dedup integration
 /// tests to pin file ordering deterministically — the production

@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-04-15T10:00:00Z","cwd":"/proj-ns","message":{"content":"hello"}}
+{"type":"assistant","timestamp":"2026-04-15T10:00:05Z","cwd":"/proj-ns","message":{"id":"msg_p1","model":"claude-opus-4-7","usage":{"input_tokens":0,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":100},"cache_read_input_tokens":0},"content":[{"type":"text","text":"reply"}]},"requestId":"req_p1"}

@@ -1144,6 +1144,7 @@ mod tests {
             ContextFileKind::PluginAgent {
                 plugin: "p".into(),
                 marketplace: "m".into(),
+                namespace: None,
             },
             ContextFileKind::ProjectClaudeMd,
             ContextFileKind::ProjectLocalSkill,

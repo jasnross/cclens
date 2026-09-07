@@ -10,7 +10,11 @@
 //! - `SessionKind` — `Parent` vs. `Subagent { agent_type }`
 //!   discriminator. `Subagent` payload's `agent_type` is matched
 //!   against `ContextFile::identifier()` so an agent file is credited
-//!   only by the subagent transcripts that actually loaded it.
+//!   only by the subagent transcripts that actually loaded it. That
+//!   comparison is exact: a plugin agent's identifier carries its
+//!   plugin's namespace (`tw:code-reviewer`), which is the form the
+//!   sidecar's `agentType` uses, so a namespaced dispatch matches the
+//!   file that defines it.
 //! - `OnDemandLoad` / `OnDemandKind` — per-(skill, command) load
 //!   record extracted from user-turn content.
 //! - `session_meta_from_turns(...)` — fold a turn list into a
@@ -46,13 +50,6 @@
 //! - **Plugin / user skill-name collisions.** If a user skill and a
 //!   plugin skill share a directory name, both are credited. Accepted
 //!   edge case.
-//! - **`agentType` ↔ file-stem normalization.** Subagent crediting
-//!   matches the sidecar's `agentType` against the agent file's stem
-//!   verbatim. Older Claude Code versions occasionally emitted
-//!   `agentType` strings using `:` separators (e.g.
-//!   `tw:code-reviewer`) where the inventory file stem uses `-`
-//!   (`tw-code-reviewer.md`). Such mismatches silently miss
-//!   attribution; the matcher does not normalize.
 //! - **Cache invalidation modeling.** 1h TTL expiry, prefix changes
 //!   mid-session, and manual `/clear` could re-load CLAUDE.md / rules
 //!   within a single session. We assume one load per session per
@@ -767,6 +764,7 @@ mod tests {
             }),
             content: None,
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -781,6 +779,7 @@ mod tests {
             usage: None,
             content: None,
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -795,6 +794,7 @@ mod tests {
             usage: None,
             content: None,
             cwd: cwd.map(Path::to_path_buf),
+            effort: None,
             origin: TurnOrigin::default(),
         }
     }
@@ -1115,6 +1115,7 @@ mod tests {
             usage: None,
             content: None,
             cwd: None,
+            effort: None,
             origin: TurnOrigin::default(),
         }];
         assert!(
