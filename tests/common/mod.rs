@@ -31,6 +31,13 @@ pub fn dedup_projects_fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dedup-projects")
 }
 
+/// Project directory for the continuation tests: sessions that replay
+/// and link an earlier session's content. Isolated so continuation
+/// shapes and mtime overrides stay out of the main listing assertions.
+pub fn continuation_projects_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/continuation-projects")
+}
+
 pub fn pricing_fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/pricing")

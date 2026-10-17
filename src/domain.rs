@@ -2,7 +2,8 @@
 //!
 //! Public API:
 //! - `Session` — aggregated per-session record (id, project, totals).
-//! - `Turn` — single-line record (role, model, effort, usage, content,
+//! - `Turn` — one assistant message (merged from its lines) or one
+//!   non-assistant line (role, model, effort, ids, uuid, usage, content,
 //!   cwd, origin).
 //! - `Role` — typed enum over Claude Code's `.type` field.
 //! - `TurnOrigin` — discriminates a parent-session turn (`Parent`) from
@@ -57,6 +58,13 @@ pub struct Turn {
     pub effort: Option<String>,
     pub message_id: Option<String>,
     pub request_id: Option<String>,
+    /// The line's top-level `uuid`. A merged assistant turn keeps its
+    /// first line's. The loading walk keys non-assistant turns on it to
+    /// drop lines a continuation replayed, and keys an assistant turn
+    /// on it only when the turn lacks a message key; `parse_jsonl`
+    /// uses an assistant line's to skip a repeat of that line while
+    /// merging the message.
+    pub uuid: Option<String>,
     pub usage: Option<Usage>,
     pub content: Option<Value>,
     pub cwd: Option<PathBuf>,
@@ -65,7 +73,7 @@ pub struct Turn {
     /// turns parsed from a subagent transcript. Defaults to `Parent`
     /// so existing turn-construction sites (parser, tests) don't
     /// need to mention it explicitly; the subagent-specific
-    /// origin is set in `build_subagent_turns` after
+    /// origin is set by the loading walk after
     /// `parse_jsonl` returns.
     pub origin: TurnOrigin,
 }

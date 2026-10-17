@@ -384,11 +384,13 @@ fn run_pricing(mode: RenderMode, action: PricingAction) -> anyhow::Result<()> {
 
 /// Render one session's per-exchange table.
 ///
-/// Delegates to `loading::load_show`, which walks the parent JSONL
-/// (with the same per-project cross-file dedup pass `run_list` runs)
-/// plus every subagent transcript discovered under
-/// `<stem>/subagents/`, tags subagent turns with `TurnOrigin::Subagent`,
-/// and sorts by user-turn timestamp. The renderer dispatches on origin
+/// Delegates to `loading::load_show`, which reads the session through
+/// the same per-project walk `run_list` uses: parent and subagent turns
+/// share one project-wide dedup, so a subagent transcript the session
+/// merely linked from an earlier one is omitted, and subagent turns are
+/// tagged `TurnOrigin::Subagent`. Exchanges sort by user-turn timestamp,
+/// falling back to the first assistant's when the user line is absent
+/// or carries none. The renderer dispatches on origin
 /// to render subagent exchanges as single rows (role `subagent`)
 /// inline with the parent's exchanges. The body's `cumulative` column
 /// at the bottom equals what `cclens list` reports for the same

@@ -1,0 +1,3 @@
+{"type":"user","uuid":"v1-1","timestamp":"2026-05-02T12:00:00Z","cwd":"/Users/test/cont","message":{"role":"user","content":"Refactor the parser"}}
+{"type":"assistant","uuid":"b1-1","timestamp":"2026-05-02T12:00:10Z","cwd":"/Users/test/cont","requestId":"req_Q1","message":{"id":"msg_Q1","role":"assistant","model":"claude-opus-4-7","content":[{"type":"tool_use","id":"tu_5","name":"Edit","input":{}}],"usage":{"input_tokens":200,"output_tokens":50}}}
+{"type":"continued-in","timestamp":"2026-05-02T12:01:00Z","sessionId":"c2000001-0000-0000-0000-000000000001","continuedInSessionId":"c2000002-0000-0000-0000-000000000002"}

@@ -117,12 +117,13 @@ pub(super) enum Command {
     },
     /// Rank subagent dispatches by observed spend.
     ///
-    /// Reads every subagent transcript under `--projects-dir`,
-    /// deduplicates each one's assistant turns, and prices the
-    /// survivors at the model that dispatch actually ran on. Rows are
-    /// grouped by agent type, resolved model, observed effort, and how
-    /// the agent's file constrains the model — so one agent whose
-    /// dispatches disagree about any of those appears as several rows.
+    /// Reads every subagent transcript under `--projects-dir`, counts
+    /// each assistant message once per project at its final usage,
+    /// and prices them at the model that dispatch actually ran on.
+    /// Rows are grouped by agent type, resolved model, observed effort,
+    /// and how the agent's file constrains the model — so one agent
+    /// whose dispatches disagree about any of those appears as several
+    /// rows.
     ///
     /// Columns: `agent`, `model` and `effort` as observed in the
     /// transcript, `declared_effort` as the agent file states it,

@@ -1,23 +1,31 @@
 //! Fold parsed `Turn`s into typed `Session`s and `Exchange`s.
 //!
 //! Public API:
-//! - `aggregate(&Path, String, Vec<Turn>, &[Vec<Turn>], &PricingCatalog) -> Option<Session>`
-//!   — turn list → session, with title extraction, project-short-name
-//!   derivation, billable summation, strict cost folding, and the
-//!   zero-billable + zero-cost filter. Subagent transcript turns are
-//!   passed via `subagent_turn_lists` and fold into `Session.total_*`;
-//!   `Session.turns` stays parent-only so title and short-name
-//!   derivation only see the parent's own turns.
-//! - `dedup_assistant_turns(Vec<Turn>, &mut HashSet<(String, String), S>) -> Vec<Turn>`
-//!   — drop assistant turns whose `(message_id, request_id)` pair has
-//!   already been seen earlier in the project's file walk. Generic over
-//!   the `HashSet` hasher so callers retain control of the hash strategy.
+//! - `aggregate(String, String, Vec<Turn>, &[Vec<Turn>], &PricingCatalog) -> Option<Session>`
+//!   — project short name + turn list → session, with title
+//!   extraction, billable summation, strict cost folding, and the
+//!   zero-billable + zero-cost filter. The caller supplies the short
+//!   name (see `derive_project_short_name`) because it reads the
+//!   transcript before dedup, which `turns` has already been through.
+//!   Subagent transcript turns are passed via `subagent_turn_lists`
+//!   and fold into `Session.total_*`; `Session.turns` stays
+//!   parent-only so title extraction only sees the parent's own turns.
+//! - `SeenTurns` + `dedup_turns(Vec<Turn>, &mut SeenTurns) -> Vec<Turn>`
+//!   — drop turns already contributed by an earlier file in the
+//!   project's walk or, for a line `parse_jsonl` does not merge,
+//!   earlier in the same file: an assistant turn by its
+//!   `(message_id, request_id)` pair, any other turn (and a keyless
+//!   assistant one) by its line `uuid`. One `SeenTurns` spans a
+//!   project's parent and subagent transcripts.
 //! - `majority_assistant_value(&[Turn], Fn) -> Option<String>` —
 //!   most-frequent non-`None` value of a per-turn selector across
 //!   assistant turns, ties resolved to the first-seen value.
 //! - `Exchange<'a>` — a substantive user turn plus its assistant
-//!   cluster.
-//! - `group_into_exchanges(&[Turn]) -> Vec<Exchange<'_>>`.
+//!   cluster, or a user-less continuation cluster; carries the
+//!   exchange's `origin`.
+//! - `group_into_exchanges(&[Turn]) -> Vec<Exchange<'_>>` — assistant
+//!   turns before the first substantive user turn open a user-less
+//!   continuation exchange rather than being dropped.
 //!
 //! Crate-internal (visible to other library modules):
 //! - `exchange_filter_totals(&Exchange<'_>, &PricingCatalog) -> (u64, Option<f64>)`
@@ -40,7 +48,6 @@
 //!   layer and `rendering::add_totals_row`.
 
 use std::collections::HashSet;
-use std::hash::BuildHasher;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -55,7 +62,7 @@ use crate::pricing::PricingCatalog;
 
 #[must_use]
 pub fn aggregate(
-    project_dir: &Path,
+    project_short_name: String,
     session_id: String,
     turns: Vec<Turn>,
     subagent_turn_lists: &[Vec<Turn>],
@@ -78,7 +85,6 @@ pub fn aggregate(
     }
     let started_at = turns.iter().filter_map(|t| t.timestamp).min()?;
     let last_activity = turns.iter().filter_map(|t| t.timestamp).max()?;
-    let project_short_name = derive_project_short_name(project_dir, &turns);
     let title = extract_title(&turns, &session_id);
     Some(Session {
         id: session_id,
@@ -128,9 +134,10 @@ fn total_session_cost(
 /// The project's display name: the first turn's `cwd` basename, else
 /// the project directory's own basename.
 ///
-/// Crate-internal rather than private so `loading::load_agents` reads
-/// the same definition the list view does — two spellings of this rule
-/// would let `--project` filter the two views differently.
+/// Crate-internal so `loading`'s project walk derives it once, from the
+/// parent transcript before dedup, for every view — two spellings of
+/// this rule, or two choices of which turns it reads, would let
+/// `--project` filter the views differently.
 pub(crate) fn derive_project_short_name(project_dir: &Path, turns: &[Turn]) -> String {
     for turn in turns {
         if let Some(cwd) = &turn.cwd
@@ -147,32 +154,44 @@ pub(crate) fn derive_project_short_name(project_dir: &Path, turns: &[Turn]) -> S
 
 // ---- cross-file dedup ----
 
-/// Drop assistant turns whose `(message_id, request_id)` pair has
-/// already been seen earlier in this project's file walk.
+/// Message keys and line `uuid`s one project's walk has already
+/// contributed.
+#[derive(Debug, Default)]
+pub struct SeenTurns {
+    message_keys: HashSet<(String, String)>,
+    line_uuids: HashSet<String>,
+}
+
+/// Drop turns the project's walk already contributed: an assistant
+/// turn by its `(message_id, request_id)` pair, any other turn — and
+/// an assistant turn missing either id — by its line `uuid`. A turn
+/// with neither identity passes through.
 ///
-/// Mirrors ccusage's `createUniqueHash`: a turn missing either part of
-/// the pair passes through (matches their `null`-on-partial-key rule).
-/// Non-assistant turns (user, attachment, system, other) are unaffected
-/// — they don't carry billable usage and are required for title
-/// extraction and exchange grouping. Sidechain markers (`isSidechain`)
-/// aren't visible at this layer (the parser doesn't surface the flag),
-/// so every assistant turn is keyed on `(message_id, request_id)`
-/// regardless of sidechain status.
-pub fn dedup_assistant_turns<S: BuildHasher>(
-    turns: Vec<Turn>,
-    seen: &mut HashSet<(String, String), S>,
-) -> Vec<Turn> {
+/// Expects `parse_jsonl` output, in which a message's lines are
+/// already merged, so a keyed assistant turn drops only as a
+/// cross-file repeat. A line `parse_jsonl` does not merge — any
+/// non-assistant line, or a keyless assistant one — drops here even
+/// when repeated within one file. A keyed assistant turn is never
+/// matched on its `uuid`: a merged message keeps only its first
+/// line's, and only the message key ties its lines together. A keyless
+/// one never merged, so its `uuid` is its own; matching on it keeps a
+/// replayed `<synthetic>` error line (which carries no `requestId`)
+/// from surviving into the continuation that replayed it. ccusage
+/// keeps such lines, but they carry no usage, so totals agree.
+pub fn dedup_turns(turns: Vec<Turn>, seen: &mut SeenTurns) -> Vec<Turn> {
+    let mut first_line = |turn: &Turn| {
+        turn.uuid
+            .as_ref()
+            .is_none_or(|uuid| seen.line_uuids.insert(uuid.clone()))
+    };
     turns
         .into_iter()
         .filter(|turn| match &turn.role {
             Role::Assistant => match (turn.message_id.as_ref(), turn.request_id.as_ref()) {
-                (Some(mid), Some(rid)) => seen.insert((mid.clone(), rid.clone())),
-                // Missing key — pass through unchanged (matches
-                // ccusage's createUniqueHash returning null on
-                // partial keys).
-                _ => true,
+                (Some(mid), Some(rid)) => seen.message_keys.insert((mid.clone(), rid.clone())),
+                _ => first_line(turn),
             },
-            Role::User | Role::Attachment | Role::System | Role::Other(_) => true,
+            Role::User | Role::Attachment | Role::System | Role::Other(_) => first_line(turn),
         })
         .collect()
 }
@@ -348,16 +367,24 @@ fn extract_slash_command_title(s: &str) -> Option<String> {
 /// A user turn plus the cluster of consecutive assistant turns that follow it
 /// (up to the next substantive user turn). The `assistants` vec is empty when
 /// the user turn is orphaned at the end of a session with no response.
+///
+/// `user` is `None` only for a continuation exchange — assistant turns that
+/// precede the turn list's first substantive user line, as when a
+/// continuation begins mid tool loop. Such an exchange always has at least
+/// one assistant turn. `origin` is the user line's origin, or the first
+/// assistant turn's when there is no user line.
 #[derive(Debug)]
 pub struct Exchange<'a> {
-    pub user: &'a Turn,
+    pub user: Option<&'a Turn>,
     pub assistants: Vec<&'a Turn>,
+    pub origin: &'a TurnOrigin,
 }
 
 #[derive(Debug)]
 struct ExchangeInProgress<'a> {
-    user: &'a Turn,
+    user: Option<&'a Turn>,
     assistants: Vec<&'a Turn>,
+    origin: &'a TurnOrigin,
 }
 
 impl<'a> ExchangeInProgress<'a> {
@@ -365,6 +392,7 @@ impl<'a> ExchangeInProgress<'a> {
         Exchange {
             user: self.user,
             assistants: self.assistants,
+            origin: self.origin,
         }
     }
 }
@@ -382,8 +410,9 @@ pub fn group_into_exchanges(turns: &[Turn]) -> Vec<Exchange<'_>> {
                         exchanges.push(existing.finish());
                     }
                     current = Some(ExchangeInProgress {
-                        user: turn,
+                        user: Some(turn),
                         assistants: Vec::new(),
+                        origin: &turn.origin,
                     });
                 }
                 // else: non-substantive user (synthetic wrapper or
@@ -392,8 +421,15 @@ pub fn group_into_exchanges(turns: &[Turn]) -> Vec<Exchange<'_>> {
             Role::Assistant => {
                 if let Some(builder) = current.as_mut() {
                     builder.assistants.push(turn);
+                } else {
+                    // Assistant before any substantive user — opens a
+                    // user-less continuation exchange.
+                    current = Some(ExchangeInProgress {
+                        user: None,
+                        assistants: vec![turn],
+                        origin: &turn.origin,
+                    });
                 }
-                // else: assistant before any substantive user — dropped.
             }
             Role::Attachment | Role::System | Role::Other(_) => {
                 // Non-user/non-assistant — absorbed, no row.
@@ -448,6 +484,9 @@ pub enum PreparedRowRole {
     User,
     Assistant,
     Subagent,
+    /// One row for a parent continuation exchange: assistant turns that
+    /// precede the session's first prompt, priced across every component.
+    Continuation,
 }
 
 #[derive(Debug, Serialize)]
@@ -490,97 +529,102 @@ pub fn prepare_exchanges(
         let (ex_tokens, ex_cost) = exchange_filter_totals(exchange, catalog);
         let visible = thresholds.matches(ex_tokens, ex_cost);
 
-        let rows = match &exchange.user.origin {
-            TurnOrigin::Parent => {
-                let mut rows = Vec::new();
-
-                let user_tokens_opt: Option<u64> = if exchange.assistants.is_empty() {
-                    None
-                } else {
-                    let sum = exchange
-                        .assistants
-                        .iter()
-                        .filter_map(|t| t.usage.as_ref())
-                        .map(|u| u.input + u.cache_creation.total())
-                        .sum();
-                    Some(sum)
-                };
-                let output_tokens: u64 = exchange
-                    .assistants
-                    .iter()
-                    .filter_map(|t| t.usage.as_ref())
-                    .map(|u| u.output)
-                    .sum();
-
-                let (user_cost_breakdown, user_cost_delta) = if exchange.assistants.is_empty() {
-                    (None, Some(0.0))
-                } else {
-                    let breakdown =
-                        strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
-                            (usage.input, 0, usage.cache_creation, usage.cache_read)
-                        });
-                    (breakdown, breakdown.map(|b| b.total()))
-                };
-
-                cumulative += user_tokens_opt.unwrap_or(0);
-                cum_cost = fold_cum_cost(cum_cost, user_cost_delta);
-
-                rows.push(PreparedRow {
-                    timestamp: exchange.user.timestamp,
-                    role: PreparedRowRole::User,
-                    tokens: user_tokens_opt,
-                    cost: user_cost_breakdown,
-                    cumulative_tokens: cumulative,
-                    cumulative_cost: cum_cost,
-                    content: user_content_preview(exchange.user),
-                    tool_use_count: 0,
-                });
-
-                if let Some(first_assistant) = exchange.assistants.first() {
-                    let assistant_breakdown =
-                        strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
-                            (0, usage.output, CacheCreation::default(), 0)
-                        });
-                    cumulative += output_tokens;
-                    cum_cost = fold_cum_cost(cum_cost, assistant_breakdown.map(|b| b.total()));
-
-                    rows.push(PreparedRow {
-                        timestamp: first_assistant.timestamp,
-                        role: PreparedRowRole::Assistant,
-                        tokens: Some(output_tokens),
-                        cost: assistant_breakdown,
+        let rows = match exchange.origin {
+            TurnOrigin::Parent => match exchange.user {
+                None => {
+                    let (row_tokens, breakdown) =
+                        whole_cluster_totals(&exchange.assistants, catalog);
+                    cumulative += row_tokens;
+                    cum_cost = fold_cum_cost(cum_cost, breakdown.map(|b| b.total()));
+                    vec![PreparedRow {
+                        timestamp: exchange.assistants.first().and_then(|a| a.timestamp),
+                        role: PreparedRowRole::Continuation,
+                        tokens: Some(row_tokens),
+                        cost: breakdown,
                         cumulative_tokens: cumulative,
                         cumulative_cost: cum_cost,
                         content: assistant_cluster_preview(&exchange.assistants),
                         #[allow(clippy::cast_possible_truncation)]
                         tool_use_count: count_tool_uses(&exchange.assistants) as usize,
-                    });
+                    }]
                 }
+                Some(user) => {
+                    let mut rows = Vec::new();
 
-                rows
-            }
+                    let user_tokens_opt: Option<u64> = if exchange.assistants.is_empty() {
+                        None
+                    } else {
+                        let sum = exchange
+                            .assistants
+                            .iter()
+                            .filter_map(|t| t.usage.as_ref())
+                            .map(|u| u.input + u.cache_creation.total())
+                            .sum();
+                        Some(sum)
+                    };
+                    let output_tokens: u64 = exchange
+                        .assistants
+                        .iter()
+                        .filter_map(|t| t.usage.as_ref())
+                        .map(|u| u.output)
+                        .sum();
+
+                    let (user_cost_breakdown, user_cost_delta) = if exchange.assistants.is_empty() {
+                        (None, Some(0.0))
+                    } else {
+                        let breakdown =
+                            strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+                                (usage.input, 0, usage.cache_creation, usage.cache_read)
+                            });
+                        (breakdown, breakdown.map(|b| b.total()))
+                    };
+
+                    cumulative += user_tokens_opt.unwrap_or(0);
+                    cum_cost = fold_cum_cost(cum_cost, user_cost_delta);
+
+                    rows.push(PreparedRow {
+                        timestamp: user.timestamp,
+                        role: PreparedRowRole::User,
+                        tokens: user_tokens_opt,
+                        cost: user_cost_breakdown,
+                        cumulative_tokens: cumulative,
+                        cumulative_cost: cum_cost,
+                        content: user_content_preview(user),
+                        tool_use_count: 0,
+                    });
+
+                    if let Some(first_assistant) = exchange.assistants.first() {
+                        let assistant_breakdown =
+                            strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
+                                (0, usage.output, CacheCreation::default(), 0)
+                            });
+                        cumulative += output_tokens;
+                        cum_cost = fold_cum_cost(cum_cost, assistant_breakdown.map(|b| b.total()));
+
+                        rows.push(PreparedRow {
+                            timestamp: first_assistant.timestamp,
+                            role: PreparedRowRole::Assistant,
+                            tokens: Some(output_tokens),
+                            cost: assistant_breakdown,
+                            cumulative_tokens: cumulative,
+                            cumulative_cost: cum_cost,
+                            content: assistant_cluster_preview(&exchange.assistants),
+                            #[allow(clippy::cast_possible_truncation)]
+                            tool_use_count: count_tool_uses(&exchange.assistants) as usize,
+                        });
+                    }
+
+                    rows
+                }
+            },
             TurnOrigin::Subagent {
                 agent_type,
                 description,
             } => {
-                let row_tokens: u64 = exchange
-                    .assistants
-                    .iter()
-                    .filter_map(|t| t.usage.as_ref())
-                    .map(|u| u.input + u.output + u.cache_creation.total())
-                    .sum();
+                let (row_tokens, breakdown) = whole_cluster_totals(&exchange.assistants, catalog);
                 let (row_cost_breakdown, row_cost_delta) = if exchange.assistants.is_empty() {
                     (None, Some(0.0))
                 } else {
-                    let breakdown =
-                        strict_fold_assistant_cost(&exchange.assistants, catalog, |usage| {
-                            (
-                                usage.input,
-                                usage.output,
-                                usage.cache_creation,
-                                usage.cache_read,
-                            )
-                        });
                     (breakdown, breakdown.map(|b| b.total()))
                 };
 
@@ -591,7 +635,7 @@ pub fn prepare_exchanges(
                     .assistants
                     .first()
                     .and_then(|a| a.timestamp)
-                    .or(exchange.user.timestamp);
+                    .or_else(|| exchange.user.and_then(|u| u.timestamp));
 
                 let tokens_display = if exchange.assistants.is_empty() {
                     None
@@ -618,13 +662,37 @@ pub fn prepare_exchanges(
 
         if visible {
             result.push(PreparedExchange {
-                origin: exchange.user.origin.clone(),
+                origin: exchange.origin.clone(),
                 rows,
             });
         }
     }
 
     result
+}
+
+/// Billable tokens and all-component cost of an assistant cluster
+/// reported as a single row — the shape of both a subagent row and a
+/// parent continuation row, kept in one place so the two cannot price
+/// different slices.
+fn whole_cluster_totals(
+    assistants: &[&Turn],
+    catalog: &PricingCatalog,
+) -> (u64, Option<CostBreakdown>) {
+    let tokens = assistants
+        .iter()
+        .filter_map(|t| t.usage.as_ref())
+        .map(Usage::billable)
+        .sum();
+    let cost = strict_fold_assistant_cost(assistants, catalog, |usage| {
+        (
+            usage.input,
+            usage.output,
+            usage.cache_creation,
+            usage.cache_read,
+        )
+    });
+    (tokens, cost)
 }
 
 /// Exchange-level (`tokens`, `cost`) for filter decisions.
@@ -813,7 +881,6 @@ pub(crate) fn fold_cum_cost(prev: Option<f64>, delta: Option<f64>) -> Option<f64
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::path::PathBuf;
 
     use super::*;
@@ -860,6 +927,7 @@ mod tests {
             model: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: Some(Value::String(content.to_string())),
             cwd: None,
@@ -875,6 +943,7 @@ mod tests {
             model: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: Some(content),
             cwd: None,
@@ -890,6 +959,7 @@ mod tests {
             model: Some("claude-opus-4-7".to_string()),
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: Some(Usage {
                 input,
                 output,
@@ -918,6 +988,7 @@ mod tests {
             model: Some("claude-opus-4-7".to_string()),
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: Some(Usage {
                 input,
                 output,
@@ -941,6 +1012,7 @@ mod tests {
             model: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: Some(Value::String("whatever".to_string())),
             cwd: None,
@@ -956,6 +1028,7 @@ mod tests {
             model: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: Some(Value::String(content.to_string())),
             cwd: None,
@@ -977,6 +1050,7 @@ mod tests {
             model: Some("claude-opus-4-7".to_string()),
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: Some(Usage {
                 input,
                 output,
@@ -1096,7 +1170,7 @@ mod tests {
             assistant_turn_with_usage(0, 0, 0),
         ];
         let result = aggregate(
-            Path::new("/tmp/fake-project"),
+            "fake-project".to_string(),
             "abc".to_string(),
             turns,
             &[],
@@ -1113,7 +1187,7 @@ mod tests {
             assistant_turn_with_usage(200, 0, 0),
         ];
         let session = aggregate(
-            Path::new("/tmp/fake-project"),
+            "fake-project".to_string(),
             "abc".to_string(),
             turns,
             &[],
@@ -1145,6 +1219,7 @@ mod tests {
                 model: Some("claude-fake-9-9".to_string()),
                 message_id: None,
                 request_id: None,
+                uuid: None,
                 usage: Some(Usage {
                     input: 0,
                     output: 0,
@@ -1161,7 +1236,7 @@ mod tests {
             },
         ];
         let session = aggregate(
-            Path::new("/tmp/fake-project"),
+            "fake-project".to_string(),
             "abc".to_string(),
             turns,
             &[],
@@ -1175,13 +1250,14 @@ mod tests {
     // --- short-name derivation ---
 
     #[test]
-    fn aggregate_short_name_from_first_cwd() {
+    fn derive_project_short_name_from_first_cwd() {
         let turn_with_cwd = Turn {
             timestamp: Some("2026-04-01T10:00:00Z".parse().unwrap()),
             role: Role::Assistant,
             model: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: Some(Usage {
                 input: 1,
                 output: 1,
@@ -1193,25 +1269,21 @@ mod tests {
             effort: None,
             origin: TurnOrigin::default(),
         };
-        let session = aggregate(
-            Path::new("/tmp/encoded-dir-name"),
-            "abc".to_string(),
-            vec![turn_with_cwd],
-            &[],
-            &PricingCatalog::empty(),
-        )
-        .unwrap();
-        assert_eq!(session.project_short_name, "redis-tui");
+        assert_eq!(
+            derive_project_short_name(Path::new("/tmp/encoded-dir-name"), &[turn_with_cwd]),
+            "redis-tui"
+        );
     }
 
     #[test]
-    fn aggregate_short_name_falls_back_to_dir_name() {
+    fn derive_project_short_name_falls_back_to_dir_name() {
         let turn_no_cwd = Turn {
             timestamp: Some("2026-04-01T10:00:00Z".parse().unwrap()),
             role: Role::Assistant,
             model: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: Some(Usage {
                 input: 1,
                 output: 1,
@@ -1223,15 +1295,10 @@ mod tests {
             effort: None,
             origin: TurnOrigin::default(),
         };
-        let session = aggregate(
-            Path::new("/tmp/-Users-jasonr-encoded"),
-            "abc".to_string(),
-            vec![turn_no_cwd],
-            &[],
-            &PricingCatalog::empty(),
-        )
-        .unwrap();
-        assert_eq!(session.project_short_name, "-Users-jasonr-encoded");
+        assert_eq!(
+            derive_project_short_name(Path::new("/tmp/-Users-jasonr-encoded"), &[turn_no_cwd]),
+            "-Users-jasonr-encoded"
+        );
     }
 
     // --- subagent fold-in ---
@@ -1248,7 +1315,7 @@ mod tests {
             assistant_turn_with_usage(40, 60, 0),
         ];
         let session = aggregate(
-            Path::new("/tmp/p"),
+            "p".to_string(),
             "sid".to_string(),
             parent,
             &[subagent],
@@ -1269,7 +1336,7 @@ mod tests {
         ];
         let catalog = sample_catalog();
         let session = aggregate(
-            Path::new("/tmp/p"),
+            "p".to_string(),
             "sid".to_string(),
             parent,
             &[subagent],
@@ -1300,6 +1367,7 @@ mod tests {
             model: Some("claude-fake-9-9".to_string()),
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: Some(Usage {
                 input: 5,
                 output: 5,
@@ -1313,7 +1381,7 @@ mod tests {
         };
         let subagent = vec![user_string_turn("hi"), unpriced_assistant];
         let session = aggregate(
-            Path::new("/tmp/p"),
+            "p".to_string(),
             "sid".to_string(),
             parent,
             &[subagent],
@@ -1330,7 +1398,7 @@ mod tests {
         // for an arbitrary parent turn list.
         let turns = vec![user_string_turn("q"), assistant_turn_with_usage(50, 75, 25)];
         let catalog = sample_catalog();
-        let session = aggregate(Path::new("/tmp/p"), "sid".to_string(), turns, &[], &catalog)
+        let session = aggregate("p".to_string(), "sid".to_string(), turns, &[], &catalog)
             .expect("session present");
         // Tokens = 50 + 75 + 25 = 150.
         assert_eq!(session.total_billable, 150);
@@ -1349,7 +1417,7 @@ mod tests {
     #[test]
     fn group_into_exchanges_assigns_origin_per_exchange() {
         // Group a parent transcript and a subagent transcript
-        // separately; assert that each exchange's user.origin matches
+        // separately; assert that each exchange's origin matches
         // its source. This is the invariant the show renderer's
         // origin-dispatch relies on.
         let parent_user = user_string_turn("hi");
@@ -1372,11 +1440,11 @@ mod tests {
         let sub_exchanges = group_into_exchanges(&sub_turns);
         assert_eq!(parent_exchanges.len(), 1);
         assert_eq!(sub_exchanges.len(), 1);
-        match &parent_exchanges[0].user.origin {
+        match parent_exchanges[0].origin {
             TurnOrigin::Parent => {}
             TurnOrigin::Subagent { .. } => panic!("parent exchange must carry Parent origin"),
         }
-        match &sub_exchanges[0].user.origin {
+        match sub_exchanges[0].origin {
             TurnOrigin::Subagent {
                 agent_type,
                 description,
@@ -1401,7 +1469,7 @@ mod tests {
             assistant_turn_with_usage(25, 0, 0),
         ];
         let session = aggregate(
-            Path::new("/tmp/p"),
+            "p".to_string(),
             "sid".to_string(),
             parent,
             &[subagent],
@@ -1542,16 +1610,41 @@ mod tests {
     }
 
     #[test]
-    fn group_into_exchanges_drops_assistant_before_any_user() {
-        let text = serde_json::json!([{ "type": "text", "text": "stray" }]);
+    fn group_into_exchanges_opens_continuation_exchange_for_leading_assistants() {
+        let text = serde_json::json!([{ "type": "text", "text": "resumed" }]);
         let turns = vec![
+            assistant_turn_with_content(text.clone(), 1, 1, 0),
             assistant_turn_with_content(text.clone(), 1, 1, 0),
             user_string_turn("hello"),
             assistant_turn_with_content(text, 1, 1, 0),
         ];
         let exchanges = group_into_exchanges(&turns);
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].assistants.len(), 1);
+        assert_eq!(exchanges.len(), 2);
+        assert!(exchanges[0].user.is_none());
+        assert_eq!(exchanges[0].assistants.len(), 2);
+        assert!(exchanges[1].user.is_some());
+        assert_eq!(exchanges[1].assistants.len(), 1);
+    }
+
+    #[test]
+    fn group_into_exchanges_continuation_takes_first_assistant_origin() {
+        let origin = TurnOrigin::Subagent {
+            agent_type: "tw-code-reviewer".to_string(),
+            description: None,
+        };
+        let mut assistant = assistant_turn_with_usage(1, 1, 0);
+        assistant.origin = origin.clone();
+        let mut user = user_string_turn("x");
+        user.origin = origin;
+        let turns = vec![assistant, user];
+        let exchanges = group_into_exchanges(&turns);
+        assert!(exchanges[0].user.is_none());
+        match exchanges[0].origin {
+            TurnOrigin::Subagent { agent_type, .. } => {
+                assert_eq!(agent_type, "tw-code-reviewer");
+            }
+            TurnOrigin::Parent => panic!("continuation must take its first assistant's origin"),
+        }
     }
 
     #[test]
@@ -1676,8 +1769,9 @@ mod tests {
     fn exchange_filter_totals_orphan_is_zero_and_none() {
         let u = show_user_turn("orphan", "2026-04-01T10:00:00Z");
         let exchange = Exchange {
-            user: &u,
+            user: Some(&u),
             assistants: Vec::new(),
+            origin: &u.origin,
         };
         let (tokens, cost) = exchange_filter_totals(&exchange, &PricingCatalog::empty());
         assert_eq!(tokens, 0);
@@ -1705,8 +1799,9 @@ mod tests {
             "2026-04-01T10:02:00Z",
         );
         let exchange = Exchange {
-            user: &u,
+            user: Some(&u),
             assistants: vec![&a1, &a2],
+            origin: &u.origin,
         };
         let catalog = sample_catalog();
         let (tokens, cost) = exchange_filter_totals(&exchange, &catalog);
@@ -1741,6 +1836,7 @@ mod tests {
             model: Some("claude-fake-9-9".to_string()),
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: Some(Usage {
                 input: 5,
                 output: 15,
@@ -1753,8 +1849,9 @@ mod tests {
             origin: TurnOrigin::default(),
         };
         let exchange = Exchange {
-            user: &u,
+            user: Some(&u),
             assistants: vec![&known, &unknown],
+            origin: &u.origin,
         };
         let catalog = sample_catalog();
         let (tokens, cost) = exchange_filter_totals(&exchange, &catalog);
@@ -1786,16 +1883,21 @@ mod tests {
         partial.request_id = None;
         let user = user_string_turn("hi");
 
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        let kept =
-            dedup_assistant_turns(vec![first_dup, second_dup, other, partial, user], &mut seen);
+        let mut seen = SeenTurns::default();
+        let kept = dedup_turns(vec![first_dup, second_dup, other, partial, user], &mut seen);
 
         // first_dup (kept), second_dup (dropped), other (kept),
         // partial (kept, missing key), user (kept)
         assert_eq!(kept.len(), 4);
         // Verify the key cache observed the two complete pairs.
-        assert!(seen.contains(&("m1".to_string(), "r1".to_string())));
-        assert!(seen.contains(&("m2".to_string(), "r2".to_string())));
+        assert!(
+            seen.message_keys
+                .contains(&("m1".to_string(), "r1".to_string()))
+        );
+        assert!(
+            seen.message_keys
+                .contains(&("m2".to_string(), "r2".to_string()))
+        );
         // Surviving assistant turns retain their hash keys.
         assert_eq!(kept[0].message_id.as_deref(), Some("m1"));
         assert_eq!(kept[0].request_id.as_deref(), Some("r1"));
@@ -1803,7 +1905,7 @@ mod tests {
 
     #[test]
     fn dedup_drops_duplicate_assistant_across_separate_calls() {
-        // The orchestration layer reuses one HashSet across multiple
+        // The orchestration layer reuses one SeenTurns across multiple
         // parse_jsonl results — confirm the second call picks up the
         // first call's state.
         let mut first_call_turn = assistant_turn_with_usage(1, 1, 0);
@@ -1813,9 +1915,9 @@ mod tests {
         second_call_turn.message_id = Some("m1".into());
         second_call_turn.request_id = Some("r1".into());
 
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        let first = dedup_assistant_turns(vec![first_call_turn], &mut seen);
-        let second = dedup_assistant_turns(vec![second_call_turn], &mut seen);
+        let mut seen = SeenTurns::default();
+        let first = dedup_turns(vec![first_call_turn], &mut seen);
+        let second = dedup_turns(vec![second_call_turn], &mut seen);
         assert_eq!(first.len(), 1);
         assert!(second.is_empty(), "duplicate from second call must drop");
     }
@@ -1829,9 +1931,60 @@ mod tests {
         sidechain.message_id = Some("msc".into());
         sidechain.request_id = Some("rsc".into());
 
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        let kept = dedup_assistant_turns(vec![sidechain], &mut seen);
+        let mut seen = SeenTurns::default();
+        let kept = dedup_turns(vec![sidechain], &mut seen);
         assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn dedup_drops_non_assistant_line_by_uuid() {
+        let with_uuid = || {
+            let mut turn = user_string_turn("replayed");
+            turn.uuid = Some("u".into());
+            turn
+        };
+        let mut seen = SeenTurns::default();
+        assert_eq!(dedup_turns(vec![with_uuid()], &mut seen).len(), 1);
+        assert!(
+            dedup_turns(vec![with_uuid()], &mut seen).is_empty(),
+            "a uuid an earlier call recorded must drop",
+        );
+
+        // A line repeated within one file drops in the same call.
+        let mut seen = SeenTurns::default();
+        assert_eq!(
+            dedup_turns(vec![with_uuid(), with_uuid()], &mut seen).len(),
+            1
+        );
+
+        // No uuid, no identity: passes every call.
+        assert_eq!(dedup_turns(vec![user_string_turn("a")], &mut seen).len(), 1);
+        assert_eq!(dedup_turns(vec![user_string_turn("a")], &mut seen).len(), 1);
+
+        // An assistant turn's uuid is never recorded.
+        let mut assistant = assistant_turn_with_usage(1, 1, 0);
+        assistant.message_id = Some("m".into());
+        assistant.request_id = Some("r".into());
+        assistant.uuid = Some("shared".into());
+        assert_eq!(dedup_turns(vec![assistant], &mut seen).len(), 1);
+        let mut user = user_string_turn("later");
+        user.uuid = Some("shared".into());
+        assert_eq!(dedup_turns(vec![user], &mut seen).len(), 1);
+    }
+
+    #[test]
+    fn dedup_drops_a_keyless_assistant_line_by_uuid() {
+        // A `<synthetic>` error line has no `requestId`, so no message
+        // key; a continuation's replay of it must still drop.
+        let keyless = || {
+            let mut turn = assistant_turn_with_usage(0, 0, 0);
+            turn.message_id = Some("m".into());
+            turn.uuid = Some("err".into());
+            turn
+        };
+        let mut seen = SeenTurns::default();
+        assert_eq!(dedup_turns(vec![keyless()], &mut seen).len(), 1);
+        assert!(dedup_turns(vec![keyless()], &mut seen).is_empty());
     }
 
     // --- user_content_preview ---
@@ -1854,6 +2007,7 @@ mod tests {
             model: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: Some(Value::Null),
             cwd: None,
@@ -2033,6 +2187,7 @@ mod tests {
             model: Some("claude-opus-4-7".to_string()),
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: None,
             cwd: None,
@@ -2078,8 +2233,9 @@ mod tests {
             "2026-04-01T10:01:00Z",
         );
         let exchanges = vec![Exchange {
-            user: &u,
+            user: Some(&u),
             assistants: vec![&a],
+            origin: &u.origin,
         }];
         let prepared = prepare_exchanges(
             &exchanges,
@@ -2100,8 +2256,9 @@ mod tests {
     fn prepare_exchanges_orphan_exchange_produces_one_row() {
         let u = show_user_turn("orphan", "2026-04-01T10:00:00Z");
         let exchanges = vec![Exchange {
-            user: &u,
+            user: Some(&u),
             assistants: Vec::new(),
+            origin: &u.origin,
         }];
         let prepared = prepare_exchanges(
             &exchanges,
@@ -2133,8 +2290,9 @@ mod tests {
             description: None,
         };
         let exchanges = vec![Exchange {
-            user: &u,
+            user: Some(&u),
             assistants: vec![&a],
+            origin: &u.origin,
         }];
         let prepared = prepare_exchanges(
             &exchanges,
@@ -2169,12 +2327,14 @@ mod tests {
         );
         let exchanges = vec![
             Exchange {
-                user: &u1,
+                user: Some(&u1),
                 assistants: vec![&a1],
+                origin: &u1.origin,
             },
             Exchange {
-                user: &u2,
+                user: Some(&u2),
                 assistants: vec![&a2],
+                origin: &u2.origin,
             },
         ];
         let thresholds = ThresholdsFilter {
@@ -2195,8 +2355,9 @@ mod tests {
     fn prepare_exchanges_orphan_cost_delta_does_not_latch_cumulative() {
         let u = show_user_turn("orphan", "2026-04-01T10:00:00Z");
         let exchanges = vec![Exchange {
-            user: &u,
+            user: Some(&u),
             assistants: Vec::new(),
+            origin: &u.origin,
         }];
         let prepared = prepare_exchanges(
             &exchanges,
@@ -2227,12 +2388,14 @@ mod tests {
         );
         let exchanges = vec![
             Exchange {
-                user: &u1,
+                user: Some(&u1),
                 assistants: vec![&a1],
+                origin: &u1.origin,
             },
             Exchange {
-                user: &u2,
+                user: Some(&u2),
                 assistants: vec![&a2],
+                origin: &u2.origin,
             },
         ];
         let prepared =
@@ -2255,8 +2418,9 @@ mod tests {
             "2026-04-01T10:01:00Z",
         );
         let exchanges = vec![Exchange {
-            user: &u,
+            user: Some(&u),
             assistants: vec![&a],
+            origin: &u.origin,
         }];
         let prepared = prepare_exchanges(
             &exchanges,
@@ -2265,6 +2429,286 @@ mod tests {
         );
         assert_eq!(prepared[0].rows[0].tool_use_count, 0);
         assert_eq!(prepared[0].rows[1].tool_use_count, 2);
+    }
+
+    #[test]
+    fn prepare_exchanges_renders_parent_continuation_as_one_row() {
+        let a1 = show_assistant_turn(
+            serde_json::json!([
+                { "type": "text", "text": "resuming" },
+                { "type": "tool_use", "name": "Edit", "id": "1", "input": {} },
+            ]),
+            10,
+            5,
+            0,
+            "2026-04-01T10:00:00Z",
+        );
+        let a2 = show_assistant_turn(
+            serde_json::json!([
+                { "type": "tool_use", "name": "Edit", "id": "2", "input": {} },
+            ]),
+            20,
+            7,
+            3,
+            "2026-04-01T10:01:00Z",
+        );
+        let exchanges = vec![Exchange {
+            user: None,
+            assistants: vec![&a1, &a2],
+            origin: &TurnOrigin::Parent,
+        }];
+        let prepared = prepare_exchanges(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].rows.len(), 1);
+        let row = &prepared[0].rows[0];
+        assert!(matches!(row.role, PreparedRowRole::Continuation));
+        assert_eq!(row.tokens, Some(45));
+        assert_eq!(row.cumulative_tokens, 45);
+        assert_eq!(row.tool_use_count, 2);
+        assert_eq!(row.content, "resuming");
+        assert_eq!(row.timestamp, a1.timestamp);
+    }
+
+    #[test]
+    fn prepare_exchanges_continuation_cumulative_carries_into_next_exchange() {
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "resuming" }]),
+            10,
+            5,
+            2,
+            "2026-04-01T10:00:00Z",
+        );
+        let u = show_user_turn("next", "2026-04-01T10:01:00Z");
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "done" }]),
+            30,
+            11,
+            4,
+            "2026-04-01T10:02:00Z",
+        );
+        let exchanges = vec![
+            Exchange {
+                user: None,
+                assistants: vec![&a1],
+                origin: &TurnOrigin::Parent,
+            },
+            Exchange {
+                user: Some(&u),
+                assistants: vec![&a2],
+                origin: &u.origin,
+            },
+        ];
+        let prepared = prepare_exchanges(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
+        let last_row = prepared[1].rows.last().expect("has rows");
+        let expected: u64 = [&a1, &a2]
+            .iter()
+            .filter_map(|t| t.usage.as_ref())
+            .map(Usage::billable)
+            .sum();
+        assert_eq!(last_row.cumulative_tokens, expected);
+    }
+
+    #[test]
+    fn prepare_exchanges_subagent_continuation_uses_subagent_row() {
+        let origin = TurnOrigin::Subagent {
+            agent_type: "reviewer".to_string(),
+            description: None,
+        };
+        let mut a = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "ok" }]),
+            10,
+            20,
+            0,
+            "2026-04-01T10:01:00Z",
+        );
+        a.origin = origin;
+        let exchanges = vec![Exchange {
+            user: None,
+            assistants: vec![&a],
+            origin: &a.origin,
+        }];
+        let prepared = prepare_exchanges(
+            &exchanges,
+            &PricingCatalog::empty(),
+            ThresholdsFilter::default(),
+        );
+        assert_eq!(prepared[0].rows.len(), 1);
+        assert!(matches!(
+            prepared[0].rows[0].role,
+            PreparedRowRole::Subagent
+        ));
+        assert_eq!(prepared[0].rows[0].timestamp, a.timestamp);
+    }
+
+    /// A continuation exchange (`a_cont`) followed by a normal one
+    /// (`u`, `a_next`), as `group_into_exchanges` would build them.
+    fn continuation_then_normal<'a>(
+        a_cont: &'a Turn,
+        u: &'a Turn,
+        a_next: &'a Turn,
+    ) -> Vec<Exchange<'a>> {
+        vec![
+            Exchange {
+                user: None,
+                assistants: vec![a_cont],
+                origin: &a_cont.origin,
+            },
+            Exchange {
+                user: Some(u),
+                assistants: vec![a_next],
+                origin: &u.origin,
+            },
+        ]
+    }
+
+    fn full_cost(turns: &[&Turn], catalog: &PricingCatalog) -> f64 {
+        turns
+            .iter()
+            .map(|t| {
+                catalog
+                    .cost_for_turn(t.usage.as_ref().unwrap(), t.model.as_deref())
+                    .unwrap()
+                    .total()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn prepare_exchanges_prices_every_component_of_a_continuation() {
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "resuming" }]),
+            10,
+            5,
+            0,
+            "2026-04-01T10:00:00Z",
+        );
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "more" }]),
+            20,
+            7,
+            3,
+            "2026-04-01T10:01:00Z",
+        );
+        let exchanges = vec![Exchange {
+            user: None,
+            assistants: vec![&a1, &a2],
+            origin: &TurnOrigin::Parent,
+        }];
+        let catalog = sample_catalog();
+        let prepared = prepare_exchanges(&exchanges, &catalog, ThresholdsFilter::default());
+        let row = &prepared[0].rows[0];
+        let expected = full_cost(&[&a1, &a2], &catalog);
+        let cost = row.cost.expect("known model prices").total();
+        assert!((cost - expected).abs() < 1e-12, "{cost} vs {expected}");
+        let cum = row.cumulative_cost.expect("cumulative cost");
+        assert!((cum - expected).abs() < 1e-12, "{cum} vs {expected}");
+    }
+
+    #[test]
+    fn prepare_exchanges_continuation_cost_carries_into_next_exchange() {
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "resuming" }]),
+            10,
+            5,
+            2,
+            "2026-04-01T10:00:00Z",
+        );
+        let u = show_user_turn("next", "2026-04-01T10:01:00Z");
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "done" }]),
+            30,
+            11,
+            4,
+            "2026-04-01T10:02:00Z",
+        );
+        let catalog = sample_catalog();
+        let prepared = prepare_exchanges(
+            &continuation_then_normal(&a1, &u, &a2),
+            &catalog,
+            ThresholdsFilter::default(),
+        );
+        let last = prepared[1].rows.last().expect("has rows");
+        let expected = full_cost(&[&a1, &a2], &catalog);
+        let cum = last.cumulative_cost.expect("cumulative cost");
+        assert!((cum - expected).abs() < 1e-12, "{cum} vs {expected}");
+    }
+
+    #[test]
+    fn prepare_exchanges_unknown_model_continuation_latches_cumulative_cost() {
+        let mut a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "resuming" }]),
+            10,
+            5,
+            0,
+            "2026-04-01T10:00:00Z",
+        );
+        a1.model = Some("claude-fake-9-9".to_string());
+        let u = show_user_turn("next", "2026-04-01T10:01:00Z");
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "done" }]),
+            30,
+            11,
+            0,
+            "2026-04-01T10:02:00Z",
+        );
+        let prepared = prepare_exchanges(
+            &continuation_then_normal(&a1, &u, &a2),
+            &sample_catalog(),
+            ThresholdsFilter::default(),
+        );
+        assert_eq!(prepared[0].rows[0].cost, None);
+        assert_eq!(prepared[0].rows[0].cumulative_cost, None);
+        assert_eq!(
+            prepared[1].rows.last().expect("has rows").cumulative_cost,
+            None
+        );
+    }
+
+    #[test]
+    fn prepare_exchanges_hidden_continuation_still_counts_toward_cumulative() {
+        let a1 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "resuming" }]),
+            10,
+            5,
+            0,
+            "2026-04-01T10:00:00Z",
+        );
+        let u = show_user_turn("next", "2026-04-01T10:01:00Z");
+        let a2 = show_assistant_turn(
+            serde_json::json!([{ "type": "text", "text": "done" }]),
+            500,
+            500,
+            0,
+            "2026-04-01T10:02:00Z",
+        );
+        let thresholds = ThresholdsFilter {
+            min_tokens: Some(500),
+            min_cost: None,
+        };
+        let prepared = prepare_exchanges(
+            &continuation_then_normal(&a1, &u, &a2),
+            &PricingCatalog::empty(),
+            thresholds,
+        );
+        assert_eq!(prepared.len(), 1, "the 15-token continuation is hidden");
+        let last = prepared[0].rows.last().expect("has rows");
+        assert_eq!(last.cumulative_tokens, 15 + 1000);
+    }
+
+    #[test]
+    fn prepared_row_role_continuation_serializes_as_continuation() {
+        assert_eq!(
+            serde_json::to_value(PreparedRowRole::Continuation).expect("serialize"),
+            serde_json::json!("continuation"),
+        );
     }
 
     #[test]
@@ -2286,8 +2730,9 @@ mod tests {
             description: Some("review auth".to_string()),
         };
         let exchanges = vec![Exchange {
-            user: &u,
+            user: Some(&u),
             assistants: vec![&a],
+            origin: &u.origin,
         }];
         let prepared = prepare_exchanges(
             &exchanges,

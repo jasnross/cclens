@@ -600,9 +600,8 @@ fn list_skips_unreadable_subagent_jsonl_without_aborting() {
     let subagents = project.join(session_stem).join("subagents");
     std::fs::create_dir_all(&subagents).unwrap();
     // Sidecar present and parseable; the agent-1.jsonl path is a
-    // *directory* rather than a file, so `parse_jsonl` errors → the
-    // build_subagent_turns helper returns None → that subagent is
-    // skipped.
+    // *directory* rather than a file, so discovery skips it and that
+    // subagent never reaches the loading walk.
     std::fs::write(
         subagents.join("agent-1.meta.json"),
         r#"{"agentType":"tw-code-reviewer","description":"broken case"}"#,

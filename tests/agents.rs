@@ -1,6 +1,6 @@
 // Integration tests for `cclens agents`. Covers:
 //   - cost-descending ranking across two projects
-//   - per-transcript deduplication, asserted against a hand-computed sum
+//   - per-project deduplication, asserted against a hand-computed sum
 //   - the narrowing `--pinning` default and widening past it
 //   - fork rows, and the em dash for a transcript recording no effort
 //   - `--compare-model`: columns, footer labels, and the two ways a

@@ -424,9 +424,9 @@ fn inputs_subagent_credits_matching_agent_and_extra_load_for_always_loaded_files
 
 #[test]
 fn inputs_subagent_without_cwd_inherits_parent_cwd_for_attribution() {
-    // Pins the `build_subagent_meta` parent-cwd fallback contract
-    // (main.rs:290-295). A subagent JSONL with no `cwd` on any turn
-    // would otherwise produce a `SessionMeta` with `cwd: None`, which
+    // Pins `load_inputs`'s subagent parent-cwd fallback. A subagent
+    // JSONL with no `cwd` on any turn would otherwise produce a
+    // `SessionMeta` with `cwd: None`, which
     // `attribution::build_row` skips entirely (attribution.rs:552-553)
     // — meaning the subagent would contribute zero loads to every
     // file. The fallback substitutes the parent's cwd / short-name so

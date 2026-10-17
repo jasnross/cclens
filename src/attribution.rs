@@ -82,13 +82,13 @@ use crate::pricing::PricingCatalog;
 ///   transcript. `compute_rows`' agent-row dispatch uses the
 ///   `Subagent { agent_type }` payload to credit only the matching
 ///   agent inventory entry.
-/// - `cwd` — first non-`None` `Turn.cwd` across any role, mirroring
-///   `aggregation::derive_project_short_name`'s rule. Subagent metas
-///   constructed by `run_inputs` fall back to the parent session's
-///   cwd when the subagent JSONL has none.
-/// - `project_short_name` — `cwd.file_name()` if the cwd was found,
-///   else `project_dir.file_name()`. Carrying it pre-derived keeps
-///   `InputsFilter::accepts` a single-argument predicate.
+/// - `cwd` — passed in by the caller: the first `Turn.cwd` of the
+///   whole transcript, read before dedup; a subagent recording none
+///   takes its parent session's.
+/// - `project_short_name` — passed in by the caller, derived by
+///   `aggregation::derive_project_short_name`'s rule. Carrying it
+///   pre-derived keeps `InputsFilter::accepts` a single-argument
+///   predicate.
 /// - `started_at` — earliest `Turn.timestamp`.
 /// - `model` — most-frequent model across this session's assistant
 ///   turns, ties broken by first-occurrence. Used as the per-load
@@ -265,6 +265,10 @@ impl InputsFilter {
 
 /// Fold a turn list into a `SessionMeta`. Returns `None` if no turn
 /// carried a timestamp (matches `aggregation::aggregate`'s rule).
+///
+/// `cwd` and `project_short_name` come from the caller rather than
+/// from `turns`: dedup may have dropped the lines that recorded the
+/// cwd, so the caller reads it from the whole transcript.
 //
 // `observed_1h_tokens`/`observed_5m_tokens` are the domain-essential
 // per-tier counter names — silencing `similar_names` here is a
@@ -275,20 +279,13 @@ impl InputsFilter {
 pub fn session_meta_from_turns(
     kind: SessionKind,
     session_id: String,
-    project_dir: &Path,
+    cwd: Option<&Path>,
+    project_short_name: &str,
     turns: &[Turn],
 ) -> Option<SessionMeta> {
     let started_at = turns.iter().filter_map(|t| t.timestamp).min()?;
-    let cwd = turns.iter().find_map(|t| t.cwd.clone());
-    let project_short_name = cwd
-        .as_ref()
-        .and_then(|c| c.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| {
-            project_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
+    let cwd = cwd.map(Path::to_path_buf);
+    let project_short_name = project_short_name.to_string();
     let model = most_frequent_assistant_model(turns);
 
     let mut primary_tier: Option<CacheTier> = None;
@@ -728,6 +725,7 @@ mod tests {
             model: model.map(str::to_string),
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: Some(Usage {
                 input: 0,
                 output: 0,
@@ -751,6 +749,7 @@ mod tests {
             model: model.map(str::to_string),
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: None,
             cwd: None,
@@ -766,6 +765,7 @@ mod tests {
             model: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: None,
             cwd: cwd.map(Path::to_path_buf),
@@ -857,7 +857,8 @@ mod tests {
         let meta = session_meta_from_turns(
             SessionKind::Parent,
             "session-id".to_string(),
-            Path::new("/proj"),
+            None,
+            "proj",
             &turns,
         )
         .unwrap();
@@ -874,13 +875,9 @@ mod tests {
             assistant_turn("2026-04-01T10:00:00Z", Some("claude-opus-4-7"), 200, 0),
             assistant_turn("2026-04-01T10:01:00Z", Some("claude-opus-4-7"), 0, 100),
         ];
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "id".to_string(),
-            Path::new("/proj"),
-            &turns,
-        )
-        .unwrap();
+        let meta =
+            session_meta_from_turns(SessionKind::Parent, "id".to_string(), None, "proj", &turns)
+                .unwrap();
         assert_eq!(meta.primary_tier, CacheTier::Short5m);
     }
 
@@ -894,13 +891,9 @@ mod tests {
             50,
             100,
         )];
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "id".to_string(),
-            Path::new("/proj"),
-            &turns,
-        )
-        .unwrap();
+        let meta =
+            session_meta_from_turns(SessionKind::Parent, "id".to_string(), None, "proj", &turns)
+                .unwrap();
         assert_eq!(meta.primary_tier, CacheTier::Long1h);
     }
 
@@ -915,13 +908,9 @@ mod tests {
             0,
             0,
         )];
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "id".to_string(),
-            Path::new("/proj"),
-            &turns,
-        )
-        .unwrap();
+        let meta =
+            session_meta_from_turns(SessionKind::Parent, "id".to_string(), None, "proj", &turns)
+                .unwrap();
         assert_eq!(meta.primary_tier, CacheTier::Long1h);
     }
 
@@ -938,13 +927,9 @@ mod tests {
             user,
             assistant_turn("2026-04-01T10:00:05Z", Some("claude-opus-4-7"), 100, 0),
         ];
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "id".to_string(),
-            Path::new("/proj"),
-            &turns,
-        )
-        .unwrap();
+        let meta =
+            session_meta_from_turns(SessionKind::Parent, "id".to_string(), None, "proj", &turns)
+                .unwrap();
         assert_eq!(meta.on_demand_loads.len(), 1);
         let load = &meta.on_demand_loads[0];
         assert_eq!(load.kind, OnDemandKind::Skill);
@@ -966,13 +951,9 @@ mod tests {
             user,
             assistant_turn("2026-04-01T10:00:05Z", Some("claude-opus-4-7"), 100, 0),
         ];
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "id".to_string(),
-            Path::new("/proj"),
-            &turns,
-        )
-        .unwrap();
+        let meta =
+            session_meta_from_turns(SessionKind::Parent, "id".to_string(), None, "proj", &turns)
+                .unwrap();
         assert_eq!(meta.on_demand_loads.len(), 1);
         let load = &meta.on_demand_loads[0];
         assert_eq!(load.kind, OnDemandKind::Command);
@@ -997,13 +978,9 @@ mod tests {
             u2,
             assistant_turn("2026-04-01T10:02:05Z", Some("claude-opus-4-7"), 100, 0),
         ];
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "id".to_string(),
-            Path::new("/proj"),
-            &turns,
-        )
-        .unwrap();
+        let meta =
+            session_meta_from_turns(SessionKind::Parent, "id".to_string(), None, "proj", &turns)
+                .unwrap();
         let foo_count = meta
             .on_demand_loads
             .iter()
@@ -1019,13 +996,9 @@ mod tests {
             assistant_turn("2026-04-01T10:01:00Z", Some("model-a"), 100, 0),
             assistant_turn("2026-04-01T10:02:00Z", Some("model-b"), 100, 0),
         ];
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "id".to_string(),
-            Path::new("/proj"),
-            &turns,
-        )
-        .unwrap();
+        let meta =
+            session_meta_from_turns(SessionKind::Parent, "id".to_string(), None, "proj", &turns)
+                .unwrap();
         assert_eq!(meta.model.as_deref(), Some("model-a"));
     }
 
@@ -1036,30 +1009,24 @@ mod tests {
             assistant_turn("2026-04-01T10:00:00Z", Some("model-x"), 100, 0),
             assistant_turn("2026-04-01T10:01:00Z", Some("model-y"), 100, 0),
         ];
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "id".to_string(),
-            Path::new("/proj"),
-            &turns,
-        )
-        .unwrap();
+        let meta =
+            session_meta_from_turns(SessionKind::Parent, "id".to_string(), None, "proj", &turns)
+                .unwrap();
         assert_eq!(meta.model.as_deref(), Some("model-x"));
     }
 
     #[test]
-    fn session_meta_picks_first_cwd_from_any_role() {
-        // User turn with cwd=/x precedes assistant turn with cwd=/y;
-        // user's cwd wins (matches aggregation::derive_project_short_name).
-        let mut user = user_turn("2026-04-01T10:00:00Z", Some(Path::new("/x")));
-        user.timestamp = Some(ts("2026-04-01T10:00:00Z"));
+    fn session_meta_takes_the_callers_cwd_and_short_name() {
+        // A turn's own cwd (/y) must not override the caller's, which
+        // was read from the transcript before dedup.
         let mut asst = assistant_turn("2026-04-01T10:01:00Z", Some("model-a"), 100, 0);
         asst.cwd = Some(PathBuf::from("/y"));
-        let turns = vec![user, asst];
         let meta = session_meta_from_turns(
             SessionKind::Parent,
             "id".to_string(),
-            Path::new("/proj"),
-            &turns,
+            Some(Path::new("/x")),
+            "x",
+            &[asst],
         )
         .unwrap();
         assert_eq!(meta.cwd, Some(PathBuf::from("/x")));
@@ -1071,13 +1038,8 @@ mod tests {
         // Empty turns → None.
         let empty: Vec<Turn> = Vec::new();
         assert!(
-            session_meta_from_turns(
-                SessionKind::Parent,
-                "id".to_string(),
-                Path::new("/p"),
-                &empty
-            )
-            .is_none()
+            session_meta_from_turns(SessionKind::Parent, "id".to_string(), None, "proj", &empty)
+                .is_none()
         );
 
         // Only-untimestamped turns → also None.
@@ -1087,6 +1049,7 @@ mod tests {
             model: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: None,
             cwd: None,
@@ -1097,30 +1060,12 @@ mod tests {
             session_meta_from_turns(
                 SessionKind::Parent,
                 "id".to_string(),
-                Path::new("/p"),
+                None,
+                "proj",
                 &untimestamped
             )
             .is_none()
         );
-    }
-
-    #[test]
-    fn session_meta_falls_back_to_project_dir_name_when_no_cwd() {
-        let turns = vec![assistant_turn(
-            "2026-04-01T10:00:00Z",
-            Some("model-a"),
-            100,
-            0,
-        )];
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "id".to_string(),
-            Path::new("/some/proj-name"),
-            &turns,
-        )
-        .unwrap();
-        assert!(meta.cwd.is_none());
-        assert_eq!(meta.project_short_name, "proj-name");
     }
 
     // --- compute_rows: per-load attribution ---
@@ -1676,7 +1621,8 @@ mod tests {
                 agent_type: "tw-code-reviewer".to_string(),
             },
             "agent-abc".to_string(),
-            Path::new("/proj"),
+            None,
+            "proj",
             &turns,
         )
         .unwrap();
@@ -1814,13 +1760,9 @@ mod tests {
         assert_eq!(expected_1h, 425);
         assert_eq!(expected_5m, 350);
 
-        let meta = session_meta_from_turns(
-            SessionKind::Parent,
-            "s1".to_string(),
-            Path::new("/proj"),
-            &turns,
-        )
-        .unwrap();
+        let meta =
+            session_meta_from_turns(SessionKind::Parent, "s1".to_string(), None, "proj", &turns)
+                .unwrap();
         let cov = compute_coverage(&[meta], &[]);
         assert_eq!(cov.long_1h.observed_tokens, expected_1h);
         assert_eq!(cov.short_5m.observed_tokens, expected_5m);

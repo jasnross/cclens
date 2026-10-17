@@ -97,16 +97,26 @@ Library modules (declared `pub mod` in `src/lib.rs`, one file each under `src/<n
 
 ```
 domain        ← Session, Turn, Role, TurnOrigin, Usage, CacheCreation;
-                Turn.origin discriminates parent transcripts from
-                subagent transcripts (Subagent { agent_type, description })
-parsing       ← RawLine / RawMessage / RawUsage + parse_jsonl + raw_to_turn
+                a Turn is one assistant message or one non-assistant
+                line, and carries the line's uuid; Turn.origin
+                discriminates parent transcripts from subagent
+                transcripts (Subagent { agent_type, description })
+parsing       ← RawLine / RawMessage / RawUsage + parse_jsonl + raw_to_turn;
+                parse_jsonl returns a ParsedTranscript (turns plus
+                continued-in targets) and merges a message's lines
+                (shared message_id + request_id) into one Turn
 discovery     ← projects_dir walk → ProjectSessions { project_dir,
                 sessions: [SessionPaths { jsonl, subagents:
                 [SubagentPaths { jsonl, meta }] }] }; per-session
                 three-level walk into <stem>/subagents/ for
                 agent-*.jsonl + .meta.json sidecars; read_subagent_meta
                 helper for the sidecar (returns SubagentMeta with
-                agent_type, optional description, and is_fork)
+                agent_type, optional description, is_fork, and a nested
+                dispatch's parent_agent_id); paths are sorted by mtime,
+                the loading walk's fallback order — lineage
+                (continued-in between sessions, parentAgentId between
+                subagents), not mtime, decides which keeps repeated
+                content
 inventory     ← walks ~/.claude/{CLAUDE.md,rules,skills,agents},
                 plugin cache, and per-session ancestor + project-local
                 context; tokenizes via tiktoken_rs cl100k_base;
@@ -117,18 +127,24 @@ inventory     ← walks ~/.claude/{CLAUDE.md,rules,skills,agents},
                 its .claude-plugin/plugin.json; read_agent_frontmatter
                 returns one agent file's declared model / effort as a
                 separate entry point — the walk parses no frontmatter
-aggregation   ← turn list → Session; Exchange grouping;
+aggregation   ← turn list → Session; Exchange grouping (leading assistant
+                turns form a user-less continuation exchange);
                 title extraction; project short-name derivation;
-                zero-billable filter; cross-file dedup_assistant_turns;
+                zero-billable filter; SeenTurns + dedup_turns (drops a
+                message key, or the line uuid of a non-assistant or
+                keyless assistant line, already contributed by an
+                earlier file in the project, or, for a line
+                parse_jsonl does not merge, earlier in the same file);
                 aggregate accepts subagent_turn_lists slice that folds
                 into Session.total_* (Session.turns stays parent-only)
-agents        ← subagent transcript → Dispatch (deduplicated per
-                transcript on (message_id, request_id), priced at its
-                own recorded model) → AgentRow keyed by agent type ×
-                model × effort × Pinning; Pinning classifies how an
-                agent file constrains a dispatch (Pinned / Inherit /
-                Unpinned / NoAgentFile / Fork) from a caller-supplied
-                frontmatter map, so the classification reads no files;
+agents        ← subagent transcript → Dispatch (built from the loading
+                walk's merged, project-deduplicated subagent turns,
+                priced at its own recorded model) → AgentRow keyed by
+                agent type × model × effort × Pinning; Pinning
+                classifies how an agent file constrains a dispatch
+                (Pinned / Inherit / Unpinned / NoAgentFile / Fork) from
+                a caller-supplied frontmatter map, so the
+                classification reads no files;
                 PinningFilter (colocated here, not in filter, which
                 depends on nothing) whose default narrows and whose
                 describe_active is therefore empty at that default;
@@ -143,6 +159,13 @@ attribution   ← turn list → SessionMeta { kind: Parent | Subagent
                 across parent + subagent metas
 loading       ← composes discovery/parsing/aggregation/attribution/
                 pricing into view-ready data behind DataContext;
+                every loader projects one private ProjectWalk per
+                project (two phases: parse every parent and order the
+                sessions by continued-in lineage, then dedup each
+                session's parent and subagent turns, subagents parent
+                agent first by parentAgentId, into one
+                per-project SeenTurns, omitting transcripts dedup
+                emptied);
                 load_sessions / load_show / load_inputs / load_agents;
                 DataContext carries projects_dir, catalog, inventory
                 (an Arc<InventoryConfig>, so a caller can point the
@@ -220,7 +243,7 @@ Binary entry point (`src/main.rs`):
 
 - Declares `mod cli;` (binary-only — `src/cli.rs` is **not** in `lib.rs`) so library code cannot reach into clap-derived types.
 - Imports library modules via `use cclens::...`.
-- Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs`, `run_agents` — orchestration only. Each `run_*` builds a `loading::DataContext` from CLI args and either drives the TUI (`run_tui`) or calls `loading::load_sessions` / `loading::load_show` / `loading::load_inputs` / `loading::load_agents` directly for the plain/JSON paths. The loaders themselves, their `build_subagent_turns` / `build_subagent_meta` / `stem_matches` helpers, and fingerprint-building all live in `loading` — the binary has no data-loading code of its own.
+- Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs`, `run_agents` — orchestration only. Each `run_*` builds a `loading::DataContext` from CLI args and either drives the TUI (`run_tui`) or calls `loading::load_sessions` / `loading::load_show` / `loading::load_inputs` / `loading::load_agents` directly for the plain/JSON paths. The loaders themselves, the `ProjectWalk` they share, `stem_matches`, and fingerprint-building all live in `loading` — the binary has no data-loading code of its own.
 
 Binary CLI submodule (`src/cli.rs`):
 

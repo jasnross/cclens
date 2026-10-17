@@ -13,7 +13,8 @@ mod common;
 
 use common::{
     build_inputs_claude_home, cclens_claude_home_command, cclens_command,
-    inputs_projects_fixture_dir, pricing_fixture_url, snapshot_pricing_url, snapshot_projects_dir,
+    continuation_projects_fixture_dir, inputs_projects_fixture_dir, pricing_fixture_url,
+    snapshot_pricing_url, snapshot_projects_dir,
 };
 use insta::assert_snapshot;
 
@@ -71,6 +72,28 @@ fn show_snapshot_with_subagents() {
         .arg(snapshot_projects_dir())
         .arg("show")
         .arg("eeee0005-0005-0005-0005-000000000005")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(stdout_bytes).expect("stdout utf8");
+    assert_snapshot!(stdout);
+}
+
+#[test]
+fn show_snapshot_continuation() {
+    // A continuation that resumes mid tool loop: its replayed lines
+    // belong to the original, so it opens with a `continuation` row.
+    // Lineage decides that ownership, so the result does not depend on
+    // the checkout's file mtimes.
+    let cache = isolated_cache();
+    let stdout_bytes = cclens_command(cache.path(), &snapshot_pricing_url())
+        .env("TZ", "UTC")
+        .args(["--projects-dir"])
+        .arg(continuation_projects_fixture_dir())
+        .arg("show")
+        .arg("c2000002-0000-0000-0000-000000000002")
         .assert()
         .success()
         .get_output()

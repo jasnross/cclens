@@ -3134,7 +3134,7 @@ fn render_show_content(app: &mut App, frame: &mut Frame, area: ratatui::layout::
 fn show_table_widths() -> [Constraint; 11] {
     [
         Constraint::Length(16), // datetime
-        Constraint::Length(10), // role
+        Constraint::Length(12), // role
         Constraint::Length(8),  // tokens
         Constraint::Length(8),  // in
         Constraint::Length(8),  // out
@@ -4455,6 +4455,36 @@ mod tests {
         assert!(
             output.contains("subagent"),
             "output should contain 'subagent' role; got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn show_tui_renders_continuation_label_in_full() {
+        let mut app = new_app(fixture_sessions(), fixture_pricing_data(), Tab::Sessions);
+        let mut table_state = TableState::default();
+        table_state.select_first();
+        app.view = View::Show {
+            session_id: "aaa".to_string(),
+            header_label: "\"First session\" (alpha)".to_string(),
+            prepared: vec![PreparedExchange {
+                origin: TurnOrigin::Parent,
+                rows: vec![PreparedRow {
+                    timestamp: Some("2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+                    role: PreparedRowRole::Continuation,
+                    tokens: Some(650),
+                    cost: None,
+                    cumulative_tokens: 650,
+                    cumulative_cost: None,
+                    content: "Resuming the edit".to_string(),
+                    tool_use_count: 1,
+                }],
+            }],
+            table_state,
+        };
+        let output = render_app(&mut app, 120, 20);
+        assert!(
+            output.contains("continuation"),
+            "the role column must fit all 12 characters of 'continuation'; got:\n{output}",
         );
     }
 

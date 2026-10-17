@@ -2,7 +2,9 @@
 //! view ranks.
 //!
 //! Public API:
-//! - `Dispatch` — one subagent transcript, deduplicated and priced.
+//! - `Dispatch` — one subagent transcript's messages — merged per
+//!   message and deduplicated across its project — priced at its
+//!   majority model.
 //! - `Pinning` — how an agent file constrains the model a dispatch
 //!   runs on; part of the row key, so a disagreement between two
 //!   dispatches of one agent splits them into two rows.
@@ -44,7 +46,8 @@ use crate::pricing::PricingCatalog;
 
 // ---- core types ----
 
-/// One subagent transcript, deduplicated and priced.
+/// One subagent transcript's messages — merged per message and
+/// deduplicated across its project — priced at its majority model.
 ///
 /// `model` and `effort` are majority votes across the transcript's
 /// assistant turns rather than first-seen values: a run that switches
@@ -283,26 +286,21 @@ impl PinningFilter {
 /// expected to be deduplicated already — the caller owns that pass,
 /// because the `seen` set's scope is what decides which spend counts.
 ///
-/// A transcript recording no cwd inherits the parent's, so a subagent
-/// can still match a project-local agent file.
+/// `cwd` and `project_short_name` come from the caller rather than
+/// from `turns`: dedup may have dropped the lines that recorded the
+/// cwd, so the caller reads it from the whole transcript, falling
+/// back to the parent's.
 #[must_use]
 pub fn dispatch_from_turns(
     meta: &SubagentMeta,
-    parent_cwd: Option<&Path>,
-    parent_short_name: &str,
+    cwd: Option<&Path>,
+    project_short_name: &str,
     turns: &[Turn],
     catalog: &PricingCatalog,
 ) -> Option<Dispatch> {
     let started_at = turns.iter().filter_map(|t| t.timestamp).min()?;
-    let cwd = turns
-        .iter()
-        .find_map(|t| t.cwd.clone())
-        .or_else(|| parent_cwd.map(Path::to_path_buf));
-    let project_short_name = turns
-        .iter()
-        .find_map(|t| t.cwd.as_ref())
-        .and_then(|c| c.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| parent_short_name.to_string());
+    let cwd = cwd.map(Path::to_path_buf);
+    let project_short_name = project_short_name.to_string();
 
     let model = majority_assistant_value(turns, |turn| turn.model.as_deref());
     let effort = majority_assistant_value(turns, |turn| turn.effort.as_deref());
@@ -663,6 +661,7 @@ mod tests {
             effort: effort.map(str::to_string),
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: Some(Usage {
                 input: tokens,
                 output: 0,
@@ -683,6 +682,7 @@ mod tests {
             effort: None,
             message_id: None,
             request_id: None,
+            uuid: None,
             usage: None,
             content: None,
             cwd: cwd.map(PathBuf::from),
@@ -695,6 +695,7 @@ mod tests {
             agent_type: agent_type.to_string(),
             description: None,
             is_fork,
+            parent_agent_id: None,
         }
     }
 
@@ -796,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_falls_back_to_parent_cwd() {
+    fn dispatch_takes_the_callers_cwd_and_short_name() {
         let catalog = catalog_with(&[("claude-known-model", 1e-6)]);
         let turns = vec![assistant_turn(
             "2026-04-01T10:00:00Z",

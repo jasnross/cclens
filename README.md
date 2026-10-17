@@ -42,10 +42,10 @@ $ cclens --projects-dir /mnt/backup/claude/projects list
 
 #### Columns
 
-- **datetime** — local-timezone start of the session (`YYYY-MM-DD HH:MM`).
+- **datetime** — local-timezone start of the session (`YYYY-MM-DD HH:MM`). For a continued session, the start of the content it produced rather than of the history it replayed; `--since` / `--until` compare against the same time.
 - **project** — final path segment of the session's working directory.
-- **title** — the user's first substantive prompt, or the slash command they ran, truncated to 80 characters with `…`.
-- **tokens** — sum of billable tokens (`input + output + cache_creation`) across every assistant turn, including subagent/sidechain turns.
+- **title** — the user's first substantive prompt, or the slash command they ran, truncated to 80 characters with `…`. For a continued session, its first prompt after the replayed history.
+- **tokens** — sum of billable tokens (`input + output + cache_creation`) across every assistant message, each counted once at its final usage, including subagent/sidechain messages. Content a continued session replays from the session it continued is counted under the original.
 - **cost** — per-session USD cost (`$X.XXXX`), summed from the same turns, computed via the LiteLLM pricing catalog. Diverges from `tokens` by including `cache_read` tokens (priced at the discounted cache-read rate). Renders `—` if any assistant turn has an unknown model — strict no-partial-sums propagation.
 - **id** — the session UUID, taken from the JSONL filename in `~/.claude/projects/`.
 
@@ -77,19 +77,19 @@ Drill into a single session and see a per-exchange token breakdown:
 $ cclens show <session-id>
 ```
 
-The session ID argument must match a full session UUID exactly (case- sensitive; surrounding whitespace is trimmed). Tool-use round-trips (assistant tool call → user tool result → assistant reply) collapse into a single exchange; orphaned trailing user turns (no assistant response) render with `—` in the tokens column.
+The session ID argument must match a full session UUID exactly (case- sensitive; surrounding whitespace is trimmed). Tool-use round-trips (assistant tool call → user tool result → assistant reply) collapse into a single exchange; orphaned trailing user turns (no assistant response) render with `—` in the tokens column. A session that begins with assistant turns before any prompt (a continuation picking up mid tool loop) opens with one `continuation` row. A continued session's `show` lists only what that session produced: replayed exchanges and subagent transcripts it merely linked appear under the original session.
 
 Unlike `list`, `show` does not hide zero-billable sessions — it's an inspection tool and will render any valid session ID.
 
 #### Columns
 
 - **datetime** — local-timezone timestamp of the turn (`YYYY-MM-DD HH:MM`).
-- **role** — `user` or `assistant`.
-- **tokens** — per-row token total. User rows count `input + cache_creation` across the following assistant cluster; assistant rows count `output`. Orphan user rows show `—`.
-- **cost** — per-row USD cost (`$X.XXXX`). User rows price `input + cache_creation + cache_read`; assistant rows price `output`. Includes `cache_read` (the `tokens` column doesn't). Orphan user rows show `—`. Any unknown-model row shows `—`.
-- **cumulative** — running sum of billable tokens through this row. Matches the session's `list` tokens value at the final assistant row.
+- **role** — `user`, `assistant`, `subagent`, or `continuation`.
+- **tokens** — per-row token total. User rows count `input + cache_creation` across the following assistant cluster; assistant rows count `output`; continuation rows count `input + output + cache_creation` across their cluster. Orphan user rows show `—`.
+- **cost** — per-row USD cost (`$X.XXXX`). User rows price `input + cache_creation + cache_read`; assistant rows price `output`; continuation rows price every component. Includes `cache_read` (the `tokens` column doesn't). Orphan user rows show `—`. Any unknown-model row shows `—`.
+- **cumulative** — running sum of billable tokens through this row. Matches the session's `list` tokens value at the final row.
 - **cum_cost** — running USD cost through this row. Strict propagation: once any row is `—` (unknown model), every subsequent `cum_cost` cell is also `—`.
-- **content** — user prose (or slash-command reconstruction) on user rows; assistant reply preview with an optional `+N tool uses` suffix on assistant rows. Truncated to 80 characters with `…`.
+- **content** — user prose (or slash-command reconstruction) on user rows; assistant reply preview with an optional `+N tool uses` suffix on assistant rows, and the same preview of the whole cluster on continuation rows. Truncated to 80 characters with `…`.
 
 The `--min-tokens` / `--min-cost` flags described under [Filtering](#filtering) work on `show` too — the filter unit is a collapsed exchange (so a user row and its assistant row are shown or hidden together). `cumulative` and `cum_cost` continue to fold over **every** exchange so the final visible row's running totals match the session's `list` totals — visible cells may "jump" between rows when the filter drops middle exchanges.
 
@@ -122,7 +122,7 @@ The empty-result behavior matches `list`: if every row is dropped, stdout still 
 
 ### agents
 
-Rank subagent dispatches by observed spend. Reads every subagent transcript under `--projects-dir`, deduplicates each one's assistant turns, and prices the survivors at the model that dispatch actually ran on.
+Rank subagent dispatches by observed spend. Reads every subagent transcript under `--projects-dir`, counts each assistant message once per project at its final usage, and prices them at the model that dispatch actually ran on.
 
 ```sh
 $ cclens agents
@@ -140,7 +140,7 @@ Rows are grouped by agent type, resolved model, observed effort, and how the age
 - **declared_effort** — the effort the agent's file declares in its frontmatter, or `—` when it declares none. Never compared against **effort**; both are reported as found.
 - **pinning** — how the agent's file constrains the model: `pinned` (frontmatter names a concrete model), `inherit` (the `inherit` sentinel), `unpinned` (a file that names no model), `no-agent-file` (nothing on disk matched — either a built-in agent or a file not installed here, which are indistinguishable), or `fork` (a fork of the parent, which structurally has no model choice).
 - **dispatches** — how many dispatches this row covers.
-- **tokens** — deduplicated billable tokens summed across those dispatches.
+- **tokens** — billable tokens of those dispatches' messages, each counted once per project.
 - **cost** — USD across those dispatches. Renders `—` if any contributing dispatch had an unpriceable model; the token figure still reflects all of them.
 
 #### Filtering

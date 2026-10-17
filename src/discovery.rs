@@ -6,16 +6,21 @@
 //! - `discover(&Path) -> anyhow::Result<Vec<ProjectSessions>>` — returns
 //!   one `ProjectSessions` per project directory; each carries the parent
 //!   jsonl files plus their per-session subagent walks. JSONL paths are
-//!   sorted by mtime ascending (both top-level and per-subagent) so the
-//!   cross-file dedup pass is deterministic.
+//!   sorted by mtime ascending (both top-level and per-subagent). That
+//!   order is deterministic, and it is the order the loading walk falls
+//!   back to between sessions, or subagents, that lineage does not
+//!   relate. Lineage — `continued-in` records between sessions, the
+//!   sidecar's `parentAgentId` between subagents — not mtime, decides
+//!   which keeps repeated content.
 //! - `ProjectSessions`, `SessionPaths`, `SubagentPaths`, `SubagentMeta`
 //!   — typed records the discoverer emits.
 //! - `read_subagent_meta(&Path) -> Option<SubagentMeta>` — read a
 //!   subagent's `.meta.json` sidecar; returns `None` when absent or
 //!   malformed (graceful degradation, the caller decides whether to
-//!   skip the subagent). The returned `SubagentMeta` carries both
-//!   `agent_type` and an optional `description` (the per-invocation
-//!   summary surfaced in the show view).
+//!   skip the subagent). The returned `SubagentMeta` carries
+//!   `agent_type`, an optional `description` (the per-invocation
+//!   summary surfaced in the show view), `is_fork`, and the optional
+//!   `parent_agent_id` of a nested dispatch.
 //!
 //! Per-entry, per-subdir, and per-subagent-walk read errors are silently
 //! skipped; only a failure to read the top-level `projects_dir` propagates.
@@ -57,12 +62,14 @@ pub struct SubagentPaths {
 /// Parsed contents of a subagent `.meta.json` sidecar.
 ///
 /// The on-disk schema observed in real Claude Code data is
-/// `{"agentType": "<name>", "description": "<text>", "isFork": <bool>}`.
-/// cclens exposes all three: `agent_type` is consumed by the inputs
-/// pipeline for agent-row crediting, `description` by the show
-/// renderer for per-invocation labels, and `is_fork` distinguishes a
-/// fork of the parent from a fresh agent. Sidecars omitting
-/// `description` or `isFork` deserialize cleanly.
+/// `{"agentType": "<name>", "description": "<text>", "isFork": <bool>,
+/// "parentAgentId": <id or null>}`. cclens exposes all four:
+/// `agent_type` is consumed by the inputs pipeline for agent-row
+/// crediting, `description` by the show renderer for per-invocation
+/// labels, `is_fork` distinguishes a fork of the parent from a fresh
+/// agent, and `parent_agent_id` orders a nested dispatch after the
+/// agent that spawned it. Sidecars omitting any of the last three
+/// deserialize cleanly.
 #[derive(Debug)]
 pub struct SubagentMeta {
     pub agent_type: String,
@@ -73,6 +80,13 @@ pub struct SubagentMeta {
     /// absent key as `false` — the required degradation for a field
     /// cclens cannot require to be present.
     pub is_fork: bool,
+    /// The id of the subagent that spawned this one, for a nested
+    /// dispatch; `None` for one the parent session spawned. An id is a
+    /// transcript's file stem without its `agent-` prefix. A nested fork
+    /// replays its parent agent's opening messages, so the loading walk
+    /// orders a session's subagents parent-first to credit those
+    /// messages to the agent that produced them.
+    pub parent_agent_id: Option<String>,
 }
 
 /// On-disk shape of a subagent `.meta.json` sidecar. Unknown fields
@@ -87,6 +101,8 @@ struct RawSubagentMeta {
     description: Option<String>,
     #[serde(rename = "isFork", default)]
     is_fork: bool,
+    #[serde(rename = "parentAgentId", default)]
+    parent_agent_id: Option<String>,
 }
 
 /// # Errors
@@ -129,9 +145,11 @@ pub fn discover(projects_dir: &Path) -> anyhow::Result<Vec<ProjectSessions>> {
                 jsonl_paths.push(session_path);
             }
         }
-        // Resumed sessions inherit cost from the original; ordering by
-        // mtime ascending makes "earliest file wins" deterministic and
-        // semantically meaningful for the cross-file dedup pass.
+        // Mtime order is deterministic, and it is the order the loading
+        // walk falls back to between sessions continuation lineage does
+        // not relate. Lineage, not mtime, decides which session keeps
+        // repeated content; `discover_subagents` sorts the same way,
+        // with `parentAgentId` lineage taking precedence there.
         sort_by_mtime_asc(&mut jsonl_paths, PathBuf::as_path);
         let sessions: Vec<SessionPaths> = jsonl_paths
             .into_iter()
@@ -237,6 +255,7 @@ pub fn read_subagent_meta(path: &Path) -> Option<SubagentMeta> {
         agent_type: raw.agent_type,
         description: raw.description,
         is_fork: raw.is_fork,
+        parent_agent_id: raw.parent_agent_id,
     })
 }
 

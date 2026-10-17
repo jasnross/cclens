@@ -1,0 +1,8 @@
+---
+source: tests/snapshots.rs
+expression: stdout
+---
+ datetime          role          tokens                    cost  cumulative  cum_cost  content                        
+ 2026-05-02 12:02  continuation   0.65k  in:$0.0092 out:$0.0030       0.65k   $0.0122  Resuming the edit +1 tool uses 
+ 2026-05-02 12:03  user           0.32k              in:$0.0048       0.97k   $0.0169  Run the tests                  
+ 2026-05-02 12:03  assistant      0.01k             out:$0.0007       0.98k   $0.0177  Tests pass

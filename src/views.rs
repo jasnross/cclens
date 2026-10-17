@@ -95,6 +95,7 @@ pub fn show_row_cells(row: &PreparedRow) -> ShowRowCells {
         PreparedRowRole::User => "user",
         PreparedRowRole::Assistant => "assistant",
         PreparedRowRole::Subagent => "subagent",
+        PreparedRowRole::Continuation => "continuation",
     };
     let content = if row.tool_use_count > 0 {
         format!("{} +{} tool uses", row.content, row.tool_use_count)
@@ -361,6 +362,21 @@ mod tests {
         let row = fixture_row(PreparedRowRole::Subagent, Some(30), None, 180, None, "s", 0);
         let cells = show_row_cells(&row);
         assert_eq!(cells.role, "subagent");
+    }
+
+    #[test]
+    fn show_row_cells_labels_continuation_rows() {
+        let row = fixture_row(
+            PreparedRowRole::Continuation,
+            Some(45),
+            None,
+            45,
+            None,
+            "c",
+            0,
+        );
+        let cells = show_row_cells(&row);
+        assert_eq!(cells.role, "continuation");
     }
 
     #[test]

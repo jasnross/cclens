@@ -1,0 +1,3 @@
+{"type":"user","uuid":"s1-1","timestamp":"2026-05-01T10:00:15Z","cwd":"/Users/test/cont","message":{"role":"user","content":"Probe the cache"}}
+{"type":"assistant","uuid":"s1-2","timestamp":"2026-05-01T10:00:20Z","cwd":"/Users/test/cont","requestId":"req_S1","message":{"id":"msg_S1","role":"assistant","model":"claude-opus-4-7","content":[{"type":"thinking","thinking":"checking"}],"usage":{"input_tokens":20,"output_tokens":3}}}
+{"type":"assistant","uuid":"s1-3","timestamp":"2026-05-01T10:00:21Z","cwd":"/Users/test/cont","requestId":"req_S1","message":{"id":"msg_S1","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"Cache is warm"}],"usage":{"input_tokens":20,"output_tokens":30}}}
