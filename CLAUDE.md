@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # cclens
 
-A tiny Rust CLI that surfaces two views of Claude Code usage:
+A Rust CLI that surfaces three views of Claude Code usage:
 
 - **`cclens list` / `cclens show`** — sessions browser. Lists conversations (when they happened, what project, what about, token + cost totals) from `~/.claude/projects/`.
 - **`cclens inputs`** — per-file context-cost attribution. Ranks the user's CLAUDE.md / rules / skills / agents (global, project-local, and plugin-shipped) by attributed cache-creation cost, with a per-tier coverage indicator. Reads `~/.claude/{CLAUDE.md,rules,skills,agents}`, `~/.claude/plugins/cache/` (driven from `installed_plugins.json`), and per-session ancestor + project-local context files in addition to `~/.claude/projects/`.
+- **`cclens agents`** — subagent spend. Ranks subagent dispatches by observed cost, grouped by agent type × model × effort × pinning (how the agent's file constrains its model), with optional `--compare-model` repricing as an upper bound. Reads subagent transcripts under `~/.claude/projects/` plus agent-file frontmatter.
 
-Output is a plain aligned table to stdout in both views.
+Output is a plain aligned table to stdout when piped or with `--format plain`, JSON with `--format json`, and an interactive TUI on a terminal for `list` / `inputs` / `agents` (an empty `list` result prints plain).
 
 ## Project Status
 
@@ -91,7 +92,7 @@ Run `cargo +nightly fmt && cargo clippy --all-targets -- -D warnings` before com
 
 ## Source Layout
 
-The crate compiles as two crates from the same `src/` tree: a library (`src/lib.rs`, root for the thirteen promoted modules) and a binary (`src/main.rs`, root for orchestration plus the CLI submodule). Both are named `cclens`; the binary consumes the library via `use cclens::...`.
+The crate compiles as two crates from the same `src/` tree: a library (`src/lib.rs`, root for the fourteen promoted modules) and a binary (`src/main.rs`, root for orchestration plus the CLI submodule). Both are named `cclens`; the binary consumes the library via `use cclens::...`.
 
 Library modules (declared `pub mod` in `src/lib.rs`, one file each under `src/<name>.rs`; declarations are alphabetical, the pipeline order below is for orientation):
 
@@ -179,8 +180,10 @@ loading       ← composes discovery/parsing/aggregation/attribution/
                 plain/JSON CLI paths — one loader definition per view,
                 not one per entry point
 pricing       ← LiteLLM-catalog fetch/cache/lookup, tiered cost math,
-                pricing-subcommand handlers; cost_for_cache_creation_{1h,5m}
-                helpers exposed for the inputs subcommand; lookup_exact
+                refresh_catalog / cache_info backing the pricing
+                subcommand; PricingCatalog::cost_for_turn /
+                cost_for_components return a per-component
+                CostBreakdown; lookup_exact
                 resolves a user-supplied model without lookup's
                 prefix / substring fallbacks
 rendering     ← comfy-table render_table (list view), render_session
@@ -243,7 +246,7 @@ Binary entry point (`src/main.rs`):
 
 - Declares `mod cli;` (binary-only — `src/cli.rs` is **not** in `lib.rs`) so library code cannot reach into clap-derived types.
 - Imports library modules via `use cclens::...`.
-- Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs`, `run_agents` — orchestration only. Each `run_*` builds a `loading::DataContext` from CLI args and either drives the TUI (`run_tui`) or calls `loading::load_sessions` / `loading::load_show` / `loading::load_inputs` / `loading::load_agents` directly for the plain/JSON paths. The loaders themselves, the `ProjectWalk` they share, `stem_matches`, and fingerprint-building all live in `loading` — the binary has no data-loading code of its own.
+- Holds `main`, `run_list`, `run_show`, `run_pricing`, `run_inputs`, `run_agents` — orchestration only. Each data-view `run_*` (`run_list`, `run_show`, `run_inputs`, `run_agents`) builds a `loading::DataContext` from CLI args and either drives the TUI (`run_tui`, or `run_tui_with_compare_model` for the agents tab) or calls `loading::load_sessions` / `loading::load_show` / `loading::load_inputs` / `loading::load_agents` directly for the plain/JSON paths. `run_pricing` builds no context and calls `pricing` directly. The loaders themselves, the `ProjectWalk` they share, `stem_matches`, and fingerprint-building all live in `loading` — the binary has no data-loading code of its own.
 
 Binary CLI submodule (`src/cli.rs`):
 
@@ -259,7 +262,7 @@ Each library module file opens with a `//!` doc comment listing its public API s
 
 `docs/` holds supporting documentation that isn't worth always-on context — currently `docs/testing-pricing.md`, the recipe for exercising a doctored pricing catalog offline.
 
-Integration tests live in `tests/listing.rs` (and sibling files) and use `assert_cmd` against fixtures under `tests/fixtures/projects/`. Snapshot regression tests in `tests/snapshots.rs` use `insta` against a dedicated fixture tree at `tests/fixtures/snapshot-projects/` and lock byte-for-byte rendering of `list` and `show`.
+Integration tests live in `tests/listing.rs` (and sibling files) and use `assert_cmd` against fixtures under `tests/fixtures/projects/`. Snapshot regression tests in `tests/snapshots.rs` use `insta` against a dedicated fixture tree at `tests/fixtures/snapshot-projects/` and lock byte-for-byte rendering of `list`, `show`, and `inputs`.
 
 ## Design Principles
 
@@ -307,4 +310,4 @@ Assert on synchronously observable state instead — a reservation count, a regi
 
 ### Snapshot tests are reviewable assertions, not contracts
 
-`tests/snapshots.rs` locks byte-for-byte rendering of `list` and `show` via `insta` so that any change to output is visible in review. When output changes intentionally — a new column, a tweaked label, a different default sort — accept the new baseline with `cargo insta review` rather than contorting code to preserve the old bytes. While cclens is pre-1.0 (see Project Status), a failing snapshot is a prompt to confirm intent, not a regression to avoid.
+`tests/snapshots.rs` locks byte-for-byte rendering of `list`, `show`, and `inputs` via `insta` so that any change to output is visible in review. When output changes intentionally — a new column, a tweaked label, a different default sort — accept the new baseline with `cargo insta review` rather than contorting code to preserve the old bytes. While cclens is pre-1.0 (see Project Status), a failing snapshot is a prompt to confirm intent, not a regression to avoid.
